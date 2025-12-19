@@ -10,6 +10,11 @@ use tokio::task::spawn_blocking;
 
 use crate::PidResolver;
 
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5);
+// Best-effort caps to avoid unbounded growth (TTL alone doesn't evict).
+const MAX_CONN_CACHE_ENTRIES: usize = 16_384;
+const MAX_PPID_CACHE_ENTRIES: usize = 65_536;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct ConnectionKey {
     local: SocketAddr,
@@ -28,7 +33,7 @@ impl Default for WindowsPidResolver {
         Self {
             conn_cache: DashMap::new(),
             ppid_cache: DashMap::new(),
-            cache_ttl: Duration::from_secs(5),
+            cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
 }
@@ -56,6 +61,8 @@ impl WindowsPidResolver {
                 return Ok(Some(pid));
             }
         }
+        // Expired; remove eagerly.
+        self.conn_cache.remove(&key);
 
         // Match the client-owned socket entry: local=peer, remote=local.
         let pid = match (local.ip(), peer.ip()) {
@@ -68,6 +75,7 @@ impl WindowsPidResolver {
 
         if let Some(pid) = pid {
             self.conn_cache.insert(key, (pid, Instant::now()));
+            self.maybe_prune_conn_cache();
         }
         Ok(pid)
     }
@@ -79,11 +87,44 @@ impl WindowsPidResolver {
                 return Ok(*ppid);
             }
         }
+        // Expired; remove eagerly.
+        self.ppid_cache.remove(&pid);
 
         let ppid = process_parent_pid(pid).context("resolve parent pid via Toolhelp snapshot")?;
         let ppid = if ppid == 0 { None } else { Some(ppid) };
         self.ppid_cache.insert(pid, (ppid, Instant::now()));
+        self.maybe_prune_ppid_cache();
         Ok(ppid)
+    }
+
+    fn maybe_prune_conn_cache(&self) {
+        if self.conn_cache.len() <= MAX_CONN_CACHE_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<ConnectionKey> = Vec::new();
+        for entry in self.conn_cache.iter() {
+            if entry.value().1.elapsed() > self.cache_ttl {
+                expired.push(*entry.key());
+            }
+        }
+        for key in expired {
+            self.conn_cache.remove(&key);
+        }
+    }
+
+    fn maybe_prune_ppid_cache(&self) {
+        if self.ppid_cache.len() <= MAX_PPID_CACHE_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<u32> = Vec::new();
+        for entry in self.ppid_cache.iter() {
+            if entry.value().1.elapsed() > self.cache_ttl {
+                expired.push(*entry.key());
+            }
+        }
+        for pid in expired {
+            self.ppid_cache.remove(&pid);
+        }
     }
 }
 

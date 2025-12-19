@@ -13,9 +13,21 @@ use tracing::debug;
 
 use crate::PidResolver;
 
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5);
+// These are best-effort caps to avoid unbounded growth. We prune expired entries
+// opportunistically when we notice the maps getting large.
+const MAX_CONN_CACHE_ENTRIES: usize = 16_384;
+const MAX_PPID_CACHE_ENTRIES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct ConnectionKey {
+    local: SocketAddr,
+    peer: SocketAddr,
+}
+
 #[derive(Clone)]
 pub struct LinuxPidResolver {
-    inode_cache: DashMap<u64, (u32, Instant)>,
+    conn_cache: DashMap<ConnectionKey, (u32, Instant)>,
     ppid_cache: DashMap<u32, (Option<u32>, Instant)>,
     cache_ttl: Duration,
 }
@@ -23,9 +35,9 @@ pub struct LinuxPidResolver {
 impl Default for LinuxPidResolver {
     fn default() -> Self {
         Self {
-            inode_cache: DashMap::new(),
+            conn_cache: DashMap::new(),
             ppid_cache: DashMap::new(),
-            cache_ttl: Duration::from_secs(5),
+            cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
 }
@@ -45,6 +57,19 @@ impl PidResolver for LinuxPidResolver {
 
 impl LinuxPidResolver {
     fn pid_for_peer_blocking(&self, local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
+        // Cache keyed by (server_local, client_peer) since caller passes (listen_addr, peer_addr).
+        // This is safer than caching by inode: socket inodes can be reused after close, while
+        // 4-tuples typically don't get reused quickly (TIME_WAIT).
+        let key = ConnectionKey { local, peer };
+        if let Some(entry) = self.conn_cache.get(&key) {
+            let (pid, at) = *entry.value();
+            if at.elapsed() <= self.cache_ttl {
+                return Ok(Some(pid));
+            }
+        }
+        // If it was expired, drop it so the map doesn't grow unboundedly with cold entries.
+        self.conn_cache.remove(&key);
+
         // Important: when we accept a TCP connection, `/proc/net/tcp*` will contain two entries:
         // - server socket: local=server_addr, remote=client_addr (inode owned by the server process)
         // - client socket: local=client_addr, remote=server_addr (inode owned by the client process)
@@ -56,19 +81,13 @@ impl LinuxPidResolver {
             None => return Ok(None),
         };
 
-        if let Some(entry) = self.inode_cache.get(&inode) {
-            let (pid, at) = *entry.value();
-            if at.elapsed() <= self.cache_ttl {
-                return Ok(Some(pid));
-            }
-        }
-
         let pid = match pid_for_inode(inode)? {
             Some(pid) => pid,
             None => return Ok(None),
         };
 
-        self.inode_cache.insert(inode, (pid, Instant::now()));
+        self.conn_cache.insert(key, (pid, Instant::now()));
+        self.maybe_prune_conn_cache();
         Ok(Some(pid))
     }
 
@@ -79,12 +98,15 @@ impl LinuxPidResolver {
                 return Ok(*ppid);
             }
         }
+        // Expired; remove eagerly.
+        self.ppid_cache.remove(&pid);
 
         let stat_path = format!("/proc/{pid}/stat");
         let stat = match fs::read_to_string(&stat_path) {
             Ok(s) => s,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 self.ppid_cache.insert(pid, (None, Instant::now()));
+                self.maybe_prune_ppid_cache();
                 return Ok(None);
             }
             Err(err) => return Err(err).with_context(|| format!("read {stat_path}")),
@@ -96,7 +118,38 @@ impl LinuxPidResolver {
 
         let ppid = if ppid == 0 { None } else { Some(ppid) };
         self.ppid_cache.insert(pid, (ppid, Instant::now()));
+        self.maybe_prune_ppid_cache();
         Ok(ppid)
+    }
+
+    fn maybe_prune_conn_cache(&self) {
+        if self.conn_cache.len() <= MAX_CONN_CACHE_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<ConnectionKey> = Vec::new();
+        for entry in self.conn_cache.iter() {
+            if entry.value().1.elapsed() > self.cache_ttl {
+                expired.push(*entry.key());
+            }
+        }
+        for key in expired {
+            self.conn_cache.remove(&key);
+        }
+    }
+
+    fn maybe_prune_ppid_cache(&self) {
+        if self.ppid_cache.len() <= MAX_PPID_CACHE_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<u32> = Vec::new();
+        for entry in self.ppid_cache.iter() {
+            if entry.value().1.elapsed() > self.cache_ttl {
+                expired.push(*entry.key());
+            }
+        }
+        for pid in expired {
+            self.ppid_cache.remove(&pid);
+        }
     }
 }
 
