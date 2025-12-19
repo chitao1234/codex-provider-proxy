@@ -3,8 +3,9 @@
 Local HTTP reverse proxy that routes each incoming request to an upstream "provider" (base URL + API key).
 
 The special behavior: the provider is selected based on the **PID of the client process** that opened the TCP
-connection. For now this is implemented using Linux `/proc` inspection (`/proc/net/tcp` + `/proc/<pid>/fd`),
-so only Linux is supported for PID-based routing.
+connection. This is implemented using:
+- Linux `/proc` inspection (`/proc/net/tcp` + `/proc/<pid>/fd`)
+- Windows IP Helper APIs (`GetExtendedTcpTable`)
 
 ## Quickstart
 
