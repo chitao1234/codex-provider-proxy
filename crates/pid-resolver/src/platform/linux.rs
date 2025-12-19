@@ -78,12 +78,27 @@ impl LinuxPidResolver {
         // client socket, which corresponds to (local=peer, remote=local).
         let inode = match inode_for_connection(peer, local)? {
             Some(inode) => inode,
-            None => return Ok(None),
+            None => {
+                debug!(
+                    local = %local,
+                    peer = %peer,
+                    "pid resolver: no inode found for connection in /proc/net/tcp*"
+                );
+                return Ok(None);
+            }
         };
 
         let pid = match pid_for_inode(inode)? {
             Some(pid) => pid,
-            None => return Ok(None),
+            None => {
+                debug!(
+                    local = %local,
+                    peer = %peer,
+                    inode,
+                    "pid resolver: inode found but no owning pid discovered under /proc/*/fd"
+                );
+                return Ok(None);
+            }
         };
 
         self.conn_cache.insert(key, (pid, Instant::now()));
@@ -169,7 +184,14 @@ fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u6
     match (local.ip(), peer.ip()) {
         (IpAddr::V4(_), IpAddr::V4(_)) => inode_for_connection_v4(local, peer),
         (IpAddr::V6(_), IpAddr::V6(_)) => inode_for_connection_v6(local, peer),
-        _ => Ok(None),
+        _ => {
+            debug!(
+                local = %local,
+                peer = %peer,
+                "pid resolver: ip family mismatch (v4/v6); cannot map to /proc/net/tcp or tcp6"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -178,7 +200,9 @@ fn inode_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option
     let peer_key = encode_proc_net_tcp_v4(peer.ip(), peer.port());
 
     let tcp = fs::read_to_string("/proc/net/tcp").context("read /proc/net/tcp")?;
+    let mut scanned = 0usize;
     for line in tcp.lines().skip(1) {
+        scanned += 1;
         let mut parts = line.split_whitespace();
         let _sl = parts.next();
         let local_addr = parts.next();
@@ -199,10 +223,23 @@ fn inode_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option
             let inode = inode
                 .parse::<u64>()
                 .with_context(|| format!("parse inode from /proc/net/tcp line: {line}"))?;
+            debug!(
+                local = %local,
+                peer = %peer,
+                inode,
+                scanned_lines = scanned,
+                "pid resolver: matched connection in /proc/net/tcp"
+            );
             return Ok(Some(inode));
         }
     }
 
+    debug!(
+        local = %local,
+        peer = %peer,
+        scanned_lines = scanned,
+        "pid resolver: no matching connection found in /proc/net/tcp"
+    );
     Ok(None)
 }
 
@@ -211,7 +248,9 @@ fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option
     let peer_key = encode_proc_net_tcp_v6(peer.ip(), peer.port());
 
     let tcp6 = fs::read_to_string("/proc/net/tcp6").context("read /proc/net/tcp6")?;
+    let mut scanned = 0usize;
     for line in tcp6.lines().skip(1) {
+        scanned += 1;
         let mut parts = line.split_whitespace();
         let _sl = parts.next();
         let local_addr = parts.next();
@@ -232,10 +271,23 @@ fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option
             let inode = inode
                 .parse::<u64>()
                 .with_context(|| format!("parse inode from /proc/net/tcp6 line: {line}"))?;
+            debug!(
+                local = %local,
+                peer = %peer,
+                inode,
+                scanned_lines = scanned,
+                "pid resolver: matched connection in /proc/net/tcp6"
+            );
             return Ok(Some(inode));
         }
     }
 
+    debug!(
+        local = %local,
+        peer = %peer,
+        scanned_lines = scanned,
+        "pid resolver: no matching connection found in /proc/net/tcp6"
+    );
     Ok(None)
 }
 
@@ -278,6 +330,8 @@ fn encode_proc_net_tcp_v6(ip: IpAddr, port: u16) -> String {
 
 fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
     let proc = fs::read_dir("/proc").context("read /proc")?;
+    let mut scanned_pids = 0usize;
+    let mut scanned_fds = 0usize;
     for entry in proc {
         let entry = match entry {
             Ok(e) => e,
@@ -287,6 +341,7 @@ fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
         let Some(pid) = file_name.to_string_lossy().parse::<u32>().ok() else {
             continue;
         };
+        scanned_pids += 1;
 
         let mut fd_dir = PathBuf::from("/proc");
         fd_dir.push(pid.to_string());
@@ -301,6 +356,7 @@ fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
+            scanned_fds += 1;
             let target = match fs::read_link(fd.path()) {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -316,6 +372,12 @@ fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
             }
         }
     }
+    debug!(
+        inode,
+        scanned_pids,
+        scanned_fds,
+        "pid resolver: no pid found owning socket inode"
+    );
     Ok(None)
 }
 

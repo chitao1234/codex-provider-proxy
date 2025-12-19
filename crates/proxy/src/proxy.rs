@@ -83,6 +83,18 @@ async fn handle_proxy_inner(
         }
     };
 
+    // `pid_for_peer` is best-effort and may return Ok(None) (e.g. short-lived connections,
+    // /proc visibility/permission issues, or inability to map the socket to a process).
+    // If PID routing is in use, surface this so it's not silently surprising.
+    if pid.is_none() && !state.pid_routes.is_empty() {
+        warn!(
+            request_id,
+            peer = %peer,
+            listen = %state.listen_addr,
+            "pid could not be resolved for connection; falling back to default provider"
+        );
+    }
+
     let (provider_name, route_pid) = match pid {
         Some(pid) => match find_provider_for_pid_or_ancestors(&state, pid).await {
             Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
@@ -113,8 +125,8 @@ async fn handle_proxy_inner(
     if state.cfg.logging.log_requests {
         info!(
             request_id,
-            pid,
-            route_pid,
+            pid = ?pid,
+            route_pid = ?route_pid,
             peer = %peer,
             provider = %provider_name,
             method = %parts.method,
@@ -123,8 +135,8 @@ async fn handle_proxy_inner(
         );
         debug!(
             request_id,
-            pid,
-            route_pid,
+            pid = ?pid,
+            route_pid = ?route_pid,
             provider = %provider_name,
             headers = ?parts.headers,
             "request headers"
@@ -164,8 +176,8 @@ async fn handle_proxy_inner(
     if state.cfg.logging.log_responses {
         info!(
             request_id,
-            pid,
-            route_pid,
+            pid = ?pid,
+            route_pid = ?route_pid,
             peer = %peer,
             provider = %provider_name,
             status = %status,
@@ -174,8 +186,8 @@ async fn handle_proxy_inner(
         );
         debug!(
             request_id,
-            pid,
-            route_pid,
+            pid = ?pid,
+            route_pid = ?route_pid,
             provider = %provider_name,
             headers = ?resp_headers,
             "response headers"
@@ -187,8 +199,8 @@ async fn handle_proxy_inner(
             let summary = cap.lock().unwrap().summary();
             debug!(
                 request_id,
-                pid,
-                route_pid,
+                pid = ?pid,
+                route_pid = ?route_pid,
                 provider = %provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
@@ -206,8 +218,8 @@ async fn handle_proxy_inner(
             let summary = capture.lock().unwrap().summary();
             debug!(
                 request_id,
-                pid,
-                route_pid,
+                pid = ?pid,
+                route_pid = ?route_pid,
                 provider = %provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
