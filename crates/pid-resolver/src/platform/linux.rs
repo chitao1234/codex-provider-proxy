@@ -1,0 +1,252 @@
+use std::{
+    fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use dashmap::DashMap;
+use tokio::task::spawn_blocking;
+use tracing::debug;
+
+use crate::PidResolver;
+
+#[derive(Clone)]
+pub struct LinuxPidResolver {
+    inode_cache: DashMap<u64, (u32, Instant)>,
+    cache_ttl: Duration,
+}
+
+impl Default for LinuxPidResolver {
+    fn default() -> Self {
+        Self {
+            inode_cache: DashMap::new(),
+            cache_ttl: Duration::from_secs(5),
+        }
+    }
+}
+
+#[async_trait]
+impl PidResolver for LinuxPidResolver {
+    async fn pid_for_peer(&self, local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
+        let this = self.clone();
+        spawn_blocking(move || this.pid_for_peer_blocking(local, peer)).await?
+    }
+}
+
+impl LinuxPidResolver {
+    fn pid_for_peer_blocking(&self, local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
+        // Important: when we accept a TCP connection, `/proc/net/tcp*` will contain two entries:
+        // - server socket: local=server_addr, remote=client_addr (inode owned by the server process)
+        // - client socket: local=client_addr, remote=server_addr (inode owned by the client process)
+        //
+        // We want the PID of the *other end* (the peer/client), so we must look up the inode for the
+        // client socket, which corresponds to (local=peer, remote=local).
+        let inode = match inode_for_connection(peer, local)? {
+            Some(inode) => inode,
+            None => return Ok(None),
+        };
+
+        if let Some(entry) = self.inode_cache.get(&inode) {
+            let (pid, at) = *entry.value();
+            if at.elapsed() <= self.cache_ttl {
+                return Ok(Some(pid));
+            }
+        }
+
+        let pid = match pid_for_inode(inode)? {
+            Some(pid) => pid,
+            None => return Ok(None),
+        };
+
+        self.inode_cache.insert(inode, (pid, Instant::now()));
+        Ok(Some(pid))
+    }
+}
+
+fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
+    match (local.ip(), peer.ip()) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => inode_for_connection_v4(local, peer),
+        (IpAddr::V6(_), IpAddr::V6(_)) => inode_for_connection_v6(local, peer),
+        _ => Ok(None),
+    }
+}
+
+fn inode_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
+    let local_key = encode_proc_net_tcp_v4(local.ip(), local.port());
+    let peer_key = encode_proc_net_tcp_v4(peer.ip(), peer.port());
+
+    let tcp = fs::read_to_string("/proc/net/tcp").context("read /proc/net/tcp")?;
+    for line in tcp.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let _sl = parts.next();
+        let local_addr = parts.next();
+        let rem_addr = parts.next();
+        let _st = parts.next();
+        let _tx_rx = parts.next();
+        let _tr_tm = parts.next();
+        let _retrnsmt = parts.next();
+        let _uid = parts.next();
+        let _timeout = parts.next();
+        let inode = parts.next();
+
+        let (Some(local_addr), Some(rem_addr), Some(inode)) = (local_addr, rem_addr, inode) else {
+            continue;
+        };
+
+        if local_addr == local_key && rem_addr == peer_key {
+            let inode = inode
+                .parse::<u64>()
+                .with_context(|| format!("parse inode from /proc/net/tcp line: {line}"))?;
+            return Ok(Some(inode));
+        }
+    }
+
+    Ok(None)
+}
+
+fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
+    let local_key = encode_proc_net_tcp_v6(local.ip(), local.port());
+    let peer_key = encode_proc_net_tcp_v6(peer.ip(), peer.port());
+
+    let tcp6 = fs::read_to_string("/proc/net/tcp6").context("read /proc/net/tcp6")?;
+    for line in tcp6.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let _sl = parts.next();
+        let local_addr = parts.next();
+        let rem_addr = parts.next();
+        let _st = parts.next();
+        let _tx_rx = parts.next();
+        let _tr_tm = parts.next();
+        let _retrnsmt = parts.next();
+        let _uid = parts.next();
+        let _timeout = parts.next();
+        let inode = parts.next();
+
+        let (Some(local_addr), Some(rem_addr), Some(inode)) = (local_addr, rem_addr, inode) else {
+            continue;
+        };
+
+        if local_addr == local_key && rem_addr == peer_key {
+            let inode = inode
+                .parse::<u64>()
+                .with_context(|| format!("parse inode from /proc/net/tcp6 line: {line}"))?;
+            return Ok(Some(inode));
+        }
+    }
+
+    Ok(None)
+}
+
+fn encode_proc_net_tcp_v4(ip: IpAddr, port: u16) -> String {
+    let ip = match ip {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+    };
+    let octets = ip.octets();
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+        octets[3], octets[2], octets[1], octets[0], port
+    )
+}
+
+fn encode_proc_net_tcp_v6(ip: IpAddr, port: u16) -> String {
+    let bytes = match ip {
+        IpAddr::V6(v6) => v6.octets(),
+        IpAddr::V4(v4) => {
+            // IPv4 isn't expected here, but keep this deterministic.
+            let mut b = [0u8; 16];
+            b[12..16].copy_from_slice(&v4.octets());
+            b
+        }
+    };
+
+    // /proc/net/tcp6 prints the IPv6 address as 4 32-bit words, each in little-endian byte order.
+    // Example: ::1 => ...01000000
+    let mut hex = String::with_capacity(32 + 1 + 4);
+    for word in bytes.chunks_exact(4) {
+        hex.push_str(&format!(
+            "{:02X}{:02X}{:02X}{:02X}",
+            word[3], word[2], word[1], word[0]
+        ));
+    }
+    hex.push(':');
+    hex.push_str(&format!("{:04X}", port));
+    hex
+}
+
+fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
+    let proc = fs::read_dir("/proc").context("read /proc")?;
+    for entry in proc {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+
+        let mut fd_dir = PathBuf::from("/proc");
+        fd_dir.push(pid.to_string());
+        fd_dir.push("fd");
+        let fds = match fs::read_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(_) => continue,
+        };
+
+        for fd in fds {
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+            let target = match fs::read_link(fd.path()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let Some(target_str) = target.to_str() else {
+                continue;
+            };
+            if let Some(found_inode) = parse_socket_inode(target_str) {
+                if found_inode == inode {
+                    debug!(pid, inode, "resolved pid for socket inode");
+                    return Ok(Some(pid));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_socket_inode(link_target: &str) -> Option<u64> {
+    // symlink target is usually: "socket:[123456]"
+    let link_target = link_target.strip_prefix("socket:[")?;
+    let link_target = link_target.strip_suffix(']')?;
+    link_target.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn encodes_ipv4_as_proc_net_tcp_key() {
+        let key = encode_proc_net_tcp_v4(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        assert_eq!(key, "0100007F:1F90");
+    }
+
+    #[test]
+    fn encodes_ipv6_as_proc_net_tcp6_key() {
+        let key = encode_proc_net_tcp_v6(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
+        assert_eq!(key, "00000000000000000000000001000000:1F90");
+    }
+
+    #[test]
+    fn parses_socket_inode() {
+        assert_eq!(parse_socket_inode("socket:[12345]"), Some(12345));
+        assert_eq!(parse_socket_inode("anon_inode:[eventfd]"), None);
+    }
+}

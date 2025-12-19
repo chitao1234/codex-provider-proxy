@@ -1,0 +1,24 @@
+[package]
+name = "codex-provider-proxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+codex-provider-proxy-rpc-types = { path = "../rpc-types" }
+dashmap.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+pin-project-lite.workspace = true
+pid-resolver = { path = "../pid-resolver" }
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true

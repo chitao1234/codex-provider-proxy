@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/pid-resolver",
+  "crates/proxy",
+  "crates/rpc-types",
+  "crates/proxyctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+pin-project-lite = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }

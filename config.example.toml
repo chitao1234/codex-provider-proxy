@@ -1,0 +1,24 @@
+# codex-provider-proxy example config
+listen_addr = "127.0.0.1:8080"
+# Requests must be sent to this path prefix. Example: "/v1" means the proxy accepts /v1/* and forwards only the suffix.
+listen_base_path = "/v1"
+rpc_listen_addr = "127.0.0.1:8081"
+# Optional: if set, RPC requires `Authorization: Bearer <rpc_token>`
+# rpc_token = "replace-me"
+default_provider = "provider_a"
+
+[logging]
+log_requests = true
+log_responses = true
+log_bodies = false
+max_body_log_bytes = 8192
+
+[providers.provider_a]
+base_url = "https://api.example.com/"
+api_key = "replace-me"
+
+[providers.provider_b]
+base_url = "https://api.other.example/"
+api_key = "replace-me"
+# You can override the full Authorization header value if you don't want Bearer auth:
+# authorization_header = "Api-Key replace-me"
