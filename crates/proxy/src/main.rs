@@ -12,6 +12,7 @@ use pid_resolver::platform::default_pid_resolver;
 use proxy::{handle_proxy, AppState};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         .context("build reqwest client")?;
 
     let pid_routes = Arc::new(dashmap::DashMap::<u32, String>::new());
+    let default_provider = Arc::new(RwLock::new(cfg.default_provider.clone()));
 
     let app_state = AppState {
         listen_addr: local_addr,
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         pid_resolver: default_pid_resolver(),
         http_client,
         request_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        default_provider: default_provider.clone(),
         pid_routes: pid_routes.clone(),
     };
 
@@ -112,6 +115,7 @@ async fn main() -> Result<()> {
 
     let rpc_app = rpc::router(rpc::RpcState {
         cfg: app_state.cfg.clone(),
+        default_provider,
         pid_routes,
     });
 

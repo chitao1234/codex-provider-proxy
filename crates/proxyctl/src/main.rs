@@ -3,7 +3,8 @@ use std::{net::SocketAddr, path::Path};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use codex_provider_proxy_rpc_types::{
-    DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, SetRouteRequest,
+    DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, SetDefaultProviderRequest,
+    SetRouteRequest,
 };
 use serde::Deserialize;
 
@@ -31,6 +32,12 @@ enum Cmd {
     Set {
         #[arg(long)]
         pid: u32,
+        #[arg(long)]
+        provider: String,
+    },
+
+    /// Change the runtime default provider used when no PID route matches
+    SetDefault {
         #[arg(long)]
         provider: String,
     },
@@ -96,6 +103,20 @@ async fn main() -> Result<()> {
             let resp = req.send().await.context("send set request")?;
             resp.error_for_status_ref()
                 .context("set route returned error status")?;
+            println!("ok");
+        }
+        Cmd::SetDefault { provider } => {
+            let url = format!(
+                "{}/rpc/v1/default-provider",
+                rpc_url.trim_end_matches('/')
+            );
+            let mut req = client.post(url).json(&SetDefaultProviderRequest { provider });
+            if let Some(token) = &token {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().await.context("send set-default request")?;
+            resp.error_for_status_ref()
+                .context("set default provider returned error status")?;
             println!("ok");
         }
         Cmd::Delete { pid } => {

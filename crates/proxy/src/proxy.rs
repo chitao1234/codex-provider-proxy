@@ -18,6 +18,7 @@ use dashmap::DashMap;
 use futures_util::{Stream, TryStreamExt};
 use pid_resolver::PidResolver;
 use pin_project_lite::pin_project;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -35,6 +36,7 @@ pub struct AppState {
     pub pid_resolver: Arc<dyn PidResolver>,
     pub http_client: reqwest::Client,
     pub request_seq: Arc<AtomicU64>,
+    pub default_provider: Arc<RwLock<String>>,
     pub pid_routes: Arc<DashMap<u32, String>>,
 }
 
@@ -95,10 +97,11 @@ async fn handle_proxy_inner(
         );
     }
 
+    let default_provider = state.default_provider.read().await.clone();
     let (provider_name, route_pid) = match pid {
         Some(pid) => match find_provider_for_pid_or_ancestors(&state, pid).await {
             Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
-            Ok(None) => (state.cfg.default_provider.clone(), None),
+            Ok(None) => (default_provider.clone(), None),
             Err(err) => {
                 warn!(
                     request_id,
@@ -107,10 +110,10 @@ async fn handle_proxy_inner(
                     error = %err,
                     "ancestor pid route lookup failed; falling back to default provider"
                 );
-                (state.cfg.default_provider.clone(), None)
+                (default_provider.clone(), None)
             }
         },
-        None => (state.cfg.default_provider.clone(), None),
+        None => (default_provider.clone(), None),
     };
 
     let provider = state

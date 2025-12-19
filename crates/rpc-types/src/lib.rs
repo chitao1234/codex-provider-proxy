@@ -7,6 +7,11 @@ pub struct SetRouteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDefaultProviderRequest {
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteRouteResponse {
     pub removed: bool,
 }

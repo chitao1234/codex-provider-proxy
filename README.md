@@ -36,6 +36,12 @@ cargo run -p codex-provider-proxyctl -- set --pid "$pid" --provider provider_b
 
 If `rpc_token` is set in the proxy config, pass `--token` to the client.
 
+You can also change the runtime default provider (used when no PID route matches):
+
+```bash
+cargo run -p codex-provider-proxyctl -- set-default --provider provider_b
+```
+
 4. Send a request from that same local process; it will be routed to the provider assigned to the PID.
 
 ## Notes
