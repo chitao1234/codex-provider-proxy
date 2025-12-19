@@ -16,6 +16,7 @@ use crate::PidResolver;
 #[derive(Clone)]
 pub struct LinuxPidResolver {
     inode_cache: DashMap<u64, (u32, Instant)>,
+    ppid_cache: DashMap<u32, (Option<u32>, Instant)>,
     cache_ttl: Duration,
 }
 
@@ -23,6 +24,7 @@ impl Default for LinuxPidResolver {
     fn default() -> Self {
         Self {
             inode_cache: DashMap::new(),
+            ppid_cache: DashMap::new(),
             cache_ttl: Duration::from_secs(5),
         }
     }
@@ -33,6 +35,11 @@ impl PidResolver for LinuxPidResolver {
     async fn pid_for_peer(&self, local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
         let this = self.clone();
         spawn_blocking(move || this.pid_for_peer_blocking(local, peer)).await?
+    }
+
+    async fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+        let this = self.clone();
+        spawn_blocking(move || this.parent_pid_blocking(pid)).await?
     }
 }
 
@@ -64,6 +71,45 @@ impl LinuxPidResolver {
         self.inode_cache.insert(inode, (pid, Instant::now()));
         Ok(Some(pid))
     }
+
+    fn parent_pid_blocking(&self, pid: u32) -> Result<Option<u32>> {
+        if let Some(entry) = self.ppid_cache.get(&pid) {
+            let (ppid, at) = entry.value();
+            if at.elapsed() <= self.cache_ttl {
+                return Ok(*ppid);
+            }
+        }
+
+        let stat_path = format!("/proc/{pid}/stat");
+        let stat = match fs::read_to_string(&stat_path) {
+            Ok(s) => s,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.ppid_cache.insert(pid, (None, Instant::now()));
+                return Ok(None);
+            }
+            Err(err) => return Err(err).with_context(|| format!("read {stat_path}")),
+        };
+
+        let ppid = parse_ppid_from_proc_stat(&stat).with_context(|| {
+            format!("parse parent pid (ppid) from /proc stat for pid {pid}: {stat:?}")
+        })?;
+
+        let ppid = if ppid == 0 { None } else { Some(ppid) };
+        self.ppid_cache.insert(pid, (ppid, Instant::now()));
+        Ok(ppid)
+    }
+}
+
+fn parse_ppid_from_proc_stat(stat: &str) -> Option<u32> {
+    // `/proc/<pid>/stat` format (simplified):
+    // pid (comm) state ppid ...
+    //
+    // `comm` can contain spaces, so we locate the final `)` and split after it.
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.trim_start().split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?;
+    ppid.parse::<u32>().ok()
 }
 
 fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
@@ -248,5 +294,17 @@ mod tests {
     fn parses_socket_inode() {
         assert_eq!(parse_socket_inode("socket:[12345]"), Some(12345));
         assert_eq!(parse_socket_inode("anon_inode:[eventfd]"), None);
+    }
+
+    #[test]
+    fn parses_ppid_from_proc_stat_with_spaces_in_comm() {
+        let stat = "12345 (some process name) S 4242 1 2 3 4 5";
+        assert_eq!(parse_ppid_from_proc_stat(stat), Some(4242));
+    }
+
+    #[test]
+    fn parses_ppid_from_proc_stat_with_parens_in_comm() {
+        let stat = "12345 (weird)name) R 99 1 2 3 4";
+        assert_eq!(parse_ppid_from_proc_stat(stat), Some(99));
     }
 }

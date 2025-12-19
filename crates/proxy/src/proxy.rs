@@ -26,6 +26,8 @@ use crate::{
     log_capture::{Capture, CaptureConfig, SharedCapture},
 };
 
+const MAX_ANCESTOR_PID_DEPTH: usize = 64;
+
 #[derive(Clone)]
 pub struct AppState {
     pub listen_addr: SocketAddr,
@@ -81,9 +83,23 @@ async fn handle_proxy_inner(
         }
     };
 
-    let provider_name = pid
-        .and_then(|pid| state.pid_routes.get(&pid).map(|v| v.value().clone()))
-        .unwrap_or_else(|| state.cfg.default_provider.clone());
+    let (provider_name, route_pid) = match pid {
+        Some(pid) => match find_provider_for_pid_or_ancestors(&state, pid).await {
+            Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
+            Ok(None) => (state.cfg.default_provider.clone(), None),
+            Err(err) => {
+                warn!(
+                    request_id,
+                    pid,
+                    peer = %peer,
+                    error = %err,
+                    "ancestor pid route lookup failed; falling back to default provider"
+                );
+                (state.cfg.default_provider.clone(), None)
+            }
+        },
+        None => (state.cfg.default_provider.clone(), None),
+    };
 
     let provider = state
         .cfg
@@ -98,6 +114,7 @@ async fn handle_proxy_inner(
         info!(
             request_id,
             pid,
+            route_pid,
             peer = %peer,
             provider = %provider_name,
             method = %parts.method,
@@ -107,6 +124,7 @@ async fn handle_proxy_inner(
         debug!(
             request_id,
             pid,
+            route_pid,
             provider = %provider_name,
             headers = ?parts.headers,
             "request headers"
@@ -147,6 +165,7 @@ async fn handle_proxy_inner(
         info!(
             request_id,
             pid,
+            route_pid,
             peer = %peer,
             provider = %provider_name,
             status = %status,
@@ -156,6 +175,7 @@ async fn handle_proxy_inner(
         debug!(
             request_id,
             pid,
+            route_pid,
             provider = %provider_name,
             headers = ?resp_headers,
             "response headers"
@@ -168,6 +188,7 @@ async fn handle_proxy_inner(
             debug!(
                 request_id,
                 pid,
+                route_pid,
                 provider = %provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
@@ -186,6 +207,7 @@ async fn handle_proxy_inner(
             debug!(
                 request_id,
                 pid,
+                route_pid,
                 provider = %provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
@@ -197,6 +219,37 @@ async fn handle_proxy_inner(
     };
 
     Ok(builder.body(body)?)
+}
+
+async fn find_provider_for_pid_or_ancestors(
+    state: &AppState,
+    pid: u32,
+) -> Result<Option<(u32, String)>> {
+    if let Some(provider) = state.pid_routes.get(&pid) {
+        return Ok(Some((pid, provider.value().clone())));
+    }
+
+    let mut current = pid;
+    for _ in 0..MAX_ANCESTOR_PID_DEPTH {
+        let parent = match state.pid_resolver.parent_pid(current).await? {
+            Some(ppid) => ppid,
+            None => break,
+        };
+        if parent == 0 || parent == current {
+            break;
+        }
+
+        if let Some(provider) = state.pid_routes.get(&parent) {
+            return Ok(Some((parent, provider.value().clone())));
+        }
+
+        if parent == 1 {
+            break;
+        }
+        current = parent;
+    }
+
+    Ok(None)
 }
 
 fn strip_listen_base_path<'a>(base_path: &str, incoming_path: &'a str) -> Option<&'a str> {

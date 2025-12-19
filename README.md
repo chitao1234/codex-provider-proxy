@@ -43,6 +43,8 @@ If `rpc_token` is set in the proxy config, pass `--token` to the client.
 - The proxy rewrites:
   - Destination URL to `provider.base_url + (incoming_path_minus_listen_base_path) + incoming_query`
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
+- PID routing lookup checks the client PID first; if no route exists it walks up the process tree
+  (parent PID, grandparent PID, etc.) and uses the first ancestor with a defined route.
 - By default, the runtime PID routing table is empty, so all requests go to `default_provider`.
 
 ## Path Prefix Example
