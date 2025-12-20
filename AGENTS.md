@@ -2,8 +2,8 @@
 
 This repository is a Rust workspace for a local HTTP reverse proxy that routes requests to different upstream
 "providers" (base URL + API key). The special routing behavior is based on the **PID of the client process**
-that opened the TCP connection (Linux `/proc`-based implementation today), with a local RPC server to manage
-PID→provider mappings at runtime.
+that opened the TCP connection (Linux `/proc`-based implementation and Windows `GetExtendedTcpTable`-based
+implementation), with a local RPC server to manage PID→provider mappings at runtime.
 
 ## Project Structure
 
@@ -19,8 +19,8 @@ Crates:
   - Purpose: resolve the PID for the *peer end* of a loopback TCP connection
   - Key files:
     - `crates/pid-resolver/src/lib.rs` — `PidResolver` trait
-    - `crates/pid-resolver/src/platform/` — platform implementations (`linux.rs` today)
-    - `crates/pid-resolver/tests/resolves_peer_pid.rs` — Linux-only integration test
+    - `crates/pid-resolver/src/platform/` — platform implementations (`linux.rs`, `windows.rs`)
+    - `crates/pid-resolver/tests/resolves_peer_pid.rs` — integration test (OS-specific assertions)
     - `crates/pid-resolver/src/bin/pid_resolver_test_client.rs` — helper binary used by integration tests
 
 - `crates/proxy/` (binary: `codex-provider-proxy`)
@@ -38,7 +38,12 @@ Crates:
 
 - `crates/proxyctl/` (binary: `codex-provider-proxyctl`)
   - Purpose: CLI RPC client to manage PID routes
-  - Key file: `crates/proxyctl/src/main.rs`
+  - Key files:
+    - `crates/proxyctl/src/main.rs` — CLI entrypoint, RPC client, and `match` subcommand
+    - `crates/proxyctl/src/process_scan.rs` — local process scan helpers (Linux `/proc`; Windows Toolhelp + PEB-based cwd)
+    - `crates/proxyctl/src/bin/process_scan_test_target.rs` — helper binary used by Windows scan tests
+    - `crates/proxyctl/tests/process_scan_finds_child_by_cmdline_windows.rs` — Windows integration test for process scanning
+    - `crates/proxyctl/tests/process_scan_finds_self.rs` — Linux/Windows integration test for process scanning
 
 ## Key Behaviors / Invariants
 
