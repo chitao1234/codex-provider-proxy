@@ -6,7 +6,10 @@ use codex_provider_proxy_rpc_types::{
     DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, SetDefaultProviderRequest,
     SetRouteRequest,
 };
+use regex::Regex;
 use serde::Deserialize;
+
+use codex_provider_proxyctl::process_scan;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-provider-proxyctl")]
@@ -56,6 +59,28 @@ enum Cmd {
 
     /// List configured providers and the default provider
     Providers,
+
+    /// Match processes by cmdline regex and set PID routes interactively
+    Match {
+        /// Rust regex matched against the full cmdline string.
+        /// (The cmdline is constructed from platform-specific process metadata; on Linux this reads
+        /// /proc/<pid>/cmdline and joins with spaces.)
+        /// If omitted, uses a built-in default regex.
+        #[arg(value_name = "REGEX", default_value = DEFAULT_MATCH_REGEX)]
+        regex: String,
+
+        /// Only consider the first N matching PIDs.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Print matching processes without setting any routes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply this provider to all matching PIDs (non-interactive).
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +105,55 @@ fn default_rpc_url() -> String {
     "http://127.0.0.1:8081".to_string()
 }
 
+const DEFAULT_MATCH_REGEX: &str = "codex";
+
+async fn rpc_list_providers(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    token: Option<&String>,
+) -> Result<ProvidersResponse> {
+    let url = format!("{}/rpc/v1/providers", rpc_url.trim_end_matches('/'));
+    let mut req = client.get(url);
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.context("send providers request")?;
+    let resp = resp
+        .error_for_status()
+        .context("providers returned error status")?;
+    resp.json().await.context("decode response")
+}
+
+async fn rpc_set_route(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    token: Option<&String>,
+    pid: u32,
+    provider: String,
+) -> Result<()> {
+    let url = format!("{}/rpc/v1/routes", rpc_url.trim_end_matches('/'));
+    let mut req = client.post(url).json(&SetRouteRequest { pid, provider });
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.context("send set request")?;
+    resp.error_for_status_ref()
+        .context("set route returned error status")?;
+    Ok(())
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+
+    let mut out = std::io::stdout().lock();
+    write!(out, "{prompt}")?;
+    out.flush()?;
+
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).context("read stdin")?;
+    Ok(s.trim().to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -95,22 +169,14 @@ async fn main() -> Result<()> {
 
     match args.cmd {
         Cmd::Set { pid, provider } => {
-            let url = format!("{}/rpc/v1/routes", rpc_url.trim_end_matches('/'));
-            let mut req = client.post(url).json(&SetRouteRequest { pid, provider });
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send set request")?;
-            resp.error_for_status_ref()
-                .context("set route returned error status")?;
+            rpc_set_route(&client, &rpc_url, token.as_ref(), pid, provider).await?;
             println!("ok");
         }
         Cmd::SetDefault { provider } => {
-            let url = format!(
-                "{}/rpc/v1/default-provider",
-                rpc_url.trim_end_matches('/')
-            );
-            let mut req = client.post(url).json(&SetDefaultProviderRequest { provider });
+            let url = format!("{}/rpc/v1/default-provider", rpc_url.trim_end_matches('/'));
+            let mut req = client
+                .post(url)
+                .json(&SetDefaultProviderRequest { provider });
             if let Some(token) = &token {
                 req = req.bearer_auth(token);
             }
@@ -159,19 +225,96 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Providers => {
-            let url = format!("{}/rpc/v1/providers", rpc_url.trim_end_matches('/'));
-            let mut req = client.get(url);
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send providers request")?;
-            let resp = resp
-                .error_for_status()
-                .context("providers returned error status")?;
-            let out: ProvidersResponse = resp.json().await.context("decode response")?;
+            let out = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
             println!("default={}", out.default_provider);
             for p in out.providers {
                 println!("provider={}", p);
+            }
+        }
+        Cmd::Match {
+            regex,
+            limit,
+            dry_run,
+            provider,
+        } => {
+            let re = Regex::new(&regex).context("compile regex")?;
+            let (matches, stats) = process_scan::find_processes_by_cmdline_regex(&re, limit)?;
+
+            if matches.is_empty() {
+                println!(
+                    "no matches (seen_pids={} unreadable_cmdline={} unreadable_cwd={})",
+                    stats.pids_seen, stats.unreadable_cmdline, stats.unreadable_cwd
+                );
+                return Ok(());
+            }
+
+            let providers = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
+            println!(
+                "matched={} (seen_pids={} unreadable_cmdline={} unreadable_cwd={})",
+                matches.len(),
+                stats.pids_seen,
+                stats.unreadable_cmdline,
+                stats.unreadable_cwd
+            );
+            println!("default={}", providers.default_provider);
+            for p in &providers.providers {
+                println!("provider={}", p);
+            }
+
+            let Some(provider) = provider else {
+                for m in matches {
+                    println!("pid={}", m.pid);
+                    println!("cwd={}", m.cwd);
+                    println!("cmdline={}", m.cmdline);
+
+                    loop {
+                        let input = prompt_line("provider (empty=skip, q=quit, ?=providers): ")?;
+                        if input.is_empty() {
+                            break;
+                        }
+                        if input == "q" || input == "quit" {
+                            return Ok(());
+                        }
+                        if input == "?" {
+                            println!("default={}", providers.default_provider);
+                            for p in &providers.providers {
+                                println!("provider={}", p);
+                            }
+                            continue;
+                        }
+                        if !providers.providers.iter().any(|p| p == &input) {
+                            eprintln!("unknown provider: {input}");
+                            continue;
+                        }
+
+                        if dry_run {
+                            println!("dry-run: would set pid={} provider={}", m.pid, input);
+                        } else {
+                            rpc_set_route(&client, &rpc_url, token.as_ref(), m.pid, input).await?;
+                            println!("ok");
+                        }
+                        break;
+                    }
+                }
+
+                return Ok(());
+            };
+
+            if !providers.providers.iter().any(|p| p == &provider) {
+                anyhow::bail!("unknown provider: {provider}");
+            }
+
+            for m in matches {
+                println!("pid={}", m.pid);
+                println!("cwd={}", m.cwd);
+                println!("cmdline={}", m.cmdline);
+                if dry_run {
+                    println!("dry-run: would set pid={} provider={}", m.pid, provider);
+                } else {
+                    rpc_set_route(&client, &rpc_url, token.as_ref(), m.pid, provider.clone())
+                        .await?;
+                    println!("ok");
+                }
             }
         }
     }

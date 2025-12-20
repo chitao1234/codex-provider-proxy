@@ -7,8 +7,20 @@ edition.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 codex-provider-proxy-rpc-types = { path = "../rpc-types" }
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = ">=0.59, <=0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Kernel",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Wdk_System_Threading",
+] }

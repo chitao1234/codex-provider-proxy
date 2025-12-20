@@ -36,6 +36,16 @@ cargo run -p codex-provider-proxyctl -- set --pid "$pid" --provider provider_b
 
 If `rpc_token` is set in the proxy config, pass `--token` to the client.
 
+You can also interactively set PID routes for multiple processes by matching a regex against each process
+cmdline (Linux `/proc`, Windows Toolhelp + Win32 process APIs):
+
+```bash
+# Prompts you per match to enter a provider name (or press enter to skip).
+cargo run -p codex-provider-proxyctl -- match 'python|node'
+```
+
+If you omit the regex, `proxyctl` uses its built-in default match regex.
+
 You can also change the runtime default provider (used when no PID route matches):
 
 ```bash
