@@ -374,9 +374,7 @@ fn pid_for_inode(inode: u64) -> Result<Option<u32>> {
     }
     debug!(
         inode,
-        scanned_pids,
-        scanned_fds,
-        "pid resolver: no pid found owning socket inode"
+        scanned_pids, scanned_fds, "pid resolver: no pid found owning socket inode"
     );
     Ok(None)
 }

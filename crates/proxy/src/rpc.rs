@@ -9,8 +9,8 @@ use axum::{
     Json, Router,
 };
 use codex_provider_proxy_rpc_types::{
-    DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, RouteEntry, SetDefaultProviderRequest,
-    SetRouteRequest,
+    DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, RouteEntry,
+    SetDefaultProviderRequest, SetRouteRequest,
 };
 use dashmap::DashMap;
 use tokio::sync::RwLock;
