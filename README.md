@@ -56,7 +56,10 @@ cargo run -p codex-provider-proxyctl -- set-default --provider provider_b
 
 ## Notes
 
-- Only loopback (localhost) connections are accepted.
+- The proxy can accept non-loopback connections (depending on `listen_addr`), but non-loopback clients
+  always route to `default_provider` for now.
+- RPC access is loopback-only when `rpc_listen_addr` is loopback (the default). If you set
+  `rpc_listen_addr` to a non-loopback address, non-loopback RPC clients are allowed.
 - The proxy rewrites:
   - Destination URL to `provider.base_url + (incoming_path_minus_listen_base_path) + incoming_query`
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)

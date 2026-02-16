@@ -106,18 +106,6 @@ struct ProviderFile {
 impl Config {
     pub fn from_toml_str(toml_str: &str) -> Result<Self> {
         let file: ConfigFile = toml::from_str(toml_str).context("parse config toml")?;
-        if !file.listen_addr.ip().is_loopback() {
-            return Err(anyhow!(
-                "listen_addr must be loopback (got {})",
-                file.listen_addr
-            ));
-        }
-        if !file.rpc_listen_addr.ip().is_loopback() {
-            return Err(anyhow!(
-                "rpc_listen_addr must be loopback (got {})",
-                file.rpc_listen_addr
-            ));
-        }
         let listen_base_path = normalize_base_path(&file.listen_base_path)?;
         let mut providers = HashMap::new();
         for (name, provider) in file.providers {

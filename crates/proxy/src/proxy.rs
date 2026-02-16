@@ -66,29 +66,34 @@ async fn handle_proxy_inner(
     let request_id = state.request_seq.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
 
-    if !peer.ip().is_loopback() {
-        return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("only loopback connections are supported\n"))?);
-    }
-
-    let pid = match state
-        .pid_resolver
-        .pid_for_peer(state.listen_addr, peer)
-        .await
-    {
-        Ok(pid) => pid,
-        Err(err) => {
-            warn!(request_id, peer = %peer, error = %err, "pid resolution failed");
-            None
+    let is_loopback_peer = peer.ip().is_loopback();
+    let pid = if is_loopback_peer {
+        match state
+            .pid_resolver
+            .pid_for_peer(state.listen_addr, peer)
+            .await
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                warn!(request_id, peer = %peer, error = %err, "pid resolution failed");
+                None
+            }
         }
+    } else {
+        if !state.pid_routes.is_empty() {
+            debug!(
+                request_id,
+                peer = %peer,
+                "non-loopback peer cannot be PID-routed; falling back to default provider"
+            );
+        }
+        None
     };
 
     // `pid_for_peer` is best-effort and may return Ok(None) (e.g. short-lived connections,
     // /proc visibility/permission issues, or inability to map the socket to a process).
     // If PID routing is in use, surface this so it's not silently surprising.
-    if pid.is_none() && !state.pid_routes.is_empty() {
+    if is_loopback_peer && pid.is_none() && !state.pid_routes.is_empty() {
         warn!(
             request_id,
             peer = %peer,

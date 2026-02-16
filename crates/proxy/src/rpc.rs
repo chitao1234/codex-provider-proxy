@@ -39,11 +39,13 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-fn ensure_loopback(peer: SocketAddr) -> Result<()> {
-    if peer.ip().is_loopback() {
+fn ensure_peer_allowed(peer: SocketAddr, rpc_listen_addr: SocketAddr) -> Result<()> {
+    if !rpc_listen_addr.ip().is_loopback() || peer.ip().is_loopback() {
         Ok(())
     } else {
-        Err(anyhow!("only loopback connections are supported"))
+        Err(anyhow!(
+            "only loopback RPC clients are allowed when rpc_listen_addr is loopback"
+        ))
     }
 }
 
@@ -72,7 +74,7 @@ async fn list_routes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -97,7 +99,7 @@ async fn set_route(
     headers: HeaderMap,
     Json(req): Json<SetRouteRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -122,7 +124,7 @@ async fn delete_route(
     headers: HeaderMap,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -138,7 +140,7 @@ async fn clear_routes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -154,7 +156,7 @@ async fn list_providers(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -178,7 +180,7 @@ async fn set_default_provider(
     headers: HeaderMap,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_loopback(peer) {
+    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
     if let Err(err) = ensure_auth(&headers, &state.cfg) {
@@ -195,4 +197,32 @@ async fn set_default_provider(
 
     *state.default_provider.write().await = req.provider;
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::ensure_peer_allowed;
+
+    #[test]
+    fn loopback_rpc_listener_rejects_non_loopback_peer() {
+        let peer: SocketAddr = "192.168.1.100:50000".parse().unwrap();
+        let rpc_listen_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        assert!(ensure_peer_allowed(peer, rpc_listen_addr).is_err());
+    }
+
+    #[test]
+    fn loopback_rpc_listener_allows_loopback_peer() {
+        let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let rpc_listen_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        assert!(ensure_peer_allowed(peer, rpc_listen_addr).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_rpc_listener_allows_non_loopback_peer() {
+        let peer: SocketAddr = "192.168.1.100:50000".parse().unwrap();
+        let rpc_listen_addr: SocketAddr = "0.0.0.0:8081".parse().unwrap();
+        assert!(ensure_peer_allowed(peer, rpc_listen_addr).is_ok());
+    }
 }

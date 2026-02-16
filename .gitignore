@@ -21,4 +21,7 @@ target
 #.idea/
 
 config.toml
+config.toml.*
+config.*.toml
+!config.example.toml
 .DS_Store
