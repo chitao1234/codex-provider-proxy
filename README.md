@@ -21,6 +21,10 @@ cp config.example.toml config.toml
 cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
+The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
+addresses, `rpc_listen_addr`, `rpc_token`, request/response/body logging flags, and tracing `logging.level` /
+`logging.rule` takes effect without restarting the process.
+
 To print an example config:
 
 ```bash
@@ -56,7 +60,7 @@ cargo run -p codex-provider-proxyctl -- set-default --provider provider_b
 
 ## Notes
 
-- The proxy can accept non-loopback connections (depending on `listen_addr`), but non-loopback clients
+- The proxy can accept non-loopback connections (depending on `listen_addrs` / legacy `listen_addr`), but non-loopback clients
   always route to `default_provider` for now.
 - RPC access is loopback-only when `rpc_listen_addr` is loopback (the default). If you set
   `rpc_listen_addr` to a non-loopback address, non-loopback RPC clients are allowed.
@@ -66,6 +70,7 @@ cargo run -p codex-provider-proxyctl -- set-default --provider provider_b
 - PID routing lookup checks the client PID first; if no route exists it walks up the process tree
   (parent PID, grandparent PID, etc.) and uses the first ancestor with a defined route.
 - By default, the runtime PID routing table is empty, so all requests go to `default_provider`.
+- When a config reload removes a provider, any PID routes pointing at that provider are dropped automatically.
 
 ## Path Prefix Example
 
@@ -73,3 +78,30 @@ If the proxy config sets `listen_base_path = "/v1"` and the selected provider ha
 
 - Incoming: `http://127.0.0.1:8080/v1/models`
 - Upstream: `https://example.com/v2/models`
+
+## Multiple Listen Addresses
+
+You can bind the proxy to more than one address at once:
+
+```toml
+listen_addrs = ["127.0.0.1:8080", "127.0.0.1:8082"]
+```
+
+Editing that list while the proxy is running adds new listeners and gracefully shuts down listeners that were
+removed from the config.
+
+## Runtime Logging
+
+The `[logging]` section controls both request/response/body capture and the tracing filter:
+
+```toml
+[logging]
+level = "info"
+rule = "codex_provider_proxy=debug,hyper=warn"
+log_requests = true
+log_responses = true
+log_bodies = false
+max_body_log_bytes = 8192
+```
+
+Changing any of those values in `config.toml` updates the running process without a restart.

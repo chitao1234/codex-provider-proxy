@@ -1,6 +1,7 @@
 # codex-provider-proxy example config
 # Set to 0.0.0.0:8080 to accept non-loopback clients (they currently always use default_provider).
-listen_addr = "127.0.0.1:8080"
+# The legacy singular `listen_addr` key is still accepted, but `listen_addrs` supports multiple listeners.
+listen_addrs = ["127.0.0.1:8080"]
 # Requests must be sent to this path prefix. Example: "/v1" means the proxy accepts /v1/* and forwards only the suffix.
 listen_base_path = "/v1"
 # Set to a non-loopback address (for example 0.0.0.0:8081) to allow non-loopback RPC clients.
@@ -10,6 +11,9 @@ rpc_listen_addr = "127.0.0.1:8081"
 default_provider = "provider_a"
 
 [logging]
+level = "info"
+# Optional extra tracing filter directives appended after `level`.
+# rule = "codex_provider_proxy=debug,hyper=warn"
 log_requests = true
 log_responses = true
 log_bodies = false

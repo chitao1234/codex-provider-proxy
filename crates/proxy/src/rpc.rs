@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -12,16 +12,12 @@ use codex_provider_proxy_rpc_types::{
     DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, RouteEntry,
     SetDefaultProviderRequest, SetRouteRequest,
 };
-use dashmap::DashMap;
-use tokio::sync::RwLock;
 
-use crate::config::Config;
+use crate::{config::Config, runtime::RuntimeState};
 
 #[derive(Clone)]
 pub struct RpcState {
-    pub cfg: Arc<Config>,
-    pub default_provider: Arc<RwLock<String>>,
-    pub pid_routes: Arc<DashMap<u32, String>>,
+    pub runtime: RuntimeState,
 }
 
 pub fn router(state: RpcState) -> Router {
@@ -74,15 +70,17 @@ async fn list_routes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
     let mut routes: Vec<RouteEntry> = state
-        .pid_routes
+        .runtime
+        .pid_routes()
         .iter()
         .map(|e| RouteEntry {
             pid: *e.key(),
@@ -99,14 +97,15 @@ async fn set_route(
     headers: HeaderMap,
     Json(req): Json<SetRouteRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
-    if !state.cfg.providers.contains_key(&req.provider) {
+    if !cfg.providers.contains_key(&req.provider) {
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown provider: {}\n", req.provider),
@@ -114,7 +113,7 @@ async fn set_route(
             .into_response();
     }
 
-    state.pid_routes.insert(req.pid, req.provider);
+    state.runtime.pid_routes().insert(req.pid, req.provider);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -124,14 +123,15 @@ async fn delete_route(
     headers: HeaderMap,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
-    let removed = state.pid_routes.remove(&pid).is_some();
+    let removed = state.runtime.pid_routes().remove(&pid).is_some();
     Json(DeleteRouteResponse { removed }).into_response()
 }
 
@@ -140,14 +140,15 @@ async fn clear_routes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
-    state.pid_routes.clear();
+    state.runtime.pid_routes().clear();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -156,17 +157,18 @@ async fn list_providers(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
-    let mut providers: Vec<String> = state.cfg.providers.keys().cloned().collect();
+    let mut providers: Vec<String> = cfg.providers.keys().cloned().collect();
     providers.sort();
 
-    let default_provider = state.default_provider.read().await.clone();
+    let default_provider = state.runtime.default_provider().await;
     Json(ProvidersResponse {
         default_provider,
         providers,
@@ -180,14 +182,15 @@ async fn set_default_provider(
     headers: HeaderMap,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = ensure_peer_allowed(peer, state.cfg.rpc_listen_addr) {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
-    if let Err(err) = ensure_auth(&headers, &state.cfg) {
+    if let Err(err) = ensure_auth(&headers, &cfg) {
         return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
     }
 
-    if !state.cfg.providers.contains_key(&req.provider) {
+    if !cfg.providers.contains_key(&req.provider) {
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown provider: {}\n", req.provider),
@@ -195,7 +198,7 @@ async fn set_default_provider(
             .into_response();
     }
 
-    *state.default_provider.write().await = req.provider;
+    state.runtime.set_default_provider(req.provider).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

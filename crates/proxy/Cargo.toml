@@ -13,6 +13,7 @@ dashmap.workspace = true
 futures-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+notify.workspace = true
 pin-project-lite.workspace = true
 pid-resolver = { path = "../pid-resolver" }
 reqwest.workspace = true
