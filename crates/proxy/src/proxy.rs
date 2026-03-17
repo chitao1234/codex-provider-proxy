@@ -185,7 +185,19 @@ async fn handle_proxy_inner(
         .headers(headers)
         .body(req_body);
 
-    let resp = out.send().await.context("send upstream request")?;
+    let resp = match out.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            if let Some(exchange_logger) = &exchange_logger {
+                if let Ok(mut logger) = exchange_logger.lock() {
+                    logger
+                        .mark_upstream_send_error(started.elapsed().as_millis(), &err.to_string());
+                    logger.finalize();
+                }
+            }
+            return Err(err).context("send upstream request");
+        }
+    };
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 

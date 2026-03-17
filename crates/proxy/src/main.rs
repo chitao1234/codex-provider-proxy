@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         .init();
 
     let http_client = reqwest::Client::builder()
-        .user_agent("codex-provider-proxy/0.1.0")
+        .user_agent("codex-provider-proxy/0.1.1")
         .build()
         .context("build reqwest client")?;
     let runtime = RuntimeState::new(

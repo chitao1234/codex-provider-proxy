@@ -64,6 +64,8 @@ pub fn maybe_create_exchange_logger(
 #[derive(Debug)]
 pub struct ExchangeFileLogger {
     request_id: u64,
+    metadata_path: PathBuf,
+    metadata: ExchangeMetadata,
     request_body_path: PathBuf,
     response_body_path: PathBuf,
     request_body_writer: Option<BufWriter<File>>,
@@ -71,6 +73,8 @@ pub struct ExchangeFileLogger {
     response_headers_path: PathBuf,
     reconstructed_path: PathBuf,
     should_reconstruct: bool,
+    request_body_bytes: u64,
+    response_body_bytes: u64,
 }
 
 impl ExchangeFileLogger {
@@ -90,10 +94,7 @@ impl ExchangeFileLogger {
     ) -> std::io::Result<Self> {
         fs::create_dir_all(root_dir)?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now = now_unix_ms();
         let stem = format!("{now}_req_{request_id}");
 
         let metadata_path = root_dir.join(format!("{stem}.meta.json"));
@@ -114,6 +115,17 @@ impl ExchangeFileLogger {
             uri: uri.to_string(),
             upstream_url: upstream_url.to_string(),
             should_reconstruct,
+            response_status_code: None,
+            response_status_text: None,
+            upstream_latency_ms: None,
+            completed_unix_ms: None,
+            total_duration_ms: None,
+            upstream_error: None,
+            request_body_bytes: 0,
+            response_body_bytes: 0,
+            reconstruction_attempted: false,
+            reconstruction_succeeded: None,
+            reconstruction_error: None,
             files: ExchangeMetadataFiles {
                 request_headers: request_headers_path.display().to_string(),
                 request_body: request_body_path.display().to_string(),
@@ -132,6 +144,8 @@ impl ExchangeFileLogger {
 
         Ok(Self {
             request_id,
+            metadata_path,
+            metadata,
             request_body_path: request_body_path.clone(),
             response_body_path: response_body_path.clone(),
             request_body_writer: Some(BufWriter::new(File::create(&request_body_path)?)),
@@ -139,10 +153,15 @@ impl ExchangeFileLogger {
             response_headers_path,
             reconstructed_path,
             should_reconstruct,
+            request_body_bytes: 0,
+            response_body_bytes: 0,
         })
     }
 
     pub fn on_request_body_chunk(&mut self, chunk: &Bytes) {
+        self.request_body_bytes = self
+            .request_body_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         write_chunk_best_effort(
             self.request_id,
             &self.request_body_path,
@@ -153,6 +172,9 @@ impl ExchangeFileLogger {
     }
 
     pub fn on_response_body_chunk(&mut self, chunk: &Bytes) {
+        self.response_body_bytes = self
+            .response_body_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         write_chunk_best_effort(
             self.request_id,
             &self.response_body_path,
@@ -184,6 +206,17 @@ impl ExchangeFileLogger {
                 "failed to write response headers log"
             );
         }
+        self.metadata.response_status_code = Some(status.as_u16());
+        self.metadata.response_status_text = Some(status_text.to_string());
+        self.metadata.upstream_latency_ms = Some(latency_ms);
+        self.metadata.upstream_error = None;
+        self.persist_metadata_best_effort("write response metadata");
+    }
+
+    pub fn mark_upstream_send_error(&mut self, latency_ms: u128, err: &str) {
+        self.metadata.upstream_latency_ms = Some(latency_ms);
+        self.metadata.upstream_error = Some(truncate_meta_error(err));
+        self.persist_metadata_best_effort("write upstream error metadata");
     }
 
     pub fn finalize(&mut self) {
@@ -200,19 +233,38 @@ impl ExchangeFileLogger {
             "response body",
         );
 
-        if !self.should_reconstruct {
-            return;
+        self.metadata.request_body_bytes = self.request_body_bytes;
+        self.metadata.response_body_bytes = self.response_body_bytes;
+        self.metadata.completed_unix_ms = Some(now_unix_ms());
+        self.metadata.total_duration_ms = Some(
+            self.metadata
+                .completed_unix_ms
+                .unwrap_or(self.metadata.started_unix_ms)
+                .saturating_sub(self.metadata.started_unix_ms),
+        );
+
+        if self.should_reconstruct {
+            self.metadata.reconstruction_attempted = true;
         }
 
-        if let Err(err) = self.reconstruct_and_write() {
-            warn!(
-                request_id = self.request_id,
-                response_body = %self.response_body_path.display(),
-                reconstructed = %self.reconstructed_path.display(),
-                error = %err,
-                "response reconstruction failed; proxy response was unaffected"
-            );
+        if self.should_reconstruct {
+            if let Err(err) = self.reconstruct_and_write() {
+                self.metadata.reconstruction_succeeded = Some(false);
+                self.metadata.reconstruction_error = Some(truncate_meta_error(&err.to_string()));
+                warn!(
+                    request_id = self.request_id,
+                    response_body = %self.response_body_path.display(),
+                    reconstructed = %self.reconstructed_path.display(),
+                    error = %err,
+                    "response reconstruction failed; proxy response was unaffected"
+                );
+            } else {
+                self.metadata.reconstruction_succeeded = Some(true);
+                self.metadata.reconstruction_error = None;
+            }
         }
+
+        self.persist_metadata_best_effort("finalize exchange metadata");
     }
 
     fn reconstruct_and_write(&self) -> std::io::Result<()> {
@@ -224,6 +276,31 @@ impl ExchangeFileLogger {
         let raw_text = String::from_utf8_lossy(&raw);
         let reconstructed = reconstruct_response_payload(&raw_text);
         fs::write(&self.reconstructed_path, reconstructed.as_bytes())
+    }
+
+    fn persist_metadata_best_effort(&self, action: &'static str) {
+        match serde_json::to_vec_pretty(&self.metadata) {
+            Ok(bytes) => {
+                if let Err(err) = fs::write(&self.metadata_path, bytes) {
+                    warn!(
+                        request_id = self.request_id,
+                        path = %self.metadata_path.display(),
+                        action,
+                        error = %err,
+                        "failed to write exchange metadata"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    request_id = self.request_id,
+                    path = %self.metadata_path.display(),
+                    action,
+                    error = %err,
+                    "failed to serialize exchange metadata"
+                );
+            }
+        }
     }
 }
 
@@ -239,6 +316,17 @@ struct ExchangeMetadata {
     uri: String,
     upstream_url: String,
     should_reconstruct: bool,
+    response_status_code: Option<u16>,
+    response_status_text: Option<String>,
+    upstream_latency_ms: Option<u128>,
+    completed_unix_ms: Option<u128>,
+    total_duration_ms: Option<u128>,
+    upstream_error: Option<String>,
+    request_body_bytes: u64,
+    response_body_bytes: u64,
+    reconstruction_attempted: bool,
+    reconstruction_succeeded: Option<bool>,
+    reconstruction_error: Option<String>,
     files: ExchangeMetadataFiles,
 }
 
@@ -249,6 +337,22 @@ struct ExchangeMetadataFiles {
     response_headers: String,
     response_body: String,
     reconstructed_response: Option<String>,
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn truncate_meta_error(value: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(MAX_CHARS).collect();
+    format!("{truncated}...[truncated]")
 }
 
 fn write_request_headers_file(

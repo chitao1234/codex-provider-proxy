@@ -120,3 +120,50 @@ When `logging.reconstruct_responses = true`, requests whose URL path ends in `re
 
 Reconstruction is best-effort for OpenAI `v1/responses` SSE streams, with plain-text error fallback. Any
 reconstruction failure is logged as a warning and does not affect proxy forwarding behavior.
+
+`*.meta.json` also records machine-readable exchange status fields such as:
+- `response_status_code`
+- `upstream_latency_ms`
+- `completed_unix_ms`
+- `total_duration_ms`
+- `request_body_bytes`
+- `response_body_bytes`
+- `upstream_error` (when upstream send fails before response headers)
+
+## Log Analysis Utility
+
+You can analyze captured exchange logs (token usage, token categories, cache ratio, and latency stats):
+
+```bash
+cargo run -p codex-provider-proxyctl --bin log_analyze -- --dir logs/exchanges
+```
+
+Filter examples (filters can be combined; combination is AND):
+
+```bash
+# Time range by started_unix_ms (inclusive)
+cargo run -p codex-provider-proxyctl --bin log_analyze -- \
+  --dir logs/exchanges \
+  --from-unix-ms 1773756500000 \
+  --to-unix-ms 1773756800000
+
+# Provider filter
+cargo run -p codex-provider-proxyctl --bin log_analyze -- \
+  --dir logs/exchanges \
+  --provider packycode,rightcode
+
+# Model + provider + time range together
+cargo run -p codex-provider-proxyctl --bin log_analyze -- \
+  --dir logs/exchanges \
+  --provider packycode \
+  --model gpt-5,gpt-5-codex \
+  --from-unix-ms 1773756500000 \
+  --to-unix-ms 1773756800000
+```
+
+The utility scans `*.meta.json` and corresponding response logs, extracts `response.completed` usage from SSE
+payloads, and prints aggregate metrics:
+- Input/output/total tokens
+- Token detail categories (`input_tokens_details.*`, `output_tokens_details.*`)
+- Cache ratio (`cached_tokens / input_tokens`)
+- Upstream latency and total-duration statistics (`avg`, `p50`, `p95`, `min`, `max`)
