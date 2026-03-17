@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -38,6 +38,8 @@ pub struct LoggingConfig {
     pub log_responses: bool,
     pub log_bodies: bool,
     pub max_body_log_bytes: usize,
+    pub exchange_log_dir: Option<PathBuf>,
+    pub reconstruct_responses: bool,
     pub level: String,
     pub rule: Option<String>,
 }
@@ -86,6 +88,10 @@ struct LoggingFile {
     log_bodies: bool,
     #[serde(default = "default_max_body_log_bytes")]
     max_body_log_bytes: usize,
+    #[serde(default)]
+    exchange_log_dir: Option<String>,
+    #[serde(default = "default_reconstruct_responses")]
+    reconstruct_responses: bool,
     #[serde(default = "default_log_level")]
     level: String,
     #[serde(default)]
@@ -98,6 +104,10 @@ fn default_max_body_log_bytes() -> usize {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_reconstruct_responses() -> bool {
+    true
 }
 
 fn default_listen_base_path() -> String {
@@ -181,6 +191,14 @@ impl Config {
             ));
         }
 
+        let exchange_log_dir = match file.logging.exchange_log_dir {
+            Some(path) if path.trim().is_empty() => {
+                return Err(anyhow!("logging.exchange_log_dir cannot be empty"));
+            }
+            Some(path) => Some(PathBuf::from(path)),
+            None => None,
+        };
+
         Ok(Self {
             listen_addrs,
             listen_base_path,
@@ -193,6 +211,8 @@ impl Config {
                 log_responses: file.logging.log_responses,
                 log_bodies: file.logging.log_bodies,
                 max_body_log_bytes: file.logging.max_body_log_bytes,
+                exchange_log_dir,
+                reconstruct_responses: file.logging.reconstruct_responses,
                 level: file.logging.level,
                 rule: file.logging.rule,
             },

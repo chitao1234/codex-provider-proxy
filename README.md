@@ -22,8 +22,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
-addresses, `rpc_listen_addr`, `rpc_token`, request/response/body logging flags, and tracing `logging.level` /
-`logging.rule` takes effect without restarting the process.
+addresses, `rpc_listen_addr`, `rpc_token`, and all `[logging]` options takes effect without restarting the
+process.
 
 To print an example config:
 
@@ -102,6 +102,21 @@ log_requests = true
 log_responses = true
 log_bodies = false
 max_body_log_bytes = 8192
+# exchange_log_dir = "./logs/exchanges"
+reconstruct_responses = true
 ```
 
 Changing any of those values in `config.toml` updates the running process without a restart.
+
+If `logging.exchange_log_dir` is set, the proxy writes per-exchange files:
+- `<timestamp>_req_<id>.meta.json`
+- `<timestamp>_req_<id>.request_headers.txt`
+- `<timestamp>_req_<id>.request_body.bin`
+- `<timestamp>_req_<id>.response_headers.txt`
+- `<timestamp>_req_<id>.response_body.bin`
+
+When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` additionally produce:
+- `<timestamp>_req_<id>.response_reconstructed.txt`
+
+Reconstruction is best-effort for OpenAI `v1/responses` SSE streams, with plain-text error fallback. Any
+reconstruction failure is logged as a warning and does not affect proxy forwarding behavior.

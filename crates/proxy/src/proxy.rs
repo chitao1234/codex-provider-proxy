@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::{
     config::Provider,
+    exchange_log::{maybe_create_exchange_logger, SharedExchangeFileLogger},
     log_capture::{Capture, CaptureConfig, SharedCapture},
     runtime::RuntimeState,
 };
@@ -155,7 +156,21 @@ async fn handle_proxy_inner(
     };
     let url = build_outgoing_url(&provider, forwarded_path, parts.uri.query())?;
 
-    let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(&cfg, body);
+    let exchange_logger = maybe_create_exchange_logger(
+        &cfg.logging,
+        request_id,
+        peer,
+        pid,
+        route_pid,
+        &provider_name,
+        &parts.method,
+        &parts.uri,
+        &url,
+        &parts.headers,
+    );
+
+    let (req_body, req_body_capture) =
+        maybe_wrap_request_body_for_logging(&cfg, body, exchange_logger.clone());
     let mut headers = filtered_incoming_headers(&parts.headers);
     headers.insert(
         header::AUTHORIZATION,
@@ -195,6 +210,12 @@ async fn handle_proxy_inner(
         );
     }
 
+    if let Some(exchange_logger) = &exchange_logger {
+        if let Ok(mut logger) = exchange_logger.lock() {
+            logger.write_response_headers(status, &resp_headers, started.elapsed().as_millis());
+        }
+    }
+
     if cfg.logging.log_bodies {
         if let Some(cap) = req_body_capture {
             let summary = cap.lock().unwrap().summary();
@@ -213,9 +234,10 @@ async fn handle_proxy_inner(
     let mut builder = Response::builder().status(status);
     copy_response_headers(&resp_headers, builder.headers_mut().unwrap())?;
 
-    let (resp_stream, resp_capture) = response_stream_and_capture(&cfg, resp);
-    let body = if let Some(capture) = resp_capture {
-        Body::from_stream(LogOnEndStream::new(resp_stream, move || {
+    let (resp_stream, resp_capture) =
+        response_stream_and_capture(&cfg, resp, exchange_logger.clone());
+    let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
+        if let Some(capture) = resp_capture {
             let summary = capture.lock().unwrap().summary();
             debug!(
                 request_id,
@@ -226,10 +248,13 @@ async fn handle_proxy_inner(
                 body = %summary.as_lossy_utf8(),
                 "response body"
             );
-        }))
-    } else {
-        Body::from_stream(resp_stream)
-    };
+        }
+        if let Some(exchange_logger) = exchange_logger {
+            if let Ok(mut logger) = exchange_logger.lock() {
+                logger.finalize();
+            }
+        }
+    }));
 
     Ok(builder.body(body)?)
 }
@@ -350,25 +375,40 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 fn maybe_wrap_request_body_for_logging(
     cfg: &crate::config::Config,
     body: Body,
+    exchange_logger: Option<SharedExchangeFileLogger>,
 ) -> (reqwest::Body, Option<SharedCapture>) {
-    if !cfg.logging.log_bodies {
+    if !cfg.logging.log_bodies && exchange_logger.is_none() {
         let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
         return (reqwest::Body::wrap_stream(stream), None);
     }
 
-    let cap = Arc::new(std::sync::Mutex::new(Capture::new(CaptureConfig {
-        max_bytes: cfg.logging.max_body_log_bytes,
-    })));
+    let cap = if cfg.logging.log_bodies {
+        Some(Arc::new(std::sync::Mutex::new(Capture::new(
+            CaptureConfig {
+                max_bytes: cfg.logging.max_body_log_bytes,
+            },
+        ))))
+    } else {
+        None
+    };
     let cap2 = cap.clone();
+    let exchange_logger2 = exchange_logger.clone();
     let stream = TryStreamExt::inspect_ok(
         TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err),
         move |chunk| {
-            if let Ok(mut c) = cap2.lock() {
-                c.push_chunk(chunk);
+            if let Some(cap2) = &cap2 {
+                if let Ok(mut c) = cap2.lock() {
+                    c.push_chunk(chunk);
+                }
+            }
+            if let Some(exchange_logger) = &exchange_logger2 {
+                if let Ok(mut logger) = exchange_logger.lock() {
+                    logger.on_request_body_chunk(chunk);
+                }
             }
         },
     );
-    (reqwest::Body::wrap_stream(stream), Some(cap))
+    (reqwest::Body::wrap_stream(stream), cap)
 }
 
 type BoxRespStream =
@@ -377,22 +417,37 @@ type BoxRespStream =
 fn response_stream_and_capture(
     cfg: &crate::config::Config,
     resp: reqwest::Response,
+    exchange_logger: Option<SharedExchangeFileLogger>,
 ) -> (BoxRespStream, Option<SharedCapture>) {
     let stream = resp.bytes_stream();
-    if !cfg.logging.log_bodies {
+    if !cfg.logging.log_bodies && exchange_logger.is_none() {
         return (Box::pin(stream), None);
     }
 
-    let cap = Arc::new(std::sync::Mutex::new(Capture::new(CaptureConfig {
-        max_bytes: cfg.logging.max_body_log_bytes,
-    })));
+    let cap = if cfg.logging.log_bodies {
+        Some(Arc::new(std::sync::Mutex::new(Capture::new(
+            CaptureConfig {
+                max_bytes: cfg.logging.max_body_log_bytes,
+            },
+        ))))
+    } else {
+        None
+    };
     let cap2 = cap.clone();
+    let exchange_logger2 = exchange_logger.clone();
     let stream = stream.inspect_ok(move |chunk| {
-        if let Ok(mut c) = cap2.lock() {
-            c.push_chunk(chunk);
+        if let Some(cap2) = &cap2 {
+            if let Ok(mut c) = cap2.lock() {
+                c.push_chunk(chunk);
+            }
+        }
+        if let Some(exchange_logger) = &exchange_logger2 {
+            if let Ok(mut logger) = exchange_logger.lock() {
+                logger.on_response_body_chunk(chunk);
+            }
         }
     });
-    (Box::pin(stream), Some(cap))
+    (Box::pin(stream), cap)
 }
 
 fn map_axum_body_err(err: axum::Error) -> std::io::Error {

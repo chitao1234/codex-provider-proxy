@@ -1,4 +1,5 @@
 mod config;
+mod exchange_log;
 mod log_capture;
 mod proxy;
 mod rpc;

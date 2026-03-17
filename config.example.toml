@@ -18,6 +18,12 @@ log_requests = true
 log_responses = true
 log_bodies = false
 max_body_log_bytes = 8192
+# Optional: when set, writes per-exchange files under this directory
+# (metadata, headers, raw request body, raw response body).
+# exchange_log_dir = "./logs/exchanges"
+# Best-effort reconstruction for URLs ending in `responses`.
+# This only affects file output and never alters proxy behavior.
+reconstruct_responses = true
 
 [providers.provider_a]
 base_url = "https://api.example.com/"
