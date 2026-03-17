@@ -25,3 +25,4 @@ config.toml.*
 config.*.toml
 !config.example.toml
 .DS_Store
+logs/
