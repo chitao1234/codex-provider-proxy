@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -80,6 +83,25 @@ enum Cmd {
         /// Apply this provider to all matching PIDs (non-interactive).
         #[arg(long)]
         provider: Option<String>,
+    },
+
+    /// Prune captured exchange logs older than a UTC date
+    PruneLogs {
+        /// Exchange log directory (default matches README examples).
+        #[arg(short = 'd', long, default_value = "logs/exchanges")]
+        dir: PathBuf,
+
+        /// Prune exchange logs with timestamp older than this UTC date (YYYY-MM-DD).
+        #[arg(short = 'b', long, value_name = "YYYY-MM-DD")]
+        before_date: String,
+
+        /// Confirm destructive deletion.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Print what would be pruned without deleting files.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
 }
 
@@ -316,6 +338,63 @@ async fn main() -> Result<()> {
                     println!("ok");
                 }
             }
+        }
+        Cmd::PruneLogs {
+            dir,
+            before_date,
+            yes,
+            dry_run,
+        } => {
+            let cutoff_unix_ms =
+                codex_provider_proxyctl::log_prune::parse_cutoff_date_utc(&before_date)?;
+            let plan = codex_provider_proxyctl::log_prune::build_prune_plan(&dir, cutoff_unix_ms)?;
+
+            println!("dir={}", dir.display());
+            println!("before_date={before_date} cutoff_unix_ms={cutoff_unix_ms}");
+            println!(
+                "candidates_exchanges={} candidates_files={} candidates_bytes={}",
+                plan.exchange_count(),
+                plan.total_files,
+                plan.total_bytes
+            );
+
+            if plan.is_empty() {
+                println!("nothing to prune");
+                return Ok(());
+            }
+
+            if dry_run {
+                println!("dry-run: no files deleted");
+                for group in &plan.groups {
+                    println!(
+                        "would_prune started_unix_ms={} stem={} files={} bytes={}",
+                        group.started_unix_ms,
+                        group.stem,
+                        group.files.len(),
+                        group.total_bytes
+                    );
+                }
+                return Ok(());
+            }
+
+            if !yes {
+                eprintln!(
+                    "WARNING: prune-logs permanently deletes files in {}",
+                    dir.display()
+                );
+                let answer =
+                    prompt_line("Type 'yes' to confirm pruning, or press enter to abort: ")?;
+                if !answer.eq_ignore_ascii_case("yes") {
+                    eprintln!("aborted: no files deleted");
+                    return Ok(());
+                }
+            }
+
+            let out = codex_provider_proxyctl::log_prune::execute_prune(&plan)?;
+            println!(
+                "pruned_exchanges={} pruned_files={} pruned_bytes={}",
+                out.pruned_exchanges, out.pruned_files, out.pruned_bytes
+            );
         }
     }
 
