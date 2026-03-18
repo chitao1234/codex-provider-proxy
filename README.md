@@ -35,7 +35,7 @@ cargo run -p codex-provider-proxy -- --print-example-config
 
 ```bash
 pid=$$
-cargo run -p codex-provider-proxyctl -- set --pid "$pid" --provider provider_b
+cargo run -p codex-provider-proxyctl -- set -p "$pid" -P provider_b
 ```
 
 If `rpc_token` is set in the proxy config, pass `--token` to the client.
@@ -53,8 +53,17 @@ If you omit the regex, `proxyctl` uses its built-in default match regex.
 You can also change the runtime default provider (used when no PID route matches):
 
 ```bash
-cargo run -p codex-provider-proxyctl -- set-default --provider provider_b
+cargo run -p codex-provider-proxyctl -- set-default -p provider_b
 ```
+
+You can also run a command under a specific provider route:
+
+```bash
+cargo run -p codex-provider-proxyctl -- exec -p provider_b -- \
+  curl -sS http://127.0.0.1:8080/v1/models
+```
+
+By default, `exec` removes the PID route when the command exits. Use `--keep-route` to keep it.
 
 4. Send a request from that same local process; it will be routed to the provider assigned to the PID.
 
@@ -135,7 +144,7 @@ reconstruction failure is logged as a warning and does not affect proxy forwardi
 You can analyze captured exchange logs (token usage, token categories, cache ratio, and latency stats):
 
 ```bash
-cargo run -p codex-provider-proxyctl --bin log_analyze -- --dir logs/exchanges
+cargo run -p codex-provider-proxyctl --bin log_analyze -- -d logs/exchanges
 ```
 
 Filter examples (filters can be combined; combination is AND):
@@ -143,22 +152,22 @@ Filter examples (filters can be combined; combination is AND):
 ```bash
 # Time range by started_unix_ms (inclusive)
 cargo run -p codex-provider-proxyctl --bin log_analyze -- \
-  --dir logs/exchanges \
-  --from-unix-ms 1773756500000 \
-  --to-unix-ms 1773756800000
+  -d logs/exchanges \
+  -f 1773756500000 \
+  -t 1773756800000
 
 # Provider filter
 cargo run -p codex-provider-proxyctl --bin log_analyze -- \
-  --dir logs/exchanges \
-  --provider packycode,rightcode
+  -d logs/exchanges \
+  -p packycode,rightcode
 
 # Model + provider + time range together
 cargo run -p codex-provider-proxyctl --bin log_analyze -- \
-  --dir logs/exchanges \
-  --provider packycode \
-  --model gpt-5,gpt-5-codex \
-  --from-unix-ms 1773756500000 \
-  --to-unix-ms 1773756800000
+  -d logs/exchanges \
+  -p packycode \
+  -m gpt-5,gpt-5-codex \
+  -f 1773756500000 \
+  -t 1773756800000
 ```
 
 The utility scans `*.meta.json` and corresponding response logs, extracts `response.completed` usage from SSE

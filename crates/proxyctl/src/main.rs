@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, ExitStatus},
 };
 
 use anyhow::{Context, Result};
@@ -20,12 +21,12 @@ use codex_provider_proxyctl::process_scan;
 struct Args {
     /// Base URL of the RPC server (e.g. http://127.0.0.1:8081).
     /// If omitted and `./config.toml` exists, uses `rpc_listen_addr` from that file.
-    #[arg(long)]
+    #[arg(short = 'r', long)]
     rpc_url: Option<String>,
 
     /// Optional bearer token for RPC auth.
     /// If omitted and `./config.toml` exists, uses `rpc_token` from that file.
-    #[arg(long)]
+    #[arg(short = 't', long)]
     token: Option<String>,
 
     #[command(subcommand)]
@@ -36,21 +37,21 @@ struct Args {
 enum Cmd {
     /// Set (or overwrite) the provider for a PID
     Set {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         pid: u32,
-        #[arg(long)]
+        #[arg(short = 'P', long)]
         provider: String,
     },
 
     /// Change the runtime default provider used when no PID route matches
     SetDefault {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         provider: String,
     },
 
     /// Delete an existing PID route
     Delete {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         pid: u32,
     },
 
@@ -73,16 +74,35 @@ enum Cmd {
         regex: String,
 
         /// Only consider the first N matching PIDs.
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         limit: Option<usize>,
 
         /// Print matching processes without setting any routes.
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         dry_run: bool,
 
         /// Apply this provider to all matching PIDs (non-interactive).
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         provider: Option<String>,
+    },
+
+    /// Execute a command with a temporary PID route bound to the chosen provider
+    Exec {
+        #[arg(short = 'p', long)]
+        provider: String,
+
+        /// Keep the PID route after the command exits (default: remove it).
+        #[arg(short = 'k', long)]
+        keep_route: bool,
+
+        /// Command to execute, followed by its args.
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
     },
 
     /// Prune captured exchange logs older than a UTC date
@@ -164,6 +184,38 @@ async fn rpc_set_route(
     Ok(())
 }
 
+async fn rpc_delete_route(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    token: Option<&String>,
+    pid: u32,
+) -> Result<DeleteRouteResponse> {
+    let url = format!("{}/rpc/v1/routes/{}", rpc_url.trim_end_matches('/'), pid);
+    let mut req = client.delete(url);
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.context("send delete request")?;
+    let resp = resp
+        .error_for_status()
+        .context("delete route returned error status")?;
+    resp.json().await.context("decode response")
+}
+
+fn exit_with_status(status: ExitStatus) -> ! {
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            std::process::exit(128 + sig);
+        }
+    }
+    std::process::exit(1)
+}
+
 fn prompt_line(prompt: &str) -> Result<String> {
     use std::io::Write;
 
@@ -208,16 +260,7 @@ async fn main() -> Result<()> {
             println!("ok");
         }
         Cmd::Delete { pid } => {
-            let url = format!("{}/rpc/v1/routes/{}", rpc_url.trim_end_matches('/'), pid);
-            let mut req = client.delete(url);
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send delete request")?;
-            let resp = resp
-                .error_for_status()
-                .context("delete route returned error status")?;
-            let out: DeleteRouteResponse = resp.json().await.context("decode response")?;
+            let out = rpc_delete_route(&client, &rpc_url, token.as_ref(), pid).await?;
             println!("removed={}", out.removed);
         }
         Cmd::Clear => {
@@ -338,6 +381,52 @@ async fn main() -> Result<()> {
                     println!("ok");
                 }
             }
+        }
+        Cmd::Exec {
+            provider,
+            keep_route,
+            command,
+        } => {
+            let providers = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
+            if !providers.providers.iter().any(|p| p == &provider) {
+                anyhow::bail!("unknown provider: {provider}");
+            }
+
+            let exec = command.first().context("missing command")?;
+            let args = &command[1..];
+
+            let mut child = ProcessCommand::new(exec)
+                .args(args)
+                .spawn()
+                .with_context(|| format!("spawn command {:?}", command))?;
+            let pid = child.id();
+
+            if let Err(err) =
+                rpc_set_route(&client, &rpc_url, token.as_ref(), pid, provider.clone()).await
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err)
+                    .with_context(|| format!("set route for pid={} provider={}", pid, provider));
+            }
+
+            println!("set pid={} provider={}", pid, provider);
+            let status = child
+                .wait()
+                .with_context(|| format!("wait for command {:?}", command))?;
+
+            if keep_route {
+                println!("kept route for pid={}", pid);
+            } else {
+                match rpc_delete_route(&client, &rpc_url, token.as_ref(), pid).await {
+                    Ok(out) => println!("removed={} pid={}", out.removed, pid),
+                    Err(err) => {
+                        eprintln!("warning: failed to remove pid route for {}: {}", pid, err)
+                    }
+                }
+            }
+
+            exit_with_status(status);
         }
         Cmd::PruneLogs {
             dir,

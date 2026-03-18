@@ -21,27 +21,27 @@ use crate::config::{example_config_toml, Config};
 #[command(about = "Local reverse proxy that routes by client PID", long_about = None)]
 struct Args {
     /// Path to the config file
-    #[arg(long, default_value = "config.toml")]
+    #[arg(short = 'c', long, default_value = "config.toml")]
     config: PathBuf,
 
     /// Print the example config
-    #[arg(long)]
+    #[arg(short = 'e', long)]
     print_example_config: bool,
 
     /// Force-enable request logging (overrides config.toml)
-    #[arg(long)]
+    #[arg(short = 'r', long)]
     log_requests: bool,
 
     /// Force-enable response logging (overrides config.toml)
-    #[arg(long)]
+    #[arg(short = 's', long)]
     log_responses: bool,
 
     /// Force-enable body logging (overrides config.toml)
-    #[arg(long)]
+    #[arg(short = 'b', long)]
     log_bodies: bool,
 
     /// Max bytes captured per request/response body when logging bodies (overrides config.toml)
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     max_body_log_bytes: Option<usize>,
 }
 
