@@ -124,11 +124,13 @@ If `logging.exchange_log_dir` is set, the proxy writes per-exchange files:
 - `<timestamp>_req_<id>.response_headers.txt`
 - `<timestamp>_req_<id>.response_body.bin`
 
-When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` additionally produce:
+When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
+additionally produce:
 - `<timestamp>_req_<id>.response_reconstructed.txt`
 
-Reconstruction is best-effort for OpenAI `v1/responses` SSE streams, with plain-text error fallback. Any
-reconstruction failure is logged as a warning and does not affect proxy forwarding behavior.
+Reconstruction is best-effort for OpenAI `v1/responses` SSE streams and Anthropic `v1/messages` SSE streams,
+with plain-text error fallback. Any reconstruction failure is logged as a warning and does not affect proxy
+forwarding behavior.
 
 `*.meta.json` also records machine-readable exchange status fields such as:
 - `response_status_code`

@@ -10,7 +10,7 @@ use std::{
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use bytes::Bytes;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 use url::Url;
 
@@ -34,7 +34,7 @@ pub fn maybe_create_exchange_logger(
         return None;
     };
 
-    let should_reconstruct = cfg.reconstruct_responses && path_ends_with_responses(uri.path());
+    let should_reconstruct = cfg.reconstruct_responses && path_supports_reconstruction(uri.path());
     match ExchangeFileLogger::new(
         root_dir,
         request_id,
@@ -435,10 +435,12 @@ fn reconstruct_response_payload(payload: &str) -> String {
         return payload.to_string();
     }
 
-    reconstruct_from_sse(payload).unwrap_or_else(|| payload.to_string())
+    reconstruct_openai_response_from_sse(payload)
+        .or_else(|| reconstruct_anthropic_message_from_sse(payload))
+        .unwrap_or_else(|| payload.to_string())
 }
 
-fn reconstruct_from_sse(payload: &str) -> Option<String> {
+fn reconstruct_openai_response_from_sse(payload: &str) -> Option<String> {
     let events = parse_sse_events(payload);
     if events.is_empty() {
         return None;
@@ -490,6 +492,197 @@ fn reconstruct_from_sse(payload: &str) -> Option<String> {
     None
 }
 
+fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
+    let events = parse_sse_events(payload);
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut has_message_events = false;
+    let mut message: Option<Value> = None;
+    let mut content_blocks: Vec<Option<Value>> = Vec::new();
+    let mut input_json_deltas: Vec<String> = Vec::new();
+
+    for event in events {
+        let data = event.data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+
+        let event_type = json
+            .get("type")
+            .and_then(Value::as_str)
+            .or(event.event.as_deref());
+
+        match event_type {
+            Some("message_start") => {
+                has_message_events = true;
+                if let Some(start_message) = json.get("message").cloned() {
+                    message = Some(start_message);
+                }
+            }
+            Some("content_block_start") => {
+                has_message_events = true;
+                let Some(index) = event_index(&json) else {
+                    continue;
+                };
+                ensure_content_slot(&mut content_blocks, index);
+                if let Some(content_block) = json.get("content_block").cloned() {
+                    content_blocks[index] = Some(content_block);
+                }
+            }
+            Some("content_block_delta") => {
+                has_message_events = true;
+                let Some(index) = event_index(&json) else {
+                    continue;
+                };
+                ensure_content_slot(&mut content_blocks, index);
+                ensure_input_slot(&mut input_json_deltas, index);
+                let Some(delta) = json.get("delta").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(delta_type) = delta.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+
+                if content_blocks[index].is_none() {
+                    content_blocks[index] = Some(Value::Object(Map::new()));
+                }
+                let Some(content_block) = content_blocks[index].as_mut() else {
+                    continue;
+                };
+
+                match delta_type {
+                    "text_delta" => {
+                        append_string_delta(content_block, "text", delta.get("text"));
+                    }
+                    "thinking_delta" => {
+                        append_string_delta(content_block, "thinking", delta.get("thinking"));
+                    }
+                    "signature_delta" => {
+                        append_string_delta(content_block, "signature", delta.get("signature"));
+                    }
+                    "input_json_delta" => {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                            input_json_deltas[index].push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                has_message_events = true;
+            }
+            Some("message_delta") => {
+                has_message_events = true;
+                let Some(message_obj) = ensure_message_object(&mut message) else {
+                    continue;
+                };
+                if let Some(delta_obj) = json.get("delta").and_then(Value::as_object) {
+                    for (k, v) in delta_obj {
+                        message_obj.insert(k.clone(), v.clone());
+                    }
+                }
+                if let Some(usage) = json.get("usage").cloned() {
+                    message_obj.insert("usage".to_string(), usage);
+                }
+            }
+            Some("message_stop") => {
+                has_message_events = true;
+            }
+            Some("ping") | Some("error") => {}
+            _ => {}
+        }
+    }
+
+    if !has_message_events {
+        return None;
+    }
+
+    let Some(message_obj) = ensure_message_object(&mut message) else {
+        return None;
+    };
+
+    let mut reconstructed_content = Vec::new();
+    for (index, maybe_block) in content_blocks.into_iter().enumerate() {
+        let Some(mut block) = maybe_block else {
+            continue;
+        };
+        if let Some(partial_json) = input_json_deltas.get(index) {
+            let partial_json = partial_json.trim();
+            if !partial_json.is_empty() {
+                if let Some(obj) = block.as_object_mut() {
+                    match serde_json::from_str::<Value>(partial_json) {
+                        Ok(parsed) => {
+                            obj.insert("input".to_string(), parsed);
+                        }
+                        Err(_) => {
+                            obj.insert(
+                                "input".to_string(),
+                                Value::String(partial_json.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        reconstructed_content.push(block);
+    }
+    message_obj.insert("content".to_string(), Value::Array(reconstructed_content));
+
+    let message = Value::Object(message_obj.clone());
+    serde_json::to_string_pretty(&message)
+        .ok()
+        .or_else(|| Some(message.to_string()))
+}
+
+fn ensure_content_slot(content_blocks: &mut Vec<Option<Value>>, index: usize) {
+    if content_blocks.len() <= index {
+        content_blocks.resize_with(index + 1, || None);
+    }
+}
+
+fn ensure_input_slot(input_json_deltas: &mut Vec<String>, index: usize) {
+    if input_json_deltas.len() <= index {
+        input_json_deltas.resize_with(index + 1, String::new);
+    }
+}
+
+fn event_index(json: &Value) -> Option<usize> {
+    let raw = json.get("index")?.as_u64()?;
+    usize::try_from(raw).ok()
+}
+
+fn append_string_delta(content_block: &mut Value, field: &str, delta: Option<&Value>) {
+    let Some(delta) = delta.and_then(Value::as_str) else {
+        return;
+    };
+    if delta.is_empty() {
+        return;
+    }
+    let Some(obj) = content_block.as_object_mut() else {
+        return;
+    };
+    let prev = obj
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut next = prev;
+    next.push_str(delta);
+    obj.insert(field.to_string(), Value::String(next));
+}
+
+fn ensure_message_object(message: &mut Option<Value>) -> Option<&mut Map<String, Value>> {
+    if message.is_none() {
+        *message = Some(Value::Object(Map::new()));
+    }
+    message.as_mut()?.as_object_mut()
+}
+
 #[derive(Debug)]
 struct SseEvent {
     event: Option<String>,
@@ -534,24 +727,39 @@ fn parse_sse_events(payload: &str) -> Vec<SseEvent> {
     events
 }
 
+fn path_supports_reconstruction(path: &str) -> bool {
+    path_ends_with_responses(path) || path_ends_with_messages(path)
+}
+
 fn path_ends_with_responses(path: &str) -> bool {
+    path_last_segment(path) == Some("responses")
+}
+
+fn path_ends_with_messages(path: &str) -> bool {
+    path_last_segment(path) == Some("messages")
+}
+
+fn path_last_segment(path: &str) -> Option<&str> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
-        return false;
+        return None;
     }
-    trimmed.rsplit('/').next() == Some("responses")
+    trimmed.rsplit('/').next()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{path_ends_with_responses, reconstruct_response_payload};
+    use super::{path_supports_reconstruction, reconstruct_response_payload};
 
     #[test]
-    fn responses_path_detection() {
-        assert!(path_ends_with_responses("/v1/responses"));
-        assert!(path_ends_with_responses("/v1/chat/responses/"));
-        assert!(!path_ends_with_responses("/v1/responses/stream"));
-        assert!(!path_ends_with_responses("/v1/chat/completions"));
+    fn reconstructable_path_detection() {
+        assert!(path_supports_reconstruction("/v1/responses"));
+        assert!(path_supports_reconstruction("/v1/chat/responses/"));
+        assert!(path_supports_reconstruction("/v1/messages"));
+        assert!(path_supports_reconstruction("/v1/messages/"));
+        assert!(!path_supports_reconstruction("/v1/responses/stream"));
+        assert!(!path_supports_reconstruction("/v1/messages/count_tokens"));
+        assert!(!path_supports_reconstruction("/v1/chat/completions"));
     }
 
     #[test]
@@ -581,6 +789,57 @@ mod tests {
         );
         let out = reconstruct_response_payload(payload);
         assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn reconstructs_anthropic_message_text() {
+        let payload = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let out = reconstruct_response_payload(payload);
+        assert!(out.contains("\"id\": \"msg_1\""));
+        assert!(out.contains("\"model\": \"claude-sonnet-4-6\""));
+        assert!(out.contains("\"text\": \"Hello world\""));
+        assert!(out.contains("\"stop_reason\": \"end_turn\""));
+        assert!(out.contains("\"input_tokens\": 12"));
+    }
+
+    #[test]
+    fn reconstructs_anthropic_tool_input_json() {
+        let payload = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"shell\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"echo\\\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\",\\\"arg\\\":\\\"hi\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let out = reconstruct_response_payload(payload);
+        assert!(out.contains("\"name\": \"shell\""));
+        assert!(out.contains("\"cmd\": \"echo\""));
+        assert!(out.contains("\"arg\": \"hi\""));
+        assert!(out.contains("\"stop_reason\": \"tool_use\""));
     }
 
     #[test]
