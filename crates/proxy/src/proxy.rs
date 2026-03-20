@@ -202,16 +202,29 @@ async fn handle_proxy_inner(
     let resp_headers = resp.headers().clone();
 
     if cfg.logging.log_responses {
-        info!(
-            request_id,
-            pid = ?pid,
-            route_pid = ?route_pid,
-            peer = %peer,
-            provider = %provider_name,
-            status = %status,
-            latency_ms = started.elapsed().as_millis(),
-            "response headers received"
-        );
+        if status.is_success() {
+            info!(
+                request_id,
+                pid = ?pid,
+                route_pid = ?route_pid,
+                peer = %peer,
+                provider = %provider_name,
+                status = %status,
+                latency_ms = started.elapsed().as_millis(),
+                "response headers received"
+            );
+        } else {
+            warn!(
+                request_id,
+                pid = ?pid,
+                route_pid = ?route_pid,
+                peer = %peer,
+                provider = %provider_name,
+                status = %status,
+                latency_ms = started.elapsed().as_millis(),
+                "response headers received with non-2xx upstream status"
+            );
+        }
         debug!(
             request_id,
             pid = ?pid,
