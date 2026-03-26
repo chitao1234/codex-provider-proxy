@@ -105,15 +105,21 @@ enum Cmd {
         command: Vec<String>,
     },
 
-    /// Prune captured exchange logs older than a UTC date
+    /// Prune captured exchange logs older than a local datetime
     PruneLogs {
         /// Exchange log directory (default matches README examples).
         #[arg(short = 'd', long, default_value = "logs/exchanges")]
         dir: PathBuf,
 
-        /// Prune exchange logs with timestamp older than this UTC date (YYYY-MM-DD).
-        #[arg(short = 'b', long, value_name = "YYYY-MM-DD")]
-        before_date: String,
+        /// Prune exchange logs with timestamp older than this local datetime.
+        /// Uses the machine's current timezone. Example: 2026-01-01T00:00:00.000
+        #[arg(
+            short = 'b',
+            long = "before-local-datetime",
+            visible_alias = "before-date",
+            value_name = "YYYY-MM-DDTHH:MM:SS[.fraction]"
+        )]
+        before_local_datetime: String,
 
         /// Confirm destructive deletion.
         #[arg(short = 'y', long)]
@@ -430,16 +436,19 @@ async fn main() -> Result<()> {
         }
         Cmd::PruneLogs {
             dir,
-            before_date,
+            before_local_datetime,
             yes,
             dry_run,
         } => {
-            let cutoff_unix_ms =
-                codex_provider_proxyctl::log_prune::parse_cutoff_date_utc(&before_date)?;
+            let cutoff_unix_ms = codex_provider_proxyctl::log_prune::parse_cutoff_local_datetime(
+                &before_local_datetime,
+            )?;
             let plan = codex_provider_proxyctl::log_prune::build_prune_plan(&dir, cutoff_unix_ms)?;
 
             println!("dir={}", dir.display());
-            println!("before_date={before_date} cutoff_unix_ms={cutoff_unix_ms}");
+            println!(
+                "before_local_datetime={before_local_datetime} cutoff_unix_ms={cutoff_unix_ms}"
+            );
             println!(
                 "candidates_exchanges={} candidates_files={} candidates_bytes={}",
                 plan.exchange_count(),

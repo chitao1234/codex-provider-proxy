@@ -181,22 +181,23 @@ payloads, and prints aggregate metrics:
 
 ## Log Pruning Utility
 
-You can prune captured exchange log files older than a cutoff date (UTC):
+You can prune captured exchange log files older than a local datetime cutoff:
 
 ```bash
 cargo run -p codex-provider-proxyctl -- prune-logs \
   -d logs/exchanges \
-  -b 2026-01-01 \
+  --before-local-datetime 2026-01-01T00:00:00.000 \
   -n
 ```
 
-`prune-logs` only deletes files whose exchange stem timestamp is older than `--before-date`.
+`prune-logs` only deletes files whose exchange stem timestamp is older than `--before-local-datetime`
+interpreted in the machine's current local timezone.
 Use `--dry-run` (`-n`) to preview first. Without `-y`, `prune-logs` prompts for interactive confirmation before deletion:
 
 ```bash
 cargo run -p codex-provider-proxyctl -- prune-logs \
   -d logs/exchanges \
-  -b 2026-01-01
+  --before-local-datetime 2026-01-01T00:00:00
 ```
 
 Skip the prompt by passing `-y` / `--yes`:
@@ -204,6 +205,6 @@ Skip the prompt by passing `-y` / `--yes`:
 ```bash
 cargo run -p codex-provider-proxyctl -- prune-logs \
   -d logs/exchanges \
-  -b 2026-01-01 \
+  --before-local-datetime 2026-01-01T00:00:00 \
   -y
 ```

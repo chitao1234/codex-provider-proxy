@@ -4,9 +4,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use chrono::{Local, LocalResult, NaiveDateTime, TimeZone};
 
-const MILLIS_PER_DAY: u128 = 86_400_000;
+const LOCAL_DATETIME_FORMATS: &[&str] = &[
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+];
 
 #[derive(Debug, Clone)]
 pub struct PruneGroup {
@@ -40,37 +46,40 @@ pub struct PruneOutcome {
     pub pruned_bytes: u64,
 }
 
-pub fn parse_cutoff_date_utc(date: &str) -> Result<u128> {
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("invalid date format: expected YYYY-MM-DD, got {date}");
+pub fn parse_cutoff_local_datetime(local_datetime: &str) -> Result<u128> {
+    let naive = LOCAL_DATETIME_FORMATS
+        .iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(local_datetime, fmt).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid datetime format: expected local datetime like YYYY-MM-DDTHH:MM:SS[.fraction], got {local_datetime}"
+            )
+        })?;
+
+    let local = match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earlier, later) => {
+            anyhow::bail!(
+                "ambiguous local datetime due to DST transition: {local_datetime} (could be {} or {})",
+                earlier.to_rfc3339(),
+                later.to_rfc3339()
+            );
+        }
+        LocalResult::None => {
+            anyhow::bail!(
+                "invalid local datetime in current timezone (possibly skipped by DST): {local_datetime}"
+            );
+        }
+    };
+
+    let unix_ms = local.timestamp_millis();
+    if unix_ms < 0 {
+        anyhow::bail!(
+            "datetimes before 1970-01-01T00:00:00 in local timezone are not supported: {local_datetime}"
+        );
     }
 
-    let year: i32 = parts[0]
-        .parse()
-        .with_context(|| format!("invalid year in date: {date}"))?;
-    let month: u32 = parts[1]
-        .parse()
-        .with_context(|| format!("invalid month in date: {date}"))?;
-    let day: u32 = parts[2]
-        .parse()
-        .with_context(|| format!("invalid day in date: {date}"))?;
-
-    if !(1..=12).contains(&month) {
-        anyhow::bail!("month out of range in date: {date}");
-    }
-
-    let max_day = days_in_month(year, month);
-    if day == 0 || day > max_day {
-        anyhow::bail!("day out of range in date: {date}");
-    }
-
-    let days_since_epoch = days_from_civil(year, month, day);
-    if days_since_epoch < 0 {
-        anyhow::bail!("dates before 1970-01-01 are not supported: {date}");
-    }
-
-    Ok((days_since_epoch as u128).saturating_mul(MILLIS_PER_DAY))
+    Ok(unix_ms as u128)
 }
 
 pub fn build_prune_plan(dir: &Path, cutoff_unix_ms: u128) -> Result<PrunePlan> {
@@ -166,50 +175,37 @@ fn parse_exchange_stem_and_started_ms(file_name: &str) -> Option<(String, u128)>
     Some((stem.to_string(), started_unix_ms))
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let mut y = i64::from(year);
-    let m = i64::from(month);
-    let d = i64::from(day);
-    y -= if m <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use chrono::{Local, NaiveDateTime, TimeZone};
+
     use super::*;
 
     #[test]
-    fn parse_cutoff_date_parses_epoch_day() {
-        let unix_ms = parse_cutoff_date_utc("1970-01-01").expect("parse date");
-        assert_eq!(unix_ms, 0);
+    fn parse_cutoff_local_datetime_parses_fractional_seconds() {
+        let input = "2026-01-15T12:34:56.789";
+        let unix_ms = parse_cutoff_local_datetime(input).expect("parse datetime");
+        let naive =
+            NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S%.f").expect("parse naive");
+        let expected = Local
+            .from_local_datetime(&naive)
+            .single()
+            .expect("expected non-ambiguous local datetime")
+            .timestamp_millis() as u128;
+        assert_eq!(unix_ms, expected);
     }
 
     #[test]
-    fn parse_cutoff_date_rejects_invalid_day() {
-        let err = parse_cutoff_date_utc("2025-02-29")
-            .expect_err("expected invalid day error")
+    fn parse_cutoff_local_datetime_rejects_date_only_input() {
+        let err = parse_cutoff_local_datetime("2025-02-01")
+            .expect_err("expected invalid format error")
             .to_string();
-        assert!(err.contains("day out of range"), "unexpected error: {err}");
+        assert!(
+            err.contains("invalid datetime format"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -223,7 +219,7 @@ mod tests {
         write_bytes(&dir.join(format!("{new_stem}.meta.json")), 11);
         write_bytes(&dir.join("random.txt"), 13);
 
-        let cutoff = parse_cutoff_date_utc("2024-06-01").expect("parse cutoff");
+        let cutoff = parse_cutoff_local_datetime("2024-06-01T00:00:00").expect("parse cutoff");
         let plan = build_prune_plan(&dir, cutoff).expect("build plan");
 
         assert_eq!(plan.exchange_count(), 1);
@@ -244,7 +240,7 @@ mod tests {
         write_bytes(&old_meta, 3);
         write_bytes(&old_body, 4);
 
-        let cutoff = parse_cutoff_date_utc("2024-06-01").expect("parse cutoff");
+        let cutoff = parse_cutoff_local_datetime("2024-06-01T00:00:00").expect("parse cutoff");
         let plan = build_prune_plan(&dir, cutoff).expect("build plan");
         let out = execute_prune(&plan).expect("execute prune");
 

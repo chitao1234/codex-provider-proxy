@@ -6,14 +6,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const CUTOFF_DATE: &str = "2025-01-01";
+const CUTOFF_LOCAL_DATETIME: &str = "2025-01-01T00:00:00";
 
 #[test]
 fn prune_logs_requires_yes_for_destructive_action() {
     let dir = create_temp_dir("proxyctl-prune-requires-yes");
     let (old_meta, old_body, _new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command_with_input(&dir, &["--before-date", CUTOFF_DATE], "\n");
+    let out = run_prune_command_with_input(
+        &dir,
+        &["--before-local-datetime", CUTOFF_LOCAL_DATETIME],
+        "\n",
+    );
 
     assert!(
         out.status.success(),
@@ -37,7 +41,14 @@ fn prune_logs_dry_run_does_not_delete_files() {
     let dir = create_temp_dir("proxyctl-prune-dry-run");
     let (old_meta, old_body, _new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command(&dir, &["--before-date", CUTOFF_DATE, "--dry-run"]);
+    let out = run_prune_command(
+        &dir,
+        &[
+            "--before-local-datetime",
+            CUTOFF_LOCAL_DATETIME,
+            "--dry-run",
+        ],
+    );
 
     assert!(
         out.status.success(),
@@ -61,7 +72,10 @@ fn prune_logs_with_yes_deletes_only_older_files() {
     let dir = create_temp_dir("proxyctl-prune-with-yes");
     let (old_meta, old_body, new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command(&dir, &["--before-date", CUTOFF_DATE, "-y"]);
+    let out = run_prune_command(
+        &dir,
+        &["--before-local-datetime", CUTOFF_LOCAL_DATETIME, "-y"],
+    );
 
     assert!(
         out.status.success(),
@@ -81,7 +95,11 @@ fn prune_logs_without_yes_can_delete_after_interactive_confirmation() {
     let dir = create_temp_dir("proxyctl-prune-interactive-confirm");
     let (old_meta, old_body, new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command_with_input(&dir, &["--before-date", CUTOFF_DATE], "yes\n");
+    let out = run_prune_command_with_input(
+        &dir,
+        &["--before-local-datetime", CUTOFF_LOCAL_DATETIME],
+        "yes\n",
+    );
 
     assert!(
         out.status.success(),

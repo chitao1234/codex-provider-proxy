@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 codex-provider-proxy-rpc-types = { path = "../rpc-types" }
 regex.workspace = true
