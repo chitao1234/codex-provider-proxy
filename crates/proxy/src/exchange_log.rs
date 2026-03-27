@@ -18,40 +18,43 @@ use crate::config::LoggingConfig;
 
 pub type SharedExchangeFileLogger = Arc<Mutex<ExchangeFileLogger>>;
 
+pub struct ExchangeLogContext<'a> {
+    pub request_id: u64,
+    pub peer: SocketAddr,
+    pub pid: Option<u32>,
+    pub route_pid: Option<u32>,
+    pub provider_name: &'a str,
+    pub method: &'a Method,
+    pub uri: &'a Uri,
+    pub upstream_url: &'a Url,
+    pub request_headers: &'a HeaderMap,
+}
+
 pub fn maybe_create_exchange_logger(
     cfg: &LoggingConfig,
-    request_id: u64,
-    peer: SocketAddr,
-    pid: Option<u32>,
-    route_pid: Option<u32>,
-    provider_name: &str,
-    method: &Method,
-    uri: &Uri,
-    upstream_url: &Url,
-    request_headers: &HeaderMap,
+    ctx: ExchangeLogContext<'_>,
 ) -> Option<SharedExchangeFileLogger> {
-    let Some(root_dir) = cfg.exchange_log_dir.as_ref() else {
-        return None;
-    };
+    let root_dir = cfg.exchange_log_dir.as_ref()?;
 
-    let should_reconstruct = cfg.reconstruct_responses && path_supports_reconstruction(uri.path());
+    let should_reconstruct =
+        cfg.reconstruct_responses && path_supports_reconstruction(ctx.uri.path());
     match ExchangeFileLogger::new(
         root_dir,
-        request_id,
-        peer,
-        pid,
-        route_pid,
-        provider_name,
-        method,
-        uri,
-        upstream_url,
-        request_headers,
+        ctx.request_id,
+        ctx.peer,
+        ctx.pid,
+        ctx.route_pid,
+        ctx.provider_name,
+        ctx.method,
+        ctx.uri,
+        ctx.upstream_url,
+        ctx.request_headers,
         should_reconstruct,
     ) {
         Ok(logger) => Some(Arc::new(Mutex::new(logger))),
         Err(err) => {
             warn!(
-                request_id,
+                request_id = ctx.request_id,
                 dir = %root_dir.display(),
                 error = %err,
                 "failed to initialize exchange file logger"
@@ -602,9 +605,7 @@ fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
         return None;
     }
 
-    let Some(message_obj) = ensure_message_object(&mut message) else {
-        return None;
-    };
+    let message_obj = ensure_message_object(&mut message)?;
 
     let mut reconstructed_content = Vec::new();
     for (index, maybe_block) in content_blocks.into_iter().enumerate() {
@@ -636,7 +637,7 @@ fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
     let message = Value::Object(message_obj.clone());
     serde_json::to_string_pretty(&message)
         .ok()
-        .or_else(|| Some(message.to_string()))
+        .or(Some(message.to_string()))
 }
 
 fn ensure_content_slot(content_blocks: &mut Vec<Option<Value>>, index: usize) {

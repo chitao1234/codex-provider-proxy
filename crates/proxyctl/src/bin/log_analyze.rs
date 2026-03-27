@@ -163,8 +163,10 @@ fn main() -> Result<()> {
     let mut meta_files = collect_meta_files(&args.dir)?;
     meta_files.sort();
 
-    let mut stats = AnalysisStats::default();
-    stats.exchanges_total = u64::try_from(meta_files.len()).unwrap_or(u64::MAX);
+    let mut stats = AnalysisStats {
+        exchanges_total: u64::try_from(meta_files.len()).unwrap_or(u64::MAX),
+        ..AnalysisStats::default()
+    };
 
     for meta_path in meta_files {
         if let Err(err) = analyze_exchange(&meta_path, &filters, &mut stats) {
@@ -385,7 +387,7 @@ fn extract_completed_response_from_log(path: &Path) -> Result<Option<Value>> {
         Ok(json) => Ok(json
             .get("response")
             .cloned()
-            .or_else(|| Some(json))
+            .or(Some(json))
             .filter(|v| v.is_object())),
         Err(_) => Ok(None),
     }
@@ -452,19 +454,21 @@ fn handle_sse_event(event: &Option<String>, data_lines: &[String], completed: &m
 
 fn extract_usage_snapshot(response: &Value) -> Option<UsageSnapshot> {
     let usage = response.get("usage")?.as_object()?;
-    let mut out = UsageSnapshot::default();
-    out.input_tokens = usage
-        .get("input_tokens")
-        .and_then(value_to_u64)
-        .unwrap_or_default();
-    out.output_tokens = usage
-        .get("output_tokens")
-        .and_then(value_to_u64)
-        .unwrap_or_default();
-    out.total_tokens = usage
-        .get("total_tokens")
-        .and_then(value_to_u64)
-        .unwrap_or_default();
+    let mut out = UsageSnapshot {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(value_to_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(value_to_u64)
+            .unwrap_or_default(),
+        total_tokens: usage
+            .get("total_tokens")
+            .and_then(value_to_u64)
+            .unwrap_or_default(),
+        ..UsageSnapshot::default()
+    };
 
     if let Some(input_details) = usage.get("input_tokens_details") {
         out.input_categories = extract_numeric_map(input_details);

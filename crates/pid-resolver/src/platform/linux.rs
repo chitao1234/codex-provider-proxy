@@ -174,7 +174,7 @@ fn parse_ppid_from_proc_stat(stat: &str) -> Option<u32> {
     //
     // `comm` can contain spaces, so we locate the final `)` and split after it.
     let (_, after_comm) = stat.rsplit_once(')')?;
-    let mut fields = after_comm.trim_start().split_whitespace();
+    let mut fields = after_comm.split_whitespace();
     let _state = fields.next()?;
     let ppid = fields.next()?;
     ppid.parse::<u32>().ok()

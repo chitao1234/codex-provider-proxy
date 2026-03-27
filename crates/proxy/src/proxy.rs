@@ -22,7 +22,7 @@ use url::Url;
 
 use crate::{
     config::Provider,
-    exchange_log::{maybe_create_exchange_logger, SharedExchangeFileLogger},
+    exchange_log::{maybe_create_exchange_logger, ExchangeLogContext, SharedExchangeFileLogger},
     log_capture::{Capture, CaptureConfig, SharedCapture},
     runtime::RuntimeState,
 };
@@ -165,15 +165,17 @@ async fn handle_proxy_inner(
 
     let exchange_logger = maybe_create_exchange_logger(
         &cfg.logging,
-        request_id,
-        peer,
-        pid,
-        route_pid,
-        &provider_name,
-        &parts.method,
-        &parts.uri,
-        &url,
-        &parts.headers,
+        ExchangeLogContext {
+            request_id,
+            peer,
+            pid,
+            route_pid,
+            provider_name: &provider_name,
+            method: &parts.method,
+            uri: &parts.uri,
+            upstream_url: &url,
+            request_headers: &parts.headers,
+        },
     );
 
     let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
@@ -512,11 +514,11 @@ fn response_stream_and_capture(
 }
 
 fn map_axum_body_err(err: axum::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, err)
+    std::io::Error::other(err)
 }
 
 fn map_reqwest_body_err(err: reqwest::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, err)
+    std::io::Error::other(err)
 }
 
 async fn send_with_idle_timeout<F>(
