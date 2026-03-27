@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -11,6 +11,7 @@ pub struct Config {
     pub listen_base_path: String,
     pub rpc_listen_addr: SocketAddr,
     pub rpc_token: Option<String>,
+    pub upstream_idle_timeout: Option<Duration>,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
     pub logging: LoggingConfig,
@@ -72,6 +73,8 @@ struct ConfigFile {
     rpc_listen_addr: SocketAddr,
     #[serde(default)]
     rpc_token: Option<String>,
+    #[serde(default = "default_upstream_idle_timeout_secs")]
+    upstream_idle_timeout_secs: u64,
     default_provider: String,
     #[serde(default)]
     logging: LoggingFile,
@@ -117,6 +120,10 @@ fn default_listen_base_path() -> String {
 fn default_rpc_listen_addr() -> SocketAddr {
     // Local-only management endpoint by default.
     "127.0.0.1:8081".parse().expect("default RPC addr parses")
+}
+
+fn default_upstream_idle_timeout_secs() -> u64 {
+    120
 }
 
 fn normalize_base_path(value: &str) -> Result<String> {
@@ -169,6 +176,10 @@ impl Config {
         let file: ConfigFile = toml::from_str(toml_str).context("parse config toml")?;
         let listen_addrs = normalize_listen_addrs(file.listen_addr, file.listen_addrs)?;
         let listen_base_path = normalize_base_path(&file.listen_base_path)?;
+        let upstream_idle_timeout = match file.upstream_idle_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let mut providers = HashMap::new();
         for (name, provider) in file.providers {
             if provider.base_url.cannot_be_a_base() {
@@ -204,6 +215,7 @@ impl Config {
             listen_base_path,
             rpc_listen_addr: file.rpc_listen_addr,
             rpc_token: file.rpc_token,
+            upstream_idle_timeout,
             default_provider: file.default_provider,
             providers,
             logging: LoggingConfig {
@@ -252,6 +264,7 @@ mod tests {
             r#"
                 listen_addr = "127.0.0.1:8080"
                 listen_addrs = ["127.0.0.1:8081", "127.0.0.1:8080"]
+                upstream_idle_timeout_secs = 30
                 default_provider = "provider_a"
 
                 [providers.provider_a]
@@ -263,5 +276,41 @@ mod tests {
 
         let addrs: Vec<String> = cfg.listen_addrs.iter().map(ToString::to_string).collect();
         assert_eq!(addrs, vec!["127.0.0.1:8080", "127.0.0.1:8081"]);
+        assert_eq!(cfg.upstream_idle_timeout.unwrap().as_secs(), 30);
+    }
+
+    #[test]
+    fn applies_default_upstream_idle_timeout() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.upstream_idle_timeout.unwrap().as_secs(), 120);
+    }
+
+    #[test]
+    fn allows_disabling_upstream_idle_timeout_with_zero() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                upstream_idle_timeout_secs = 0
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.upstream_idle_timeout.is_none());
     }
 }

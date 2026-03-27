@@ -8,6 +8,10 @@ listen_base_path = "/v1"
 rpc_listen_addr = "127.0.0.1:8081"
 # Optional: if set, RPC requires `Authorization: Bearer <rpc_token>` (recommended when exposing RPC beyond localhost)
 # rpc_token = "replace-me"
+# Close proxied connections if upstream sends no data (including response headers/body) for this many seconds.
+# The timeout is applied while uploading request bodies and downloading response bodies.
+# Set to 0 to disable idle-timeout termination.
+upstream_idle_timeout_secs = 120
 default_provider = "provider_a"
 
 [logging]

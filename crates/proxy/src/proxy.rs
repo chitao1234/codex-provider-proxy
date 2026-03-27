@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -10,6 +15,8 @@ use axum::{
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use pin_project_lite::pin_project;
+use tokio::sync::Notify;
+use tokio::time::{Instant as TokioInstant, Sleep};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -169,8 +176,13 @@ async fn handle_proxy_inner(
         &parts.headers,
     );
 
-    let (req_body, req_body_capture) =
-        maybe_wrap_request_body_for_logging(&cfg, body, exchange_logger.clone());
+    let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
+    let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
+        &cfg,
+        body,
+        exchange_logger.clone(),
+        upload_activity.clone(),
+    );
     let mut headers = filtered_incoming_headers(&parts.headers);
     headers.insert(
         header::AUTHORIZATION,
@@ -185,7 +197,14 @@ async fn handle_proxy_inner(
         .headers(headers)
         .body(req_body);
 
-    let resp = match out.send().await {
+    let resp = match send_with_optional_idle_timeout(
+        request_id,
+        cfg.upstream_idle_timeout,
+        upload_activity,
+        out.send(),
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(err) => {
             if let Some(exchange_logger) = &exchange_logger {
@@ -260,7 +279,7 @@ async fn handle_proxy_inner(
     copy_response_headers(&resp_headers, builder.headers_mut().unwrap())?;
 
     let (resp_stream, resp_capture) =
-        response_stream_and_capture(&cfg, resp, exchange_logger.clone());
+        response_stream_and_capture(&cfg, request_id, resp, exchange_logger.clone());
     let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
         if let Some(capture) = resp_capture {
             let summary = capture.lock().unwrap().summary();
@@ -401,11 +420,9 @@ fn maybe_wrap_request_body_for_logging(
     cfg: &crate::config::Config,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    upload_activity: Option<Arc<Notify>>,
 ) -> (reqwest::Body, Option<SharedCapture>) {
-    if !cfg.logging.log_bodies && exchange_logger.is_none() {
-        let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
-        return (reqwest::Body::wrap_stream(stream), None);
-    }
+    let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
 
     let cap = if cfg.logging.log_bodies {
         Some(Arc::new(std::sync::Mutex::new(Capture::new(
@@ -418,9 +435,10 @@ fn maybe_wrap_request_body_for_logging(
     };
     let cap2 = cap.clone();
     let exchange_logger2 = exchange_logger.clone();
-    let stream = TryStreamExt::inspect_ok(
-        TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err),
-        move |chunk| {
+    let upload_activity2 = upload_activity.clone();
+    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() || upload_activity.is_some()
+    {
+        Box::pin(TryStreamExt::inspect_ok(stream, move |chunk| {
             if let Some(cap2) = &cap2 {
                 if let Ok(mut c) = cap2.lock() {
                     c.push_chunk(chunk);
@@ -431,23 +449,26 @@ fn maybe_wrap_request_body_for_logging(
                     logger.on_request_body_chunk(chunk);
                 }
             }
-        },
-    );
+            if let Some(upload_activity) = &upload_activity2 {
+                upload_activity.notify_one();
+            }
+        })) as BoxRespStream
+    } else {
+        Box::pin(stream)
+    };
     (reqwest::Body::wrap_stream(stream), cap)
 }
 
 type BoxRespStream =
-    std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+    std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>;
 
 fn response_stream_and_capture(
     cfg: &crate::config::Config,
+    request_id: u64,
     resp: reqwest::Response,
     exchange_logger: Option<SharedExchangeFileLogger>,
 ) -> (BoxRespStream, Option<SharedCapture>) {
-    let stream = resp.bytes_stream();
-    if !cfg.logging.log_bodies && exchange_logger.is_none() {
-        return (Box::pin(stream), None);
-    }
+    let stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
 
     let cap = if cfg.logging.log_bodies {
         Some(Arc::new(std::sync::Mutex::new(Capture::new(
@@ -460,23 +481,178 @@ fn response_stream_and_capture(
     };
     let cap2 = cap.clone();
     let exchange_logger2 = exchange_logger.clone();
-    let stream = stream.inspect_ok(move |chunk| {
-        if let Some(cap2) = &cap2 {
-            if let Ok(mut c) = cap2.lock() {
-                c.push_chunk(chunk);
+    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() {
+        Box::pin(stream.inspect_ok(move |chunk| {
+            if let Some(cap2) = &cap2 {
+                if let Ok(mut c) = cap2.lock() {
+                    c.push_chunk(chunk);
+                }
             }
-        }
-        if let Some(exchange_logger) = &exchange_logger2 {
-            if let Ok(mut logger) = exchange_logger.lock() {
-                logger.on_response_body_chunk(chunk);
+            if let Some(exchange_logger) = &exchange_logger2 {
+                if let Ok(mut logger) = exchange_logger.lock() {
+                    logger.on_response_body_chunk(chunk);
+                }
             }
+        })) as BoxRespStream
+    } else {
+        Box::pin(stream)
+    };
+    match cfg.upstream_idle_timeout {
+        Some(idle_timeout) => {
+            let stream = IdleTimeoutStream::new(
+                stream,
+                idle_timeout,
+                request_id,
+                "upstream response body download",
+            );
+            (Box::pin(stream), cap)
         }
-    });
-    (Box::pin(stream), cap)
+        None => (stream, cap),
+    }
 }
 
 fn map_axum_body_err(err: axum::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, err)
+}
+
+fn map_reqwest_body_err(err: reqwest::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, err)
+}
+
+async fn send_with_idle_timeout<F>(
+    request_id: u64,
+    idle_timeout: Duration,
+    upload_activity: Arc<Notify>,
+    send_fut: F,
+) -> std::result::Result<reqwest::Response, std::io::Error>
+where
+    F: Future<Output = std::result::Result<reqwest::Response, reqwest::Error>>,
+{
+    tokio::pin!(send_fut);
+    let sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            result = &mut send_fut => {
+                return result.map_err(map_reqwest_body_err);
+            }
+            _ = &mut sleep => {
+                warn!(
+                    request_id,
+                    idle_timeout_secs = idle_timeout.as_secs(),
+                    "closing proxied connection after upstream idle timeout while sending request or waiting for response headers"
+                );
+                return Err(idle_timeout_error(
+                    "sending request or waiting for upstream response headers",
+                    idle_timeout,
+                ));
+            }
+            _ = upload_activity.notified() => {
+                sleep.as_mut().reset(TokioInstant::now() + idle_timeout);
+            }
+        }
+    }
+}
+
+async fn send_with_optional_idle_timeout<F>(
+    request_id: u64,
+    idle_timeout: Option<Duration>,
+    upload_activity: Option<Arc<Notify>>,
+    send_fut: F,
+) -> std::result::Result<reqwest::Response, std::io::Error>
+where
+    F: Future<Output = std::result::Result<reqwest::Response, reqwest::Error>>,
+{
+    match idle_timeout {
+        Some(idle_timeout) => {
+            let upload_activity = upload_activity.unwrap_or_else(|| Arc::new(Notify::new()));
+            send_with_idle_timeout(request_id, idle_timeout, upload_activity, send_fut).await
+        }
+        None => send_fut.await.map_err(map_reqwest_body_err),
+    }
+}
+
+fn idle_timeout_error(phase: &'static str, idle_timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "no upstream data for {}s while {phase}",
+            idle_timeout.as_secs()
+        ),
+    )
+}
+
+pin_project! {
+    pub struct IdleTimeoutStream<S> {
+        #[pin]
+        inner: S,
+        idle_timeout: Duration,
+        request_id: u64,
+        phase: &'static str,
+        #[pin]
+        sleep: Sleep,
+        emitted_timeout: bool,
+    }
+}
+
+impl<S> IdleTimeoutStream<S> {
+    pub fn new(inner: S, idle_timeout: Duration, request_id: u64, phase: &'static str) -> Self {
+        Self {
+            inner,
+            idle_timeout,
+            request_id,
+            phase,
+            sleep: tokio::time::sleep(idle_timeout),
+            emitted_timeout: false,
+        }
+    }
+}
+
+impl<S> Stream for IdleTimeoutStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        if *this.emitted_timeout {
+            return std::task::Poll::Ready(None);
+        }
+
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                if item.is_ok() {
+                    this.sleep
+                        .as_mut()
+                        .reset(TokioInstant::now() + *this.idle_timeout);
+                }
+                std::task::Poll::Ready(Some(item))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => match this.sleep.as_mut().poll(cx) {
+                std::task::Poll::Ready(()) => {
+                    *this.emitted_timeout = true;
+                    warn!(
+                        request_id = *this.request_id,
+                        phase = *this.phase,
+                        idle_timeout_secs = this.idle_timeout.as_secs(),
+                        "closing proxied stream after upstream idle timeout"
+                    );
+                    std::task::Poll::Ready(Some(Err(idle_timeout_error(
+                        this.phase,
+                        *this.idle_timeout,
+                    ))))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+        }
+    }
 }
 
 pin_project! {
