@@ -12,7 +12,7 @@ use axum::{
     http::{header, HeaderMap, Request, Response, StatusCode},
     Router,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, TryStreamExt};
 use pin_project_lite::pin_project;
 use tokio::sync::Notify;
@@ -178,13 +178,6 @@ async fn handle_proxy_inner(
         },
     );
 
-    let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
-    let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
-        &cfg,
-        body,
-        exchange_logger.clone(),
-        upload_activity.clone(),
-    );
     let mut headers = filtered_incoming_headers(&parts.headers);
     headers.insert(
         header::AUTHORIZATION,
@@ -192,21 +185,52 @@ async fn handle_proxy_inner(
             .context("build Authorization header")?,
     );
 
-    let out = state
-        .runtime
-        .http_client()
-        .request(parts.method.clone(), url)
-        .headers(headers)
-        .body(req_body);
+    let send_result: std::result::Result<
+        (reqwest::Response, Option<SharedCapture>),
+        std::io::Error,
+    > = if cfg.transparent_retry_count == 0 {
+        let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
+        let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
+            &cfg,
+            body,
+            exchange_logger.clone(),
+            upload_activity.clone(),
+        );
+        let out = state
+            .runtime
+            .http_client()
+            .request(parts.method.clone(), url.clone())
+            .headers(headers)
+            .body(req_body);
 
-    let resp = match send_with_optional_idle_timeout(
-        request_id,
-        cfg.upstream_idle_timeout,
-        upload_activity,
-        out.send(),
-    )
-    .await
-    {
+        send_with_optional_idle_timeout(
+            request_id,
+            cfg.upstream_idle_timeout,
+            upload_activity,
+            out.send(),
+        )
+        .await
+        .map(|resp| (resp, req_body_capture))
+    } else {
+        let (request_body, req_body_capture) =
+            buffer_request_body_for_retry(&cfg, body, exchange_logger.clone())
+                .await
+                .context("buffer request body for transparent retries")?;
+        send_with_non_2xx_retries(
+            request_id,
+            cfg.transparent_retry_count,
+            cfg.upstream_idle_timeout,
+            state.runtime.http_client(),
+            parts.method.clone(),
+            url.clone(),
+            headers,
+            request_body,
+        )
+        .await
+        .map(|resp| (resp, req_body_capture))
+    };
+
+    let (resp, req_body_capture) = match send_result {
         Ok(resp) => resp,
         Err(err) => {
             if let Some(exchange_logger) = &exchange_logger {
@@ -461,6 +485,42 @@ fn maybe_wrap_request_body_for_logging(
     (reqwest::Body::wrap_stream(stream), cap)
 }
 
+async fn buffer_request_body_for_retry(
+    cfg: &crate::config::Config,
+    body: Body,
+    exchange_logger: Option<SharedExchangeFileLogger>,
+) -> std::result::Result<(Bytes, Option<SharedCapture>), std::io::Error> {
+    let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
+    let mut buffered = BytesMut::new();
+
+    let cap = if cfg.logging.log_bodies {
+        Some(Arc::new(std::sync::Mutex::new(Capture::new(
+            CaptureConfig {
+                max_bytes: cfg.logging.max_body_log_bytes,
+            },
+        ))))
+    } else {
+        None
+    };
+
+    while let Some(chunk) = stream.try_next().await? {
+        buffered.extend_from_slice(&chunk);
+
+        if let Some(cap) = &cap {
+            if let Ok(mut c) = cap.lock() {
+                c.push_chunk(&chunk);
+            }
+        }
+        if let Some(exchange_logger) = &exchange_logger {
+            if let Ok(mut logger) = exchange_logger.lock() {
+                logger.on_request_body_chunk(&chunk);
+            }
+        }
+    }
+
+    Ok((buffered.freeze(), cap))
+}
+
 type BoxRespStream =
     std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>;
 
@@ -573,6 +633,42 @@ where
         }
         None => send_fut.await.map_err(map_reqwest_body_err),
     }
+}
+
+async fn send_with_non_2xx_retries(
+    request_id: u64,
+    transparent_retry_count: u32,
+    idle_timeout: Option<Duration>,
+    http_client: reqwest::Client,
+    method: http::Method,
+    url: Url,
+    headers: HeaderMap,
+    request_body: Bytes,
+) -> std::result::Result<reqwest::Response, std::io::Error> {
+    for attempt in 0..=transparent_retry_count {
+        let out = http_client
+            .request(method.clone(), url.clone())
+            .headers(headers.clone())
+            .body(request_body.clone());
+        let resp =
+            send_with_optional_idle_timeout(request_id, idle_timeout, None, out.send()).await?;
+
+        let status = resp.status();
+        if status.is_success() || attempt == transparent_retry_count {
+            return Ok(resp);
+        }
+
+        warn!(
+            request_id,
+            status = %status,
+            attempt = attempt + 1,
+            total_attempts = transparent_retry_count.saturating_add(1),
+            retries_remaining = transparent_retry_count - attempt,
+            "upstream returned non-2xx status; retrying transparently"
+        );
+    }
+
+    unreachable!("retry loop always returns")
 }
 
 fn idle_timeout_error(phase: &'static str, idle_timeout: Duration) -> std::io::Error {
@@ -709,7 +805,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{join_paths, strip_listen_base_path};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, Method, StatusCode},
+        response::IntoResponse,
+        routing::any,
+        Router,
+    };
+    use tokio::sync::oneshot;
+    use url::Url;
+
+    use super::{join_paths, send_with_non_2xx_retries, strip_listen_base_path};
 
     #[test]
     fn joins_paths_with_prefix() {
@@ -728,5 +840,109 @@ mod tests {
         assert_eq!(strip_listen_base_path("/v1", "/v1/models"), Some("models"));
         assert_eq!(strip_listen_base_path("/v1", "/v1"), Some("/"));
         assert_eq!(strip_listen_base_path("/v1", "/v2/models"), None);
+    }
+
+    #[derive(Clone)]
+    struct RetryServerState {
+        statuses: Arc<Vec<StatusCode>>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    async fn retry_server_handler(
+        State(state): State<RetryServerState>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        assert_eq!(body, Bytes::from_static(b"retry-body"));
+
+        let call_index = state.call_count.fetch_add(1, Ordering::SeqCst);
+        let status = state
+            .statuses
+            .get(call_index)
+            .copied()
+            .or_else(|| state.statuses.last().copied())
+            .unwrap_or(StatusCode::OK);
+        (status, format!("attempt-{call_index}"))
+    }
+
+    async fn spawn_retry_server(
+        statuses: Vec<StatusCode>,
+    ) -> (Url, Arc<AtomicUsize>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let state = RetryServerState {
+            statuses: Arc::new(statuses),
+            call_count: call_count.clone(),
+        };
+        let app = Router::new()
+            .route("/", any(retry_server_handler))
+            .with_state(state);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            call_count,
+            shutdown_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn retries_non_2xx_status_until_success() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
+
+        let resp = send_with_non_2xx_retries(
+            1,
+            2,
+            None,
+            reqwest::Client::new(),
+            Method::POST,
+            url,
+            HeaderMap::new(),
+            Bytes::from_static(b"retry-body"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn returns_last_non_2xx_when_retry_limit_exhausted() {
+        let (url, call_count, shutdown_tx) = spawn_retry_server(vec![
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::OK,
+        ])
+        .await;
+
+        let resp = send_with_non_2xx_retries(
+            2,
+            1,
+            None,
+            reqwest::Client::new(),
+            Method::POST,
+            url,
+            HeaderMap::new(),
+            Bytes::from_static(b"retry-body"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let _ = shutdown_tx.send(());
     }
 }

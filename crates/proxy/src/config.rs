@@ -12,6 +12,7 @@ pub struct Config {
     pub rpc_listen_addr: SocketAddr,
     pub rpc_token: Option<String>,
     pub upstream_idle_timeout: Option<Duration>,
+    pub transparent_retry_count: u32,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
     pub logging: LoggingConfig,
@@ -75,6 +76,8 @@ struct ConfigFile {
     rpc_token: Option<String>,
     #[serde(default = "default_upstream_idle_timeout_secs")]
     upstream_idle_timeout_secs: u64,
+    #[serde(default = "default_transparent_retry_count")]
+    transparent_retry_count: u32,
     default_provider: String,
     #[serde(default)]
     logging: LoggingFile,
@@ -124,6 +127,10 @@ fn default_rpc_listen_addr() -> SocketAddr {
 
 fn default_upstream_idle_timeout_secs() -> u64 {
     120
+}
+
+fn default_transparent_retry_count() -> u32 {
+    0
 }
 
 fn normalize_base_path(value: &str) -> Result<String> {
@@ -216,6 +223,7 @@ impl Config {
             rpc_listen_addr: file.rpc_listen_addr,
             rpc_token: file.rpc_token,
             upstream_idle_timeout,
+            transparent_retry_count: file.transparent_retry_count,
             default_provider: file.default_provider,
             providers,
             logging: LoggingConfig {
@@ -312,5 +320,40 @@ mod tests {
         .unwrap();
 
         assert!(cfg.upstream_idle_timeout.is_none());
+    }
+
+    #[test]
+    fn defaults_transparent_retry_count_to_zero() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.transparent_retry_count, 0);
+    }
+
+    #[test]
+    fn parses_transparent_retry_count() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                transparent_retry_count = 3
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.transparent_retry_count, 3);
     }
 }

@@ -22,7 +22,7 @@ cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
-addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`, and all `[logging]` options takes effect without restarting the
+addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`, `transparent_retry_count`, and all `[logging]` options takes effect without restarting the
 process.
 
 To print an example config:
@@ -78,6 +78,8 @@ By default, `exec` removes the PID route when the command exits. Use `--keep-rou
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
 - If no upstream bytes are observed for `upstream_idle_timeout_secs` (default `120`), the proxy aborts the proxied
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
+- If `transparent_retry_count > 0`, non-2xx upstream responses are retried transparently up to that many additional
+  attempts before returning the final upstream response.
 - PID routing lookup checks the client PID first; if no route exists it walks up the process tree
   (parent PID, grandparent PID, etc.) and uses the first ancestor with a defined route.
 - By default, the runtime PID routing table is empty, so all requests go to `default_provider`.

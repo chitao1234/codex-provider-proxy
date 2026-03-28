@@ -12,6 +12,9 @@ rpc_listen_addr = "127.0.0.1:8081"
 # The timeout is applied while uploading request bodies and downloading response bodies.
 # Set to 0 to disable idle-timeout termination.
 upstream_idle_timeout_secs = 120
+# Transparent retries for non-2xx upstream responses.
+# Value is the number of additional attempts after the first one (0 disables retries).
+transparent_retry_count = 0
 default_provider = "provider_a"
 
 [logging]
