@@ -186,9 +186,10 @@ async fn handle_proxy_inner(
     );
 
     let send_result: std::result::Result<
-        (reqwest::Response, Option<SharedCapture>),
+        (reqwest::Response, Option<SharedCapture>, u32, u128),
         std::io::Error,
     > = if cfg.transparent_retry_count == 0 {
+        let attempt_started = Instant::now();
         let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
         let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
             &cfg,
@@ -203,20 +204,23 @@ async fn handle_proxy_inner(
             .headers(headers)
             .body(req_body);
 
-        send_with_optional_idle_timeout(
+        let resp = send_with_optional_idle_timeout(
             request_id,
             cfg.upstream_idle_timeout,
             upload_activity,
             out.send(),
         )
-        .await
-        .map(|resp| (resp, req_body_capture))
+        .await?;
+        Ok((
+            resp,
+            req_body_capture,
+            1,
+            attempt_started.elapsed().as_millis(),
+        ))
     } else {
         let (request_body, req_body_capture) =
-            buffer_request_body_for_retry(&cfg, body, exchange_logger.clone())
-                .await
-                .context("buffer request body for transparent retries")?;
-        send_with_non_2xx_retries(
+            buffer_request_body_for_retry(&cfg, body, exchange_logger.clone()).await?;
+        let (resp, final_attempt, final_attempt_latency_ms) = send_with_non_2xx_retries(
             request_id,
             cfg.transparent_retry_count,
             cfg.upstream_idle_timeout,
@@ -225,12 +229,18 @@ async fn handle_proxy_inner(
             url.clone(),
             headers,
             request_body,
+            exchange_logger.clone(),
         )
-        .await
-        .map(|resp| (resp, req_body_capture))
+        .await?;
+        Ok((
+            resp,
+            req_body_capture,
+            final_attempt,
+            final_attempt_latency_ms,
+        ))
     };
 
-    let (resp, req_body_capture) = match send_result {
+    let (resp, req_body_capture, _final_attempt, final_attempt_latency_ms) = match send_result {
         Ok(resp) => resp,
         Err(err) => {
             if let Some(exchange_logger) = &exchange_logger {
@@ -282,6 +292,7 @@ async fn handle_proxy_inner(
 
     if let Some(exchange_logger) = &exchange_logger {
         if let Ok(mut logger) = exchange_logger.lock() {
+            logger.record_attempt(status, &resp_headers, final_attempt_latency_ms, None, true);
             logger.write_response_headers(status, &resp_headers, started.elapsed().as_millis());
         }
     }
@@ -644,8 +655,10 @@ async fn send_with_non_2xx_retries(
     url: Url,
     headers: HeaderMap,
     request_body: Bytes,
-) -> std::result::Result<reqwest::Response, std::io::Error> {
+    exchange_logger: Option<SharedExchangeFileLogger>,
+) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error> {
     for attempt in 0..=transparent_retry_count {
+        let attempt_started = Instant::now();
         let out = http_client
             .request(method.clone(), url.clone())
             .headers(headers.clone())
@@ -654,14 +667,36 @@ async fn send_with_non_2xx_retries(
             send_with_optional_idle_timeout(request_id, idle_timeout, None, out.send()).await?;
 
         let status = resp.status();
+        let attempt_latency_ms = attempt_started.elapsed().as_millis();
+        let attempt_number = attempt.saturating_add(1);
         if status.is_success() || attempt == transparent_retry_count {
-            return Ok(resp);
+            return Ok((resp, attempt_number, attempt_latency_ms));
+        }
+
+        let resp_headers = resp.headers().clone();
+        let retry_body_bytes = drain_response_body_with_optional_idle_timeout(
+            request_id,
+            idle_timeout,
+            resp,
+            "reading non-final retry response body",
+        )
+        .await?;
+        if let Some(exchange_logger) = &exchange_logger {
+            if let Ok(mut logger) = exchange_logger.lock() {
+                logger.record_attempt(
+                    status,
+                    &resp_headers,
+                    attempt_latency_ms,
+                    Some(retry_body_bytes),
+                    false,
+                );
+            }
         }
 
         warn!(
             request_id,
             status = %status,
-            attempt = attempt + 1,
+            attempt = attempt_number,
             total_attempts = transparent_retry_count.saturating_add(1),
             retries_remaining = transparent_retry_count - attempt,
             "upstream returned non-2xx status; retrying transparently"
@@ -669,6 +704,41 @@ async fn send_with_non_2xx_retries(
     }
 
     unreachable!("retry loop always returns")
+}
+
+async fn drain_response_body_with_optional_idle_timeout(
+    request_id: u64,
+    idle_timeout: Option<Duration>,
+    resp: reqwest::Response,
+    phase: &'static str,
+) -> std::result::Result<u64, std::io::Error> {
+    let mut stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
+    let mut total_bytes = 0u64;
+
+    loop {
+        let next_chunk = match idle_timeout {
+            Some(idle_timeout) => match tokio::time::timeout(idle_timeout, stream.try_next()).await
+            {
+                Ok(next) => next,
+                Err(_) => {
+                    warn!(
+                        request_id,
+                        phase,
+                        idle_timeout_secs = idle_timeout.as_secs(),
+                        "closing retry attempt body drain after upstream idle timeout"
+                    );
+                    return Err(idle_timeout_error(phase, idle_timeout));
+                }
+            },
+            None => stream.try_next().await,
+        }?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        total_bytes = total_bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+    }
+
+    Ok(total_bytes)
 }
 
 fn idle_timeout_error(phase: &'static str, idle_timeout: Duration) -> std::io::Error {
@@ -901,7 +971,7 @@ mod tests {
         let (url, call_count, shutdown_tx) =
             spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
 
-        let resp = send_with_non_2xx_retries(
+        let (resp, final_attempt, _final_attempt_latency_ms) = send_with_non_2xx_retries(
             1,
             2,
             None,
@@ -910,11 +980,13 @@ mod tests {
             url,
             HeaderMap::new(),
             Bytes::from_static(b"retry-body"),
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(final_attempt, 2);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         let _ = shutdown_tx.send(());
     }
@@ -928,7 +1000,7 @@ mod tests {
         ])
         .await;
 
-        let resp = send_with_non_2xx_retries(
+        let (resp, final_attempt, _final_attempt_latency_ms) = send_with_non_2xx_retries(
             2,
             1,
             None,
@@ -937,11 +1009,13 @@ mod tests {
             url,
             HeaderMap::new(),
             Bytes::from_static(b"retry-body"),
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(final_attempt, 2);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         let _ = shutdown_tx.send(());
     }

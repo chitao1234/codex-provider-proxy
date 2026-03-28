@@ -133,6 +133,8 @@ struct ExchangeMeta {
     #[serde(default)]
     total_duration_ms: Option<u128>,
     #[serde(default)]
+    body_compression: Option<String>,
+    #[serde(default)]
     files: ExchangeMetaFiles,
 }
 
@@ -242,25 +244,30 @@ fn analyze_exchange(
 
     let mut response_for_usage: Option<Value> = None;
     if filters.has_model_filter() {
-        let model = extract_model_from_request_body(&request_body_path).or_else(|| {
-            if !response_body_path.exists() {
-                return None;
-            }
-            match extract_completed_response_from_log(&response_body_path) {
-                Ok(response) => {
-                    response_for_usage = response.clone();
-                    response.and_then(|r| extract_model_from_response(&r))
-                }
-                Err(err) => {
-                    stats.usage_parse_errors = stats.usage_parse_errors.saturating_add(1);
-                    eprintln!(
-                        "warn: parse response body {}: {err}",
-                        response_body_path.display()
-                    );
-                    None
-                }
-            }
-        });
+        let model =
+            extract_model_from_request_body(&request_body_path, meta.body_compression.as_deref())
+                .or_else(|| {
+                    if !response_body_path.exists() {
+                        return None;
+                    }
+                    match extract_completed_response_from_log(
+                        &response_body_path,
+                        meta.body_compression.as_deref(),
+                    ) {
+                        Ok(response) => {
+                            response_for_usage = response.clone();
+                            response.and_then(|r| extract_model_from_response(&r))
+                        }
+                        Err(err) => {
+                            stats.usage_parse_errors = stats.usage_parse_errors.saturating_add(1);
+                            eprintln!(
+                                "warn: parse response body {}: {err}",
+                                response_body_path.display()
+                            );
+                            None
+                        }
+                    }
+                });
 
         if model
             .as_deref()
@@ -291,7 +298,10 @@ fn analyze_exchange(
     let response = match response_for_usage {
         Some(response) => Some(response),
         None => {
-            let parsed = extract_completed_response_from_log(&response_body_path);
+            let parsed = extract_completed_response_from_log(
+                &response_body_path,
+                meta.body_compression.as_deref(),
+            );
             match parsed {
                 Ok(v) => v,
                 Err(err) => {
@@ -354,8 +364,8 @@ fn parse_latency_from_response_headers(path: &Path) -> Option<u128> {
     None
 }
 
-fn extract_model_from_request_body(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+fn extract_model_from_request_body(path: &Path, body_compression: Option<&str>) -> Option<String> {
+    let bytes = read_logged_body(path, body_compression).ok()?;
     if bytes.is_empty() {
         return None;
     }
@@ -372,8 +382,12 @@ fn extract_model_from_response(response: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn extract_completed_response_from_log(path: &Path) -> Result<Option<Value>> {
-    let bytes = fs::read(path).with_context(|| format!("read response body {}", path.display()))?;
+fn extract_completed_response_from_log(
+    path: &Path,
+    body_compression: Option<&str>,
+) -> Result<Option<Value>> {
+    let bytes = read_logged_body(path, body_compression)
+        .with_context(|| format!("read response body {}", path.display()))?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -391,6 +405,23 @@ fn extract_completed_response_from_log(path: &Path) -> Result<Option<Value>> {
             .filter(|v| v.is_object())),
         Err(_) => Ok(None),
     }
+}
+
+fn read_logged_body(path: &Path, body_compression: Option<&str>) -> Result<Vec<u8>> {
+    let is_zstd = body_compression
+        .map(|v| v.eq_ignore_ascii_case("zstd"))
+        .unwrap_or(false)
+        || path
+            .extension()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case("zst"));
+    if is_zstd {
+        let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let bytes = zstd::stream::decode_all(file)
+            .with_context(|| format!("decode zstd {}", path.display()))?;
+        return Ok(bytes);
+    }
+    fs::read(path).with_context(|| format!("read {}", path.display()))
 }
 
 fn looks_like_sse(payload: &str) -> bool {
@@ -642,11 +673,16 @@ fn percentile_nearest_rank(sorted: &[u128], q: f64) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
     use serde_json::json;
 
     use super::{
-        extract_completed_response_from_sse, extract_usage_snapshot, normalize_filter_values,
-        AnalysisFilters,
+        extract_completed_response_from_log, extract_completed_response_from_sse,
+        extract_usage_snapshot, normalize_filter_values, AnalysisFilters,
     };
 
     #[test]
@@ -714,5 +750,30 @@ mod tests {
         assert!(f.matches_time(Some(20)));
         assert!(!f.matches_time(Some(9)));
         assert!(!f.matches_time(Some(21)));
+    }
+
+    #[test]
+    fn reads_zstd_compressed_response_body() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "proxyctl-log-analyze-zstd-{}-{unique}.response_body.bin.zst",
+            std::process::id()
+        ));
+        let payload = r#"{"response":{"id":"resp_zstd","usage":{"input_tokens":1}}}"#;
+        let encoded = zstd::stream::encode_all(payload.as_bytes(), 3).expect("encode zstd");
+        fs::write(&path, encoded).expect("write zstd payload");
+
+        let response = extract_completed_response_from_log(&path, Some("zstd"))
+            .expect("extract")
+            .expect("response exists");
+        assert_eq!(
+            response.get("id").and_then(|v| v.as_str()),
+            Some("resp_zstd")
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

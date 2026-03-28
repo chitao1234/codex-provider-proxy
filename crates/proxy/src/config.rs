@@ -41,9 +41,33 @@ pub struct LoggingConfig {
     pub log_bodies: bool,
     pub max_body_log_bytes: usize,
     pub exchange_log_dir: Option<PathBuf>,
+    pub exchange_body_max_bytes: Option<u64>,
+    pub exchange_body_compression: BodyLogCompression,
     pub reconstruct_responses: bool,
     pub level: String,
     pub rule: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyLogCompression {
+    None,
+    Zstd,
+}
+
+impl BodyLogCompression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+impl Default for BodyLogCompression {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 impl LoggingConfig {
@@ -96,6 +120,10 @@ struct LoggingFile {
     max_body_log_bytes: usize,
     #[serde(default)]
     exchange_log_dir: Option<String>,
+    #[serde(default = "default_exchange_body_max_bytes")]
+    exchange_body_max_bytes: u64,
+    #[serde(default = "default_exchange_body_compression")]
+    exchange_body_compression: BodyLogCompression,
     #[serde(default = "default_reconstruct_responses")]
     reconstruct_responses: bool,
     #[serde(default = "default_log_level")]
@@ -114,6 +142,14 @@ fn default_log_level() -> String {
 
 fn default_reconstruct_responses() -> bool {
     true
+}
+
+fn default_exchange_body_max_bytes() -> u64 {
+    0
+}
+
+fn default_exchange_body_compression() -> BodyLogCompression {
+    BodyLogCompression::None
 }
 
 fn default_listen_base_path() -> String {
@@ -216,6 +252,10 @@ impl Config {
             Some(path) => Some(PathBuf::from(path)),
             None => None,
         };
+        let exchange_body_max_bytes = match file.logging.exchange_body_max_bytes {
+            0 => None,
+            value => Some(value),
+        };
 
         Ok(Self {
             listen_addrs,
@@ -232,6 +272,8 @@ impl Config {
                 log_bodies: file.logging.log_bodies,
                 max_body_log_bytes: file.logging.max_body_log_bytes,
                 exchange_log_dir,
+                exchange_body_max_bytes,
+                exchange_body_compression: file.logging.exchange_body_compression,
                 reconstruct_responses: file.logging.reconstruct_responses,
                 level: file.logging.level,
                 rule: file.logging.rule,
@@ -246,7 +288,7 @@ pub fn example_config_toml() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{BodyLogCompression, Config};
 
     #[test]
     fn parses_legacy_single_listen_addr() {
@@ -355,5 +397,51 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.transparent_retry_count, 3);
+    }
+
+    #[test]
+    fn defaults_exchange_body_storage_options() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.logging.exchange_body_max_bytes, None);
+        assert_eq!(
+            cfg.logging.exchange_body_compression,
+            BodyLogCompression::None
+        );
+    }
+
+    #[test]
+    fn parses_exchange_body_storage_options() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [logging]
+                exchange_body_max_bytes = 2048
+                exchange_body_compression = "zstd"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.logging.exchange_body_max_bytes, Some(2048));
+        assert_eq!(
+            cfg.logging.exchange_body_compression,
+            BodyLogCompression::Zstd
+        );
     }
 }

@@ -116,6 +116,8 @@ log_responses = true
 log_bodies = false
 max_body_log_bytes = 8192
 # exchange_log_dir = "./logs/exchanges"
+exchange_body_max_bytes = 0
+exchange_body_compression = "none"
 reconstruct_responses = true
 ```
 
@@ -124,9 +126,13 @@ Changing any of those values in `config.toml` updates the running process withou
 If `logging.exchange_log_dir` is set, the proxy writes per-exchange files:
 - `<timestamp>_req_<id>.meta.json`
 - `<timestamp>_req_<id>.request_headers.txt`
-- `<timestamp>_req_<id>.request_body.bin`
+- `<timestamp>_req_<id>.request_body.bin` (or `.bin.zst` when `exchange_body_compression = "zstd"`)
 - `<timestamp>_req_<id>.response_headers.txt`
-- `<timestamp>_req_<id>.response_body.bin`
+- `<timestamp>_req_<id>.response_body.bin` (or `.bin.zst` when `exchange_body_compression = "zstd"`)
+- `<timestamp>_req_<id>.attempt_<n>.response_headers.txt` (one per upstream attempt, including retries)
+
+When `transparent_retry_count > 0`, `*.meta.json` includes an `attempts` array with per-attempt status/latency and
+body-byte details.
 
 When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
 additionally produce:

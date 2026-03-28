@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -14,9 +14,10 @@ use serde_json::{Map, Value};
 use tracing::warn;
 use url::Url;
 
-use crate::config::LoggingConfig;
+use crate::config::{BodyLogCompression, LoggingConfig};
 
 pub type SharedExchangeFileLogger = Arc<Mutex<ExchangeFileLogger>>;
+const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 2;
 
 pub struct ExchangeLogContext<'a> {
     pub request_id: u64,
@@ -50,6 +51,8 @@ pub fn maybe_create_exchange_logger(
         ctx.upstream_url,
         ctx.request_headers,
         should_reconstruct,
+        cfg.exchange_body_max_bytes,
+        cfg.exchange_body_compression,
     ) {
         Ok(logger) => Some(Arc::new(Mutex::new(logger))),
         Err(err) => {
@@ -64,20 +67,27 @@ pub fn maybe_create_exchange_logger(
     }
 }
 
-#[derive(Debug)]
 pub struct ExchangeFileLogger {
     request_id: u64,
+    root_dir: PathBuf,
+    stem: String,
     metadata_path: PathBuf,
     metadata: ExchangeMetadata,
     request_body_path: PathBuf,
     response_body_path: PathBuf,
-    request_body_writer: Option<BufWriter<File>>,
-    response_body_writer: Option<BufWriter<File>>,
+    request_body_writer: Option<BodyLogWriter>,
+    response_body_writer: Option<BodyLogWriter>,
     response_headers_path: PathBuf,
     reconstructed_path: PathBuf,
     should_reconstruct: bool,
+    body_max_bytes: Option<u64>,
+    body_compression: BodyLogCompression,
     request_body_bytes: u64,
     response_body_bytes: u64,
+    request_body_logged_bytes: u64,
+    response_body_logged_bytes: u64,
+    request_body_truncated: bool,
+    response_body_truncated: bool,
 }
 
 impl ExchangeFileLogger {
@@ -94,20 +104,24 @@ impl ExchangeFileLogger {
         upstream_url: &Url,
         request_headers: &HeaderMap,
         should_reconstruct: bool,
+        body_max_bytes: Option<u64>,
+        body_compression: BodyLogCompression,
     ) -> std::io::Result<Self> {
         fs::create_dir_all(root_dir)?;
 
         let now = now_unix_ms();
         let stem = format!("{now}_req_{request_id}");
+        let body_suffix = body_file_suffix(body_compression);
 
         let metadata_path = root_dir.join(format!("{stem}.meta.json"));
         let request_headers_path = root_dir.join(format!("{stem}.request_headers.txt"));
-        let request_body_path = root_dir.join(format!("{stem}.request_body.bin"));
+        let request_body_path = root_dir.join(format!("{stem}.request_body{body_suffix}"));
         let response_headers_path = root_dir.join(format!("{stem}.response_headers.txt"));
-        let response_body_path = root_dir.join(format!("{stem}.response_body.bin"));
+        let response_body_path = root_dir.join(format!("{stem}.response_body{body_suffix}"));
         let reconstructed_path = root_dir.join(format!("{stem}.response_reconstructed.txt"));
 
         let metadata = ExchangeMetadata {
+            schema_version: EXCHANGE_LOG_SCHEMA_VERSION,
             request_id,
             started_unix_ms: now,
             peer: peer.to_string(),
@@ -117,6 +131,8 @@ impl ExchangeFileLogger {
             method: method.to_string(),
             uri: uri.to_string(),
             upstream_url: upstream_url.to_string(),
+            body_max_bytes,
+            body_compression: body_compression.as_str().to_string(),
             should_reconstruct,
             response_status_code: None,
             response_status_text: None,
@@ -126,9 +142,14 @@ impl ExchangeFileLogger {
             upstream_error: None,
             request_body_bytes: 0,
             response_body_bytes: 0,
+            request_body_logged_bytes: 0,
+            response_body_logged_bytes: 0,
+            request_body_truncated: false,
+            response_body_truncated: false,
             reconstruction_attempted: false,
             reconstruction_succeeded: None,
             reconstruction_error: None,
+            attempts: Vec::new(),
             files: ExchangeMetadataFiles {
                 request_headers: request_headers_path.display().to_string(),
                 request_body: request_body_path.display().to_string(),
@@ -147,17 +168,25 @@ impl ExchangeFileLogger {
 
         Ok(Self {
             request_id,
+            root_dir: root_dir.to_path_buf(),
+            stem,
             metadata_path,
             metadata,
             request_body_path: request_body_path.clone(),
             response_body_path: response_body_path.clone(),
-            request_body_writer: Some(BufWriter::new(File::create(&request_body_path)?)),
-            response_body_writer: Some(BufWriter::new(File::create(&response_body_path)?)),
+            request_body_writer: Some(create_body_writer(&request_body_path, body_compression)?),
+            response_body_writer: Some(create_body_writer(&response_body_path, body_compression)?),
             response_headers_path,
             reconstructed_path,
             should_reconstruct,
+            body_max_bytes,
+            body_compression,
             request_body_bytes: 0,
             response_body_bytes: 0,
+            request_body_logged_bytes: 0,
+            response_body_logged_bytes: 0,
+            request_body_truncated: false,
+            response_body_truncated: false,
         })
     }
 
@@ -165,11 +194,22 @@ impl ExchangeFileLogger {
         self.request_body_bytes = self
             .request_body_bytes
             .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let (write_len, truncated) = limited_chunk_len(
+            self.body_max_bytes,
+            self.request_body_logged_bytes,
+            chunk.len(),
+        );
+        self.request_body_truncated |= truncated;
+        self.request_body_logged_bytes = self
+            .request_body_logged_bytes
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+
+        let to_write = &chunk[..write_len];
         write_chunk_best_effort(
             self.request_id,
             &self.request_body_path,
             &mut self.request_body_writer,
-            chunk,
+            to_write,
             "request body",
         );
     }
@@ -178,13 +218,82 @@ impl ExchangeFileLogger {
         self.response_body_bytes = self
             .response_body_bytes
             .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let (write_len, truncated) = limited_chunk_len(
+            self.body_max_bytes,
+            self.response_body_logged_bytes,
+            chunk.len(),
+        );
+        self.response_body_truncated |= truncated;
+        self.response_body_logged_bytes = self
+            .response_body_logged_bytes
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+
+        let to_write = &chunk[..write_len];
         write_chunk_best_effort(
             self.request_id,
             &self.response_body_path,
             &mut self.response_body_writer,
-            chunk,
+            to_write,
             "response body",
         );
+    }
+
+    pub fn record_attempt(
+        &mut self,
+        status: StatusCode,
+        headers: &HeaderMap,
+        latency_ms: u128,
+        response_body_bytes: Option<u64>,
+        is_final: bool,
+    ) {
+        let attempt_number = u32::try_from(self.metadata.attempts.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let status_text = status.canonical_reason().unwrap_or("unknown");
+        let attempt_headers_path = self.root_dir.join(format!(
+            "{}.attempt_{}.response_headers.txt",
+            self.stem, attempt_number
+        ));
+
+        let mut body = format!(
+            "attempt: {}\nstatus: {} {}\nlatency_ms: {}\n",
+            attempt_number,
+            status.as_u16(),
+            status_text,
+            latency_ms
+        );
+        if let Some(bytes) = response_body_bytes {
+            body.push_str(&format!("response_body_bytes: {bytes}\n"));
+        }
+        body.push_str(&format_headers(headers));
+
+        if let Err(err) = fs::write(&attempt_headers_path, body.as_bytes()) {
+            warn!(
+                request_id = self.request_id,
+                attempt = attempt_number,
+                path = %attempt_headers_path.display(),
+                error = %err,
+                "failed to write retry attempt headers log"
+            );
+        }
+
+        self.metadata.attempts.push(ExchangeAttemptMetadata {
+            attempt: attempt_number,
+            is_final,
+            response_status_code: status.as_u16(),
+            response_status_text: status_text.to_string(),
+            upstream_latency_ms: latency_ms,
+            response_body_bytes,
+            response_body_logged_bytes: None,
+            response_body_truncated: None,
+            response_headers: attempt_headers_path.display().to_string(),
+            response_body: if is_final {
+                Some(self.response_body_path.display().to_string())
+            } else {
+                None
+            },
+        });
+        self.persist_metadata_best_effort("write attempt metadata");
     }
 
     pub fn write_response_headers(
@@ -238,6 +347,10 @@ impl ExchangeFileLogger {
 
         self.metadata.request_body_bytes = self.request_body_bytes;
         self.metadata.response_body_bytes = self.response_body_bytes;
+        self.metadata.request_body_logged_bytes = self.request_body_logged_bytes;
+        self.metadata.response_body_logged_bytes = self.response_body_logged_bytes;
+        self.metadata.request_body_truncated = self.request_body_truncated;
+        self.metadata.response_body_truncated = self.response_body_truncated;
         self.metadata.completed_unix_ms = Some(now_unix_ms());
         self.metadata.total_duration_ms = Some(
             self.metadata
@@ -245,6 +358,11 @@ impl ExchangeFileLogger {
                 .unwrap_or(self.metadata.started_unix_ms)
                 .saturating_sub(self.metadata.started_unix_ms),
         );
+        if let Some(final_attempt) = self.metadata.attempts.iter_mut().rev().find(|a| a.is_final) {
+            final_attempt.response_body_bytes = Some(self.response_body_bytes);
+            final_attempt.response_body_logged_bytes = Some(self.response_body_logged_bytes);
+            final_attempt.response_body_truncated = Some(self.response_body_truncated);
+        }
 
         if self.should_reconstruct {
             self.metadata.reconstruction_attempted = true;
@@ -271,8 +389,7 @@ impl ExchangeFileLogger {
     }
 
     fn reconstruct_and_write(&self) -> std::io::Result<()> {
-        let mut raw = Vec::new();
-        File::open(&self.response_body_path)?.read_to_end(&mut raw)?;
+        let raw = read_logged_body_file(&self.response_body_path, self.body_compression)?;
         if raw.is_empty() {
             return Ok(());
         }
@@ -309,6 +426,7 @@ impl ExchangeFileLogger {
 
 #[derive(Debug, Serialize)]
 struct ExchangeMetadata {
+    schema_version: u32,
     request_id: u64,
     started_unix_ms: u128,
     peer: String,
@@ -318,6 +436,8 @@ struct ExchangeMetadata {
     method: String,
     uri: String,
     upstream_url: String,
+    body_max_bytes: Option<u64>,
+    body_compression: String,
     should_reconstruct: bool,
     response_status_code: Option<u16>,
     response_status_text: Option<String>,
@@ -327,9 +447,14 @@ struct ExchangeMetadata {
     upstream_error: Option<String>,
     request_body_bytes: u64,
     response_body_bytes: u64,
+    request_body_logged_bytes: u64,
+    response_body_logged_bytes: u64,
+    request_body_truncated: bool,
+    response_body_truncated: bool,
     reconstruction_attempted: bool,
     reconstruction_succeeded: Option<bool>,
     reconstruction_error: Option<String>,
+    attempts: Vec<ExchangeAttemptMetadata>,
     files: ExchangeMetadataFiles,
 }
 
@@ -340,6 +465,44 @@ struct ExchangeMetadataFiles {
     response_headers: String,
     response_body: String,
     reconstructed_response: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExchangeAttemptMetadata {
+    attempt: u32,
+    is_final: bool,
+    response_status_code: u16,
+    response_status_text: String,
+    upstream_latency_ms: u128,
+    response_body_bytes: Option<u64>,
+    response_body_logged_bytes: Option<u64>,
+    response_body_truncated: Option<bool>,
+    response_headers: String,
+    response_body: Option<String>,
+}
+
+enum BodyLogWriter {
+    Plain(BufWriter<File>),
+    Zstd(zstd::stream::write::Encoder<'static, BufWriter<File>>),
+}
+
+impl BodyLogWriter {
+    fn write_all(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.write_all(chunk),
+            Self::Zstd(writer) => writer.write_all(chunk),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(mut writer) => writer.flush(),
+            Self::Zstd(writer) => {
+                let mut inner = writer.finish()?;
+                inner.flush()
+            }
+        }
+    }
 }
 
 fn now_unix_ms() -> u128 {
@@ -384,13 +547,58 @@ fn format_headers(headers: &HeaderMap) -> String {
     body
 }
 
+fn create_body_writer(
+    path: &Path,
+    compression: BodyLogCompression,
+) -> std::io::Result<BodyLogWriter> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    match compression {
+        BodyLogCompression::None => Ok(BodyLogWriter::Plain(writer)),
+        BodyLogCompression::Zstd => {
+            let encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+            Ok(BodyLogWriter::Zstd(encoder))
+        }
+    }
+}
+
+fn body_file_suffix(compression: BodyLogCompression) -> &'static str {
+    match compression {
+        BodyLogCompression::None => ".bin",
+        BodyLogCompression::Zstd => ".bin.zst",
+    }
+}
+
+fn limited_chunk_len(max_bytes: Option<u64>, logged_bytes: u64, chunk_len: usize) -> (usize, bool) {
+    let Some(max_bytes) = max_bytes else {
+        return (chunk_len, false);
+    };
+    let remaining = max_bytes.saturating_sub(logged_bytes);
+    let remaining_usize = usize::try_from(remaining).unwrap_or(usize::MAX);
+    let write_len = remaining_usize.min(chunk_len);
+    (write_len, write_len < chunk_len)
+}
+
+fn read_logged_body_file(path: &Path, compression: BodyLogCompression) -> std::io::Result<Vec<u8>> {
+    match compression {
+        BodyLogCompression::None => fs::read(path),
+        BodyLogCompression::Zstd => {
+            let file = File::open(path)?;
+            zstd::stream::decode_all(file)
+        }
+    }
+}
+
 fn write_chunk_best_effort(
     request_id: u64,
     path: &Path,
-    writer: &mut Option<BufWriter<File>>,
-    chunk: &Bytes,
+    writer: &mut Option<BodyLogWriter>,
+    chunk: &[u8],
     kind: &'static str,
 ) {
+    if chunk.is_empty() {
+        return;
+    }
     let Some(writer_inner) = writer.as_mut() else {
         return;
     };
@@ -409,13 +617,13 @@ fn write_chunk_best_effort(
 fn flush_best_effort(
     request_id: u64,
     path: &Path,
-    writer: &mut Option<BufWriter<File>>,
+    writer: &mut Option<BodyLogWriter>,
     kind: &'static str,
 ) {
-    let Some(mut writer_inner) = writer.take() else {
+    let Some(writer_inner) = writer.take() else {
         return;
     };
-    if let Err(err) = writer_inner.flush() {
+    if let Err(err) = writer_inner.finish() {
         warn!(
             request_id,
             path = %path.display(),

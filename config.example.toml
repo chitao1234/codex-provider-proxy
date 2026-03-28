@@ -28,6 +28,10 @@ max_body_log_bytes = 8192
 # Optional: when set, writes per-exchange files under this directory
 # (metadata, headers, raw request body, raw response body).
 # exchange_log_dir = "./logs/exchanges"
+# Optional cap for exchange request/response body files. 0 means unlimited.
+exchange_body_max_bytes = 0
+# Compression for exchange request/response body files: "none" or "zstd".
+exchange_body_compression = "none"
 # Best-effort reconstruction for URLs ending in `responses`.
 # This only affects file output and never alters proxy behavior.
 reconstruct_responses = true
