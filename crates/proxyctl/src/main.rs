@@ -234,6 +234,18 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+async fn cleanup_route_best_effort(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    token: Option<&String>,
+    pid: u32,
+    context: &str,
+) {
+    if let Err(err) = rpc_delete_route(client, rpc_url, token, pid).await {
+        eprintln!("warning: {context} pid={pid}: {err}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -400,11 +412,37 @@ async fn main() -> Result<()> {
 
             let exec = command.first().context("missing command")?;
             let args = &command[1..];
+            let parent_pid = std::process::id();
 
-            let mut child = ProcessCommand::new(exec)
-                .args(args)
-                .spawn()
-                .with_context(|| format!("spawn command {:?}", command))?;
+            rpc_set_route(
+                &client,
+                &rpc_url,
+                token.as_ref(),
+                parent_pid,
+                provider.clone(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "set pre-exec route for parent pid={} provider={}",
+                    parent_pid, provider
+                )
+            })?;
+
+            let mut child = match ProcessCommand::new(exec).args(args).spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    cleanup_route_best_effort(
+                        &client,
+                        &rpc_url,
+                        token.as_ref(),
+                        parent_pid,
+                        "failed to remove pre-exec parent route after spawn failure for",
+                    )
+                    .await;
+                    return Err(err).with_context(|| format!("spawn command {:?}", command));
+                }
+            };
             let pid = child.id();
 
             if let Err(err) =
@@ -412,9 +450,26 @@ async fn main() -> Result<()> {
             {
                 let _ = child.kill();
                 let _ = child.wait();
+                cleanup_route_best_effort(
+                    &client,
+                    &rpc_url,
+                    token.as_ref(),
+                    parent_pid,
+                    "failed to remove pre-exec parent route after child route setup failure for",
+                )
+                .await;
                 return Err(err)
                     .with_context(|| format!("set route for pid={} provider={}", pid, provider));
             }
+
+            cleanup_route_best_effort(
+                &client,
+                &rpc_url,
+                token.as_ref(),
+                parent_pid,
+                "failed to remove pre-exec parent route for",
+            )
+            .await;
 
             println!("set pid={} provider={}", pid, provider);
             let status = child

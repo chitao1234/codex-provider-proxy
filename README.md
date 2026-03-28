@@ -64,6 +64,8 @@ cargo run -p codex-provider-proxyctl -- exec -p provider_b -- \
 ```
 
 By default, `exec` removes the PID route when the command exits. Use `--keep-route` to keep it.
+To avoid a startup race, `exec` pre-binds a temporary route on the controller process before spawning
+the child, then transfers routing to the child PID.
 
 4. Send a request from that same local process; it will be routed to the provider assigned to the PID.
 
