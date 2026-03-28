@@ -48,9 +48,10 @@ pub struct LoggingConfig {
     pub rule: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyLogCompression {
+    #[default]
     None,
     Zstd,
 }
@@ -61,12 +62,6 @@ impl BodyLogCompression {
             Self::None => "none",
             Self::Zstd => "zstd",
         }
-    }
-}
-
-impl Default for BodyLogCompression {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -149,7 +144,7 @@ fn default_exchange_body_max_bytes() -> u64 {
 }
 
 fn default_exchange_body_compression() -> BodyLogCompression {
-    BodyLogCompression::None
+    BodyLogCompression::default()
 }
 
 fn default_listen_base_path() -> String {

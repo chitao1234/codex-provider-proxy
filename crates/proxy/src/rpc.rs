@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -65,18 +65,30 @@ fn ensure_auth(headers: &HeaderMap, cfg: &Config) -> Result<()> {
     }
 }
 
+async fn authorize_rpc_request(
+    state: &RpcState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> std::result::Result<std::sync::Arc<Config>, Response> {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
+        return Err((StatusCode::FORBIDDEN, format!("{err}\n")).into_response());
+    }
+    if let Err(err) = ensure_auth(headers, &cfg) {
+        return Err((StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response());
+    }
+    Ok(cfg)
+}
+
 async fn list_routes(
     State(state): State<RpcState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     let mut routes: Vec<RouteEntry> = state
         .runtime
@@ -97,13 +109,10 @@ async fn set_route(
     headers: HeaderMap,
     Json(req): Json<SetRouteRequest>,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     if !cfg.providers.contains_key(&req.provider) {
         return (
@@ -123,13 +132,10 @@ async fn delete_route(
     headers: HeaderMap,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     let removed = state.runtime.pid_routes().remove(&pid).is_some();
     Json(DeleteRouteResponse { removed }).into_response()
@@ -140,13 +146,10 @@ async fn clear_routes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     state.runtime.pid_routes().clear();
     StatusCode::NO_CONTENT.into_response()
@@ -157,13 +160,10 @@ async fn list_providers(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     let mut providers: Vec<String> = cfg.providers.keys().cloned().collect();
     providers.sort();
@@ -182,13 +182,10 @@ async fn set_default_provider(
     headers: HeaderMap,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
-    }
-    if let Err(err) = ensure_auth(&headers, &cfg) {
-        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
-    }
+    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
 
     if !cfg.providers.contains_key(&req.provider) {
         return (

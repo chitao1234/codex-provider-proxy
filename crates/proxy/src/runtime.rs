@@ -159,6 +159,7 @@ pub struct ServerManager {
     config_path: PathBuf,
     overrides: ConfigOverrides,
     runtime: RuntimeState,
+    reconfigure_gate: Mutex<()>,
     listeners: Mutex<ListenerSet>,
 }
 
@@ -185,6 +186,7 @@ impl ServerManager {
             config_path,
             overrides,
             runtime,
+            reconfigure_gate: Mutex::new(()),
             listeners: Mutex::new(ListenerSet {
                 proxy: HashMap::new(),
                 rpc: None,
@@ -202,26 +204,43 @@ impl ServerManager {
     }
 
     pub async fn reconfigure(&self, config: Config) -> Result<()> {
+        let _reconfigure_guard = self.reconfigure_gate.lock().await;
         let config = Arc::new(config);
         let desired_proxy_addrs: HashSet<SocketAddr> =
             config.listen_addrs.iter().copied().collect();
 
-        let mut listeners = self.listeners.lock().await;
+        let (existing_proxy_addrs, existing_rpc_addr) = {
+            let listeners = self.listeners.lock().await;
+            (
+                listeners.proxy.keys().copied().collect::<HashSet<_>>(),
+                listeners.rpc.as_ref().map(|(addr, _)| *addr),
+            )
+        };
+
         let mut new_proxy_listeners = Vec::new();
         for addr in config.listen_addrs.iter().copied() {
-            if !listeners.proxy.contains_key(&addr) {
+            if !existing_proxy_addrs.contains(&addr) {
                 new_proxy_listeners.push(bind_listener(addr).await?);
             }
         }
 
-        let new_rpc_listener = match listeners.rpc.as_ref().map(|(addr, _)| *addr) {
+        let new_rpc_listener = match existing_rpc_addr {
             Some(addr) if addr == config.rpc_listen_addr => None,
             _ => Some(bind_listener(config.rpc_listen_addr).await?),
         };
 
         let summary = self.runtime.apply_config(config.clone()).await?;
 
+        let mut listeners = self.listeners.lock().await;
         for bound in new_proxy_listeners {
+            if listeners.proxy.contains_key(&bound.configured_addr) {
+                info!(
+                    configured = %bound.configured_addr,
+                    listen = %bound.local_addr,
+                    "proxy listener already present; dropping newly bound listener"
+                );
+                continue;
+            }
             info!(
                 configured = %bound.configured_addr,
                 listen = %bound.local_addr,
@@ -234,16 +253,29 @@ impl ServerManager {
         }
 
         if let Some(bound) = new_rpc_listener {
-            info!(
-                configured = %bound.configured_addr,
-                rpc_listen = %bound.local_addr,
-                "rpc listening"
-            );
-            let new_handle = spawn_rpc_listener(self.runtime.clone(), bound);
-            if let Some((old_addr, old_handle)) =
-                listeners.rpc.replace((config.rpc_listen_addr, new_handle))
+            if listeners
+                .rpc
+                .as_ref()
+                .map(|(addr, _)| *addr == config.rpc_listen_addr)
+                .unwrap_or(false)
             {
-                old_handle.stop("rpc", old_addr);
+                info!(
+                    configured = %bound.configured_addr,
+                    rpc_listen = %bound.local_addr,
+                    "rpc listener already present; dropping newly bound listener"
+                );
+            } else {
+                info!(
+                    configured = %bound.configured_addr,
+                    rpc_listen = %bound.local_addr,
+                    "rpc listening"
+                );
+                let new_handle = spawn_rpc_listener(self.runtime.clone(), bound);
+                if let Some((old_addr, old_handle)) =
+                    listeners.rpc.replace((config.rpc_listen_addr, new_handle))
+                {
+                    old_handle.stop("rpc", old_addr);
+                }
             }
         }
 
@@ -274,6 +306,7 @@ impl ServerManager {
     }
 
     pub async fn shutdown_all(&self) {
+        let _reconfigure_guard = self.reconfigure_gate.lock().await;
         let (proxy_handles, rpc_handle) = {
             let mut listeners = self.listeners.lock().await;
             let proxy_handles = std::mem::take(&mut listeners.proxy);

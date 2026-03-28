@@ -22,7 +22,10 @@ use url::Url;
 
 use crate::{
     config::Provider,
-    exchange_log::{maybe_create_exchange_logger, ExchangeLogContext, SharedExchangeFileLogger},
+    exchange_log::{
+        maybe_create_exchange_logger, ExchangeFileLogger, ExchangeLogContext,
+        SharedExchangeFileLogger,
+    },
     log_capture::{Capture, CaptureConfig, SharedCapture},
     runtime::RuntimeState,
 };
@@ -33,6 +36,41 @@ const MAX_ANCESTOR_PID_DEPTH: usize = 64;
 pub struct ProxyState {
     pub listen_addr: SocketAddr,
     pub runtime: RuntimeState,
+}
+
+#[derive(Clone)]
+struct ResolvedProviderRoute {
+    pid: Option<u32>,
+    route_pid: Option<u32>,
+    provider_name: String,
+    provider: Provider,
+}
+
+#[derive(Clone)]
+struct RetryRequestTemplate {
+    http_client: reqwest::Client,
+    method: http::Method,
+    url: Url,
+    headers: HeaderMap,
+    request_body: Bytes,
+}
+
+#[derive(Clone)]
+struct RetrySendArgs {
+    request_id: u64,
+    transparent_retry_count: u32,
+    idle_timeout: Option<Duration>,
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request: RetryRequestTemplate,
+}
+
+struct UpstreamSendRequest {
+    request_id: u64,
+    method: http::Method,
+    url: Url,
+    headers: HeaderMap,
+    body: Body,
+    exchange_logger: Option<SharedExchangeFileLogger>,
 }
 
 pub fn router(state: ProxyState) -> Router {
@@ -65,69 +103,11 @@ async fn handle_proxy_inner(
     let request_id = state.runtime.next_request_id();
     let started = Instant::now();
     let cfg = state.runtime.config().await;
-    let pid_routes = state.runtime.pid_routes();
-
-    let is_loopback_peer = peer.ip().is_loopback();
-    let pid = if is_loopback_peer {
-        match state
-            .runtime
-            .pid_resolver()
-            .pid_for_peer(state.listen_addr, peer)
-            .await
-        {
-            Ok(pid) => pid,
-            Err(err) => {
-                warn!(request_id, peer = %peer, error = %err, "pid resolution failed");
-                None
-            }
-        }
-    } else {
-        if !pid_routes.is_empty() {
-            debug!(
-                request_id,
-                peer = %peer,
-                "non-loopback peer cannot be PID-routed; falling back to default provider"
-            );
-        }
-        None
-    };
-
-    // `pid_for_peer` is best-effort and may return Ok(None) (e.g. short-lived connections,
-    // /proc visibility/permission issues, or inability to map the socket to a process).
-    // If PID routing is in use, surface this so it's not silently surprising.
-    if is_loopback_peer && pid.is_none() && !pid_routes.is_empty() {
-        warn!(
-            request_id,
-            peer = %peer,
-            listen = %state.listen_addr,
-            "pid could not be resolved for connection; falling back to default provider"
-        );
-    }
-
-    let default_provider = state.runtime.default_provider().await;
-    let (provider_name, route_pid) = match pid {
-        Some(pid) => match find_provider_for_pid_or_ancestors(&state, pid).await {
-            Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
-            Ok(None) => (default_provider.clone(), None),
-            Err(err) => {
-                warn!(
-                    request_id,
-                    pid,
-                    peer = %peer,
-                    error = %err,
-                    "ancestor pid route lookup failed; falling back to default provider"
-                );
-                (default_provider.clone(), None)
-            }
-        },
-        None => (default_provider.clone(), None),
-    };
-
-    let provider = cfg
-        .providers
-        .get(&provider_name)
-        .with_context(|| format!("provider {provider_name:?} missing from config"))?
-        .clone();
+    let resolved = resolve_provider_for_request(&state, &cfg, peer, request_id).await?;
+    let pid = resolved.pid;
+    let route_pid = resolved.route_pid;
+    let provider_name = resolved.provider_name;
+    let provider = resolved.provider;
 
     let (parts, body) = req.into_parts();
 
@@ -185,71 +165,35 @@ async fn handle_proxy_inner(
             .context("build Authorization header")?,
     );
 
-    let send_result: std::result::Result<
-        (reqwest::Response, Option<SharedCapture>, u32, u128),
-        std::io::Error,
-    > = if cfg.transparent_retry_count == 0 {
-        let attempt_started = Instant::now();
-        let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
-        let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
-            &cfg,
-            body,
-            exchange_logger.clone(),
-            upload_activity.clone(),
-        );
-        let out = state
-            .runtime
-            .http_client()
-            .request(parts.method.clone(), url.clone())
-            .headers(headers)
-            .body(req_body);
-
-        let resp = send_with_optional_idle_timeout(
+    let send_result = send_upstream_request(
+        &state,
+        &cfg,
+        UpstreamSendRequest {
             request_id,
-            cfg.upstream_idle_timeout,
-            upload_activity,
-            out.send(),
-        )
-        .await?;
-        Ok((
-            resp,
-            req_body_capture,
-            1,
-            attempt_started.elapsed().as_millis(),
-        ))
-    } else {
-        let (request_body, req_body_capture) =
-            buffer_request_body_for_retry(&cfg, body, exchange_logger.clone()).await?;
-        let (resp, final_attempt, final_attempt_latency_ms) = send_with_non_2xx_retries(
-            request_id,
-            cfg.transparent_retry_count,
-            cfg.upstream_idle_timeout,
-            state.runtime.http_client(),
-            parts.method.clone(),
-            url.clone(),
+            method: parts.method.clone(),
+            url: url.clone(),
             headers,
-            request_body,
-            exchange_logger.clone(),
-        )
-        .await?;
-        Ok((
-            resp,
-            req_body_capture,
-            final_attempt,
-            final_attempt_latency_ms,
-        ))
-    };
+            body,
+            exchange_logger: exchange_logger.clone(),
+        },
+    )
+    .await;
 
     let (resp, req_body_capture, _final_attempt, final_attempt_latency_ms) = match send_result {
         Ok(resp) => resp,
         Err(err) => {
-            if let Some(exchange_logger) = &exchange_logger {
-                if let Ok(mut logger) = exchange_logger.lock() {
-                    logger
-                        .mark_upstream_send_error(started.elapsed().as_millis(), &err.to_string());
+            let error_latency_ms = started.elapsed().as_millis();
+            let err_text = err.to_string();
+            with_exchange_logger_blocking(
+                exchange_logger.clone(),
+                request_id,
+                "mark upstream send error",
+                move |logger| {
+                    logger.mark_upstream_send_error(error_latency_ms, &err_text);
                     logger.finalize();
-                }
-            }
+                },
+            )
+            .await;
             return Err(err).context("send upstream request");
         }
     };
@@ -290,12 +234,24 @@ async fn handle_proxy_inner(
         );
     }
 
-    if let Some(exchange_logger) = &exchange_logger {
-        if let Ok(mut logger) = exchange_logger.lock() {
-            logger.record_attempt(status, &resp_headers, final_attempt_latency_ms, None, true);
-            logger.write_response_headers(status, &resp_headers, started.elapsed().as_millis());
-        }
-    }
+    let resp_headers_for_log = resp_headers.clone();
+    let upstream_latency_ms = started.elapsed().as_millis();
+    with_exchange_logger_blocking(
+        exchange_logger.clone(),
+        request_id,
+        "record final upstream attempt",
+        move |logger| {
+            logger.record_attempt(
+                status,
+                &resp_headers_for_log,
+                final_attempt_latency_ms,
+                None,
+                true,
+            );
+            logger.write_response_headers(status, &resp_headers_for_log, upstream_latency_ms);
+        },
+    )
+    .await;
 
     if cfg.logging.log_bodies {
         if let Some(cap) = req_body_capture {
@@ -331,13 +287,202 @@ async fn handle_proxy_inner(
             );
         }
         if let Some(exchange_logger) = exchange_logger {
-            if let Ok(mut logger) = exchange_logger.lock() {
-                logger.finalize();
-            }
+            finalize_exchange_logger_nonblocking(exchange_logger, request_id);
         }
     }));
 
     Ok(builder.body(body)?)
+}
+
+async fn resolve_provider_for_request(
+    state: &ProxyState,
+    cfg: &crate::config::Config,
+    peer: SocketAddr,
+    request_id: u64,
+) -> Result<ResolvedProviderRoute> {
+    let pid_routes = state.runtime.pid_routes();
+    let is_loopback_peer = peer.ip().is_loopback();
+    let pid = if is_loopback_peer {
+        match state
+            .runtime
+            .pid_resolver()
+            .pid_for_peer(state.listen_addr, peer)
+            .await
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                warn!(request_id, peer = %peer, error = %err, "pid resolution failed");
+                None
+            }
+        }
+    } else {
+        if !pid_routes.is_empty() {
+            debug!(
+                request_id,
+                peer = %peer,
+                "non-loopback peer cannot be PID-routed; falling back to default provider"
+            );
+        }
+        None
+    };
+
+    // `pid_for_peer` is best-effort and may return Ok(None) (e.g. short-lived connections,
+    // /proc visibility/permission issues, or inability to map the socket to a process).
+    // If PID routing is in use, surface this so it's not silently surprising.
+    if is_loopback_peer && pid.is_none() && !pid_routes.is_empty() {
+        warn!(
+            request_id,
+            peer = %peer,
+            listen = %state.listen_addr,
+            "pid could not be resolved for connection; falling back to default provider"
+        );
+    }
+
+    let default_provider = state.runtime.default_provider().await;
+    let (provider_name, route_pid) = match pid {
+        Some(pid) => match find_provider_for_pid_or_ancestors(state, pid).await {
+            Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
+            Ok(None) => (default_provider.clone(), None),
+            Err(err) => {
+                warn!(
+                    request_id,
+                    pid,
+                    peer = %peer,
+                    error = %err,
+                    "ancestor pid route lookup failed; falling back to default provider"
+                );
+                (default_provider.clone(), None)
+            }
+        },
+        None => (default_provider.clone(), None),
+    };
+
+    let provider = cfg
+        .providers
+        .get(&provider_name)
+        .with_context(|| format!("provider {provider_name:?} missing from config"))?
+        .clone();
+    Ok(ResolvedProviderRoute {
+        pid,
+        route_pid,
+        provider_name,
+        provider,
+    })
+}
+
+async fn send_upstream_request(
+    state: &ProxyState,
+    cfg: &crate::config::Config,
+    request: UpstreamSendRequest,
+) -> std::result::Result<(reqwest::Response, Option<SharedCapture>, u32, u128), std::io::Error> {
+    let UpstreamSendRequest {
+        request_id,
+        method,
+        url,
+        headers,
+        body,
+        exchange_logger,
+    } = request;
+    if cfg.transparent_retry_count == 0 {
+        let attempt_started = Instant::now();
+        let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
+        let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
+            cfg,
+            body,
+            exchange_logger.clone(),
+            upload_activity.clone(),
+            request_id,
+        );
+        let out = state
+            .runtime
+            .http_client()
+            .request(method, url)
+            .headers(headers)
+            .body(req_body);
+
+        let resp = send_with_optional_idle_timeout(
+            request_id,
+            cfg.upstream_idle_timeout,
+            upload_activity,
+            out.send(),
+        )
+        .await?;
+        Ok((
+            resp,
+            req_body_capture,
+            1,
+            attempt_started.elapsed().as_millis(),
+        ))
+    } else {
+        let (request_body, req_body_capture) =
+            buffer_request_body_for_retry(cfg, body, exchange_logger.clone(), request_id).await?;
+        let (resp, final_attempt, final_attempt_latency_ms) =
+            send_with_non_2xx_retries(RetrySendArgs {
+                request_id,
+                transparent_retry_count: cfg.transparent_retry_count,
+                idle_timeout: cfg.upstream_idle_timeout,
+                exchange_logger,
+                request: RetryRequestTemplate {
+                    http_client: state.runtime.http_client(),
+                    method,
+                    url,
+                    headers,
+                    request_body,
+                },
+            })
+            .await?;
+        Ok((
+            resp,
+            req_body_capture,
+            final_attempt,
+            final_attempt_latency_ms,
+        ))
+    }
+}
+
+async fn with_exchange_logger_blocking<F>(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    action: &'static str,
+    f: F,
+) where
+    F: FnOnce(&mut ExchangeFileLogger) + Send + 'static,
+{
+    let Some(exchange_logger) = exchange_logger else {
+        return;
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        if let Ok(mut logger) = exchange_logger.lock() {
+            f(&mut logger);
+        }
+    })
+    .await;
+
+    if let Err(err) = join {
+        warn!(request_id, action, error = %err, "exchange logger task join failed");
+    }
+}
+
+fn finalize_exchange_logger_nonblocking(
+    exchange_logger: SharedExchangeFileLogger,
+    request_id: u64,
+) {
+    if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
+        runtime_handle.spawn_blocking(move || {
+            if let Ok(mut logger) = exchange_logger.lock() {
+                logger.finalize();
+            }
+        });
+        return;
+    }
+
+    warn!(
+        request_id,
+        "no active Tokio runtime while finalizing exchange logger; finalizing inline"
+    );
+    if let Ok(mut logger) = exchange_logger.lock() {
+        logger.finalize();
+    }
 }
 
 async fn find_provider_for_pid_or_ancestors(
@@ -458,6 +603,7 @@ fn maybe_wrap_request_body_for_logging(
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
     upload_activity: Option<Arc<Notify>>,
+    request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
     let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
 
@@ -475,19 +621,30 @@ fn maybe_wrap_request_body_for_logging(
     let upload_activity2 = upload_activity.clone();
     let stream = if cfg.logging.log_bodies || exchange_logger.is_some() || upload_activity.is_some()
     {
-        Box::pin(TryStreamExt::inspect_ok(stream, move |chunk| {
-            if let Some(cap2) = &cap2 {
-                if let Ok(mut c) = cap2.lock() {
-                    c.push_chunk(chunk);
+        Box::pin(stream.and_then(move |chunk| {
+            let cap2 = cap2.clone();
+            let exchange_logger2 = exchange_logger2.clone();
+            let upload_activity2 = upload_activity2.clone();
+            async move {
+                if let Some(cap2) = &cap2 {
+                    if let Ok(mut c) = cap2.lock() {
+                        c.push_chunk(&chunk);
+                    }
                 }
-            }
-            if let Some(exchange_logger) = &exchange_logger2 {
-                if let Ok(mut logger) = exchange_logger.lock() {
-                    logger.on_request_body_chunk(chunk);
+                with_exchange_logger_blocking(
+                    exchange_logger2,
+                    request_id,
+                    "append request body chunk",
+                    {
+                        let chunk = chunk.clone();
+                        move |logger| logger.on_request_body_chunk(&chunk)
+                    },
+                )
+                .await;
+                if let Some(upload_activity) = &upload_activity2 {
+                    upload_activity.notify_one();
                 }
-            }
-            if let Some(upload_activity) = &upload_activity2 {
-                upload_activity.notify_one();
+                Ok(chunk)
             }
         })) as BoxRespStream
     } else {
@@ -500,6 +657,7 @@ async fn buffer_request_body_for_retry(
     cfg: &crate::config::Config,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
 ) -> std::result::Result<(Bytes, Option<SharedCapture>), std::io::Error> {
     let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
     let mut buffered = BytesMut::new();
@@ -522,11 +680,16 @@ async fn buffer_request_body_for_retry(
                 c.push_chunk(&chunk);
             }
         }
-        if let Some(exchange_logger) = &exchange_logger {
-            if let Ok(mut logger) = exchange_logger.lock() {
-                logger.on_request_body_chunk(&chunk);
-            }
-        }
+        with_exchange_logger_blocking(
+            exchange_logger.clone(),
+            request_id,
+            "append buffered request body chunk",
+            {
+                let chunk = chunk.clone();
+                move |logger| logger.on_request_body_chunk(&chunk)
+            },
+        )
+        .await;
     }
 
     Ok((buffered.freeze(), cap))
@@ -555,16 +718,26 @@ fn response_stream_and_capture(
     let cap2 = cap.clone();
     let exchange_logger2 = exchange_logger.clone();
     let stream = if cfg.logging.log_bodies || exchange_logger.is_some() {
-        Box::pin(stream.inspect_ok(move |chunk| {
-            if let Some(cap2) = &cap2 {
-                if let Ok(mut c) = cap2.lock() {
-                    c.push_chunk(chunk);
+        Box::pin(stream.and_then(move |chunk| {
+            let cap2 = cap2.clone();
+            let exchange_logger2 = exchange_logger2.clone();
+            async move {
+                if let Some(cap2) = &cap2 {
+                    if let Ok(mut c) = cap2.lock() {
+                        c.push_chunk(&chunk);
+                    }
                 }
-            }
-            if let Some(exchange_logger) = &exchange_logger2 {
-                if let Ok(mut logger) = exchange_logger.lock() {
-                    logger.on_response_body_chunk(chunk);
-                }
+                with_exchange_logger_blocking(
+                    exchange_logger2,
+                    request_id,
+                    "append response body chunk",
+                    {
+                        let chunk = chunk.clone();
+                        move |logger| logger.on_response_body_chunk(&chunk)
+                    },
+                )
+                .await;
+                Ok(chunk)
             }
         })) as BoxRespStream
     } else {
@@ -647,42 +820,40 @@ where
 }
 
 async fn send_with_non_2xx_retries(
-    request_id: u64,
-    transparent_retry_count: u32,
-    idle_timeout: Option<Duration>,
-    http_client: reqwest::Client,
-    method: http::Method,
-    url: Url,
-    headers: HeaderMap,
-    request_body: Bytes,
-    exchange_logger: Option<SharedExchangeFileLogger>,
+    args: RetrySendArgs,
 ) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error> {
-    for attempt in 0..=transparent_retry_count {
+    for attempt in 0..=args.transparent_retry_count {
         let attempt_started = Instant::now();
-        let out = http_client
-            .request(method.clone(), url.clone())
-            .headers(headers.clone())
-            .body(request_body.clone());
+        let out = args
+            .request
+            .http_client
+            .request(args.request.method.clone(), args.request.url.clone())
+            .headers(args.request.headers.clone())
+            .body(args.request.request_body.clone());
         let resp =
-            send_with_optional_idle_timeout(request_id, idle_timeout, None, out.send()).await?;
+            send_with_optional_idle_timeout(args.request_id, args.idle_timeout, None, out.send())
+                .await?;
 
         let status = resp.status();
         let attempt_latency_ms = attempt_started.elapsed().as_millis();
         let attempt_number = attempt.saturating_add(1);
-        if status.is_success() || attempt == transparent_retry_count {
+        if status.is_success() || attempt == args.transparent_retry_count {
             return Ok((resp, attempt_number, attempt_latency_ms));
         }
 
         let resp_headers = resp.headers().clone();
         let retry_body_bytes = drain_response_body_with_optional_idle_timeout(
-            request_id,
-            idle_timeout,
+            args.request_id,
+            args.idle_timeout,
             resp,
             "reading non-final retry response body",
         )
         .await?;
-        if let Some(exchange_logger) = &exchange_logger {
-            if let Ok(mut logger) = exchange_logger.lock() {
+        with_exchange_logger_blocking(
+            args.exchange_logger.clone(),
+            args.request_id,
+            "record retry attempt",
+            move |logger| {
                 logger.record_attempt(
                     status,
                     &resp_headers,
@@ -690,15 +861,16 @@ async fn send_with_non_2xx_retries(
                     Some(retry_body_bytes),
                     false,
                 );
-            }
-        }
+            },
+        )
+        .await;
 
         warn!(
-            request_id,
+            args.request_id,
             status = %status,
             attempt = attempt_number,
-            total_attempts = transparent_retry_count.saturating_add(1),
-            retries_remaining = transparent_retry_count - attempt,
+            total_attempts = args.transparent_retry_count.saturating_add(1),
+            retries_remaining = args.transparent_retry_count - attempt,
             "upstream returned non-2xx status; retrying transparently"
         );
     }
@@ -891,7 +1063,10 @@ mod tests {
     use tokio::sync::oneshot;
     use url::Url;
 
-    use super::{join_paths, send_with_non_2xx_retries, strip_listen_base_path};
+    use super::{
+        join_paths, send_with_non_2xx_retries, strip_listen_base_path, RetryRequestTemplate,
+        RetrySendArgs,
+    };
 
     #[test]
     fn joins_paths_with_prefix() {
@@ -971,19 +1146,22 @@ mod tests {
         let (url, call_count, shutdown_tx) =
             spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
 
-        let (resp, final_attempt, _final_attempt_latency_ms) = send_with_non_2xx_retries(
-            1,
-            2,
-            None,
-            reqwest::Client::new(),
-            Method::POST,
-            url,
-            HeaderMap::new(),
-            Bytes::from_static(b"retry-body"),
-            None,
-        )
-        .await
-        .unwrap();
+        let (resp, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries(RetrySendArgs {
+                request_id: 1,
+                transparent_retry_count: 2,
+                idle_timeout: None,
+                exchange_logger: None,
+                request: RetryRequestTemplate {
+                    http_client: reqwest::Client::new(),
+                    method: Method::POST,
+                    url,
+                    headers: HeaderMap::new(),
+                    request_body: Bytes::from_static(b"retry-body"),
+                },
+            })
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(final_attempt, 2);
@@ -1000,19 +1178,22 @@ mod tests {
         ])
         .await;
 
-        let (resp, final_attempt, _final_attempt_latency_ms) = send_with_non_2xx_retries(
-            2,
-            1,
-            None,
-            reqwest::Client::new(),
-            Method::POST,
-            url,
-            HeaderMap::new(),
-            Bytes::from_static(b"retry-body"),
-            None,
-        )
-        .await
-        .unwrap();
+        let (resp, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries(RetrySendArgs {
+                request_id: 2,
+                transparent_retry_count: 1,
+                idle_timeout: None,
+                exchange_logger: None,
+                request: RetryRequestTemplate {
+                    http_client: reqwest::Client::new(),
+                    method: Method::POST,
+                    url,
+                    headers: HeaderMap::new(),
+                    request_body: Bytes::from_static(b"retry-body"),
+                },
+            })
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(final_attempt, 2);
