@@ -15,6 +15,9 @@ upstream_idle_timeout_secs = 120
 # Transparent retries for non-2xx upstream responses.
 # Value is the number of additional attempts after the first one (0 disables retries).
 transparent_retry_count = 0
+# Linear backoff step between transparent retries, in milliseconds.
+# The first retry waits 1x this value, the second waits 2x, and so on. Set to 0 for no delay.
+transparent_retry_backoff_step_ms = 0
 default_provider = "provider_a"
 
 [logging]

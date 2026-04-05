@@ -59,6 +59,7 @@ struct RetryRequestTemplate {
 struct RetrySendArgs {
     request_id: u64,
     transparent_retry_count: u32,
+    transparent_retry_backoff_step: Duration,
     idle_timeout: Option<Duration>,
     exchange_logger: Option<SharedExchangeFileLogger>,
     request: RetryRequestTemplate,
@@ -420,6 +421,7 @@ async fn send_upstream_request(
             send_with_non_2xx_retries(RetrySendArgs {
                 request_id,
                 transparent_retry_count: cfg.transparent_retry_count,
+                transparent_retry_backoff_step: cfg.transparent_retry_backoff_step,
                 idle_timeout: cfg.upstream_idle_timeout,
                 exchange_logger,
                 request: RetryRequestTemplate {
@@ -822,6 +824,17 @@ where
 async fn send_with_non_2xx_retries(
     args: RetrySendArgs,
 ) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error> {
+    send_with_non_2xx_retries_with_sleep(args, tokio::time::sleep).await
+}
+
+async fn send_with_non_2xx_retries_with_sleep<S, Fut>(
+    args: RetrySendArgs,
+    sleep_fn: S,
+) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error>
+where
+    S: Fn(Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
     for attempt in 0..=args.transparent_retry_count {
         let attempt_started = Instant::now();
         let out = args
@@ -865,17 +878,35 @@ async fn send_with_non_2xx_retries(
         )
         .await;
 
+        let retry_backoff =
+            linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
+
         warn!(
             args.request_id,
             status = %status,
             attempt = attempt_number,
             total_attempts = args.transparent_retry_count.saturating_add(1),
             retries_remaining = args.transparent_retry_count - attempt,
+            retry_backoff_ms = retry_backoff.as_millis(),
             "upstream returned non-2xx status; retrying transparently"
         );
+
+        if !retry_backoff.is_zero() {
+            sleep_fn(retry_backoff).await;
+        }
     }
 
     unreachable!("retry loop always returns")
+}
+
+fn linear_retry_backoff_delay(backoff_step: Duration, retry_number: u32) -> Duration {
+    if retry_number == 0 || backoff_step.is_zero() {
+        return Duration::ZERO;
+    }
+
+    backoff_step
+        .checked_mul(retry_number)
+        .unwrap_or(Duration::MAX)
 }
 
 async fn drain_response_body_with_optional_idle_timeout(
@@ -1047,6 +1078,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1064,7 +1097,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        join_paths, send_with_non_2xx_retries, strip_listen_base_path, RetryRequestTemplate,
+        join_paths, linear_retry_backoff_delay, send_with_non_2xx_retries,
+        send_with_non_2xx_retries_with_sleep, strip_listen_base_path, RetryRequestTemplate,
         RetrySendArgs,
     };
 
@@ -1085,6 +1119,22 @@ mod tests {
         assert_eq!(strip_listen_base_path("/v1", "/v1/models"), Some("models"));
         assert_eq!(strip_listen_base_path("/v1", "/v1"), Some("/"));
         assert_eq!(strip_listen_base_path("/v1", "/v2/models"), None);
+    }
+
+    #[test]
+    fn computes_linear_retry_backoff_delay() {
+        assert_eq!(
+            linear_retry_backoff_delay(Duration::from_millis(250), 1),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            linear_retry_backoff_delay(Duration::from_millis(250), 3),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            linear_retry_backoff_delay(Duration::ZERO, 3),
+            Duration::ZERO
+        );
     }
 
     #[derive(Clone)]
@@ -1150,6 +1200,7 @@ mod tests {
             send_with_non_2xx_retries(RetrySendArgs {
                 request_id: 1,
                 transparent_retry_count: 2,
+                transparent_retry_backoff_step: Duration::ZERO,
                 idle_timeout: None,
                 exchange_logger: None,
                 request: RetryRequestTemplate {
@@ -1182,6 +1233,7 @@ mod tests {
             send_with_non_2xx_retries(RetrySendArgs {
                 request_id: 2,
                 transparent_retry_count: 1,
+                transparent_retry_backoff_step: Duration::ZERO,
                 idle_timeout: None,
                 exchange_logger: None,
                 request: RetryRequestTemplate {
@@ -1198,6 +1250,55 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(final_attempt, 2);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn records_linear_backoff_between_retries() {
+        let (url, call_count, shutdown_tx) = spawn_retry_server(vec![
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::OK,
+        ])
+        .await;
+        let sleep_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (resp, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries_with_sleep(
+                RetrySendArgs {
+                    request_id: 3,
+                    transparent_retry_count: 2,
+                    transparent_retry_backoff_step: Duration::from_millis(50),
+                    idle_timeout: None,
+                    exchange_logger: None,
+                    request: RetryRequestTemplate {
+                        http_client: reqwest::Client::new(),
+                        method: Method::POST,
+                        url,
+                        headers: HeaderMap::new(),
+                        request_body: Bytes::from_static(b"retry-body"),
+                    },
+                },
+                {
+                    let sleep_calls = sleep_calls.clone();
+                    move |duration| {
+                        let sleep_calls = sleep_calls.clone();
+                        async move {
+                            sleep_calls.lock().unwrap().push(duration);
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(final_attempt, 3);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            sleep_calls.lock().unwrap().as_slice(),
+            &[Duration::from_millis(50), Duration::from_millis(100)]
+        );
         let _ = shutdown_tx.send(());
     }
 }

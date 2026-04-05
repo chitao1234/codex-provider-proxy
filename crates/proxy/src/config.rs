@@ -13,6 +13,7 @@ pub struct Config {
     pub rpc_token: Option<String>,
     pub upstream_idle_timeout: Option<Duration>,
     pub transparent_retry_count: u32,
+    pub transparent_retry_backoff_step: Duration,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
     pub logging: LoggingConfig,
@@ -97,6 +98,8 @@ struct ConfigFile {
     upstream_idle_timeout_secs: u64,
     #[serde(default = "default_transparent_retry_count")]
     transparent_retry_count: u32,
+    #[serde(default = "default_transparent_retry_backoff_step_ms")]
+    transparent_retry_backoff_step_ms: u64,
     default_provider: String,
     #[serde(default)]
     logging: LoggingFile,
@@ -161,6 +164,10 @@ fn default_upstream_idle_timeout_secs() -> u64 {
 }
 
 fn default_transparent_retry_count() -> u32 {
+    0
+}
+
+fn default_transparent_retry_backoff_step_ms() -> u64 {
     0
 }
 
@@ -259,6 +266,9 @@ impl Config {
             rpc_token: file.rpc_token,
             upstream_idle_timeout,
             transparent_retry_count: file.transparent_retry_count,
+            transparent_retry_backoff_step: Duration::from_millis(
+                file.transparent_retry_backoff_step_ms,
+            ),
             default_provider: file.default_provider,
             providers,
             logging: LoggingConfig {
@@ -283,6 +293,8 @@ pub fn example_config_toml() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{BodyLogCompression, Config};
 
     #[test]
@@ -374,6 +386,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.transparent_retry_count, 0);
+        assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
     }
 
     #[test]
@@ -382,6 +395,7 @@ mod tests {
             r#"
                 listen_addr = "127.0.0.1:8080"
                 transparent_retry_count = 3
+                transparent_retry_backoff_step_ms = 250
                 default_provider = "provider_a"
 
                 [providers.provider_a]
@@ -392,6 +406,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.transparent_retry_count, 3);
+        assert_eq!(
+            cfg.transparent_retry_backoff_step,
+            Duration::from_millis(250)
+        );
     }
 
     #[test]

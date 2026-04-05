@@ -22,7 +22,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
-addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`, `transparent_retry_count`, and all `[logging]` options takes effect without restarting the
+addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`, `transparent_retry_count`,
+`transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect without restarting the
 process.
 
 To print an example config:
@@ -82,6 +83,8 @@ the child, then transfers routing to the child PID.
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
 - If `transparent_retry_count > 0`, non-2xx upstream responses are retried transparently up to that many additional
   attempts before returning the final upstream response.
+- `transparent_retry_backoff_step_ms` adds linear delay between those retries. A value of `250` waits 250 ms before
+  retry 2, 500 ms before retry 3, 750 ms before retry 4, and so on.
 - PID routing lookup checks the client PID first; if no route exists it walks up the process tree
   (parent PID, grandparent PID, etc.) and uses the first ancestor with a defined route.
 - By default, the runtime PID routing table is empty, so all requests go to `default_provider`.
