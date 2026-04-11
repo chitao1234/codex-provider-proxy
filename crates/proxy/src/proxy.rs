@@ -101,11 +101,12 @@ pub async fn handle_proxy(
     match handle_proxy_inner(state, peer, req).await {
         Ok(resp) => resp,
         Err(err) => {
-            warn!(error = %err, "proxy error");
+            let err_chain = format!("{err:#}");
+            warn!(error = %err_chain, "proxy error");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(format!("proxy error: {err}\n")))
+                .body(Body::from(format!("proxy error: {err_chain}\n")))
                 .unwrap()
         }
     }
