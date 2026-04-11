@@ -25,7 +25,7 @@ struct Args {
     #[arg(short = 't', long)]
     to_unix_ms: Option<u128>,
 
-    /// Provider filter (exact match). Repeat or pass comma-separated values.
+    /// Provider filter (exact match against the final provider or any retry-attempt provider).
     #[arg(short = 'p', long, value_delimiter = ',')]
     provider: Vec<String>,
 
@@ -72,11 +72,18 @@ impl AnalysisFilters {
         true
     }
 
-    fn matches_provider(&self, provider: Option<&str>) -> bool {
+    fn matches_provider<'a>(
+        &self,
+        provider: Option<&str>,
+        attempt_providers: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
         if self.providers.is_empty() {
             return true;
         }
         provider.is_some_and(|p| self.providers.contains(p))
+            || attempt_providers
+                .into_iter()
+                .any(|provider| self.providers.contains(provider))
     }
 
     fn has_model_filter(&self) -> bool {
@@ -129,6 +136,8 @@ struct ExchangeMeta {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    attempts: Vec<ExchangeAttemptMeta>,
+    #[serde(default)]
     upstream_latency_ms: Option<u128>,
     #[serde(default)]
     total_duration_ms: Option<u128>,
@@ -136,6 +145,12 @@ struct ExchangeMeta {
     body_compression: Option<String>,
     #[serde(default)]
     files: ExchangeMetaFiles,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExchangeAttemptMeta {
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -215,7 +230,12 @@ fn analyze_exchange(
         stats.filtered_out_time = stats.filtered_out_time.saturating_add(1);
         return Ok(());
     }
-    if !filters.matches_provider(meta.provider.as_deref()) {
+    if !filters.matches_provider(
+        meta.provider.as_deref(),
+        meta.attempts
+            .iter()
+            .filter_map(|attempt| attempt.provider.as_deref()),
+    ) {
         stats.filtered_out_provider = stats.filtered_out_provider.saturating_add(1);
         return Ok(());
     }
@@ -682,7 +702,7 @@ mod tests {
 
     use super::{
         extract_completed_response_from_log, extract_completed_response_from_sse,
-        extract_usage_snapshot, normalize_filter_values, AnalysisFilters,
+        extract_usage_snapshot, normalize_filter_values, AnalysisFilters, ExchangeAttemptMeta,
     };
 
     #[test]
@@ -750,6 +770,44 @@ mod tests {
         assert!(f.matches_time(Some(20)));
         assert!(!f.matches_time(Some(9)));
         assert!(!f.matches_time(Some(21)));
+    }
+
+    #[test]
+    fn provider_filter_matches_final_provider() {
+        let mut providers = std::collections::BTreeSet::new();
+        providers.insert("provider_b".to_string());
+        let filters = AnalysisFilters {
+            providers,
+            ..AnalysisFilters::default()
+        };
+
+        assert!(filters.matches_provider(Some("provider_b"), std::iter::empty()));
+        assert!(!filters.matches_provider(Some("provider_a"), std::iter::empty()));
+    }
+
+    #[test]
+    fn provider_filter_matches_attempt_provider() {
+        let mut providers = std::collections::BTreeSet::new();
+        providers.insert("provider_a".to_string());
+        let filters = AnalysisFilters {
+            providers,
+            ..AnalysisFilters::default()
+        };
+        let attempts = vec![
+            ExchangeAttemptMeta {
+                provider: Some("provider_a".to_string()),
+            },
+            ExchangeAttemptMeta {
+                provider: Some("provider_b".to_string()),
+            },
+        ];
+
+        assert!(filters.matches_provider(
+            Some("provider_b"),
+            attempts
+                .iter()
+                .filter_map(|attempt| attempt.provider.as_deref()),
+        ));
     }
 
     #[test]
