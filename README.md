@@ -83,6 +83,8 @@ the child, then transfers routing to the child PID.
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
 - If `transparent_retry_count > 0`, non-2xx upstream responses are retried transparently up to that many additional
   attempts before returning the final upstream response.
+- Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,
+  default-provider changes, and provider config reloads can affect later attempts within the same proxied request.
 - `transparent_retry_backoff_step_ms` adds linear delay between those retries. A value of `250` waits 250 ms before
   retry 2, 500 ms before retry 3, 750 ms before retry 4, and so on.
 - PID routing lookup checks the client PID first; if no route exists it walks up the process tree
@@ -136,8 +138,8 @@ If `logging.exchange_log_dir` is set, the proxy writes per-exchange files:
 - `<timestamp>_req_<id>.response_body.bin` (or `.bin.zst` when `exchange_body_compression = "zstd"`)
 - `<timestamp>_req_<id>.attempt_<n>.response_headers.txt` (one per upstream attempt, including retries)
 
-When `transparent_retry_count > 0`, `*.meta.json` includes an `attempts` array with per-attempt status/latency and
-body-byte details.
+When `transparent_retry_count > 0`, `*.meta.json` includes an `attempts` array with per-attempt provider, upstream
+URL, status/latency, and body-byte details.
 
 When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
 additionally produce:

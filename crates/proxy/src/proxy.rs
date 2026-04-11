@@ -40,36 +40,51 @@ pub struct ProxyState {
 
 #[derive(Clone)]
 struct ResolvedProviderRoute {
-    pid: Option<u32>,
     route_pid: Option<u32>,
     provider_name: String,
     provider: Provider,
 }
 
 #[derive(Clone)]
-struct RetryRequestTemplate {
-    http_client: reqwest::Client,
-    method: http::Method,
+struct PreparedUpstreamAttempt {
+    route_pid: Option<u32>,
+    provider_name: String,
     url: Url,
     headers: HeaderMap,
+}
+
+#[derive(Clone)]
+struct RetryRequestTemplate {
+    method: http::Method,
+    forwarded_path: String,
+    incoming_query: Option<String>,
+    base_headers: HeaderMap,
     request_body: Bytes,
 }
 
 #[derive(Clone)]
 struct RetrySendArgs {
+    state: ProxyState,
     request_id: u64,
+    peer: SocketAddr,
+    pid: Option<u32>,
     transparent_retry_count: u32,
     transparent_retry_backoff_step: Duration,
     idle_timeout: Option<Duration>,
     exchange_logger: Option<SharedExchangeFileLogger>,
     request: RetryRequestTemplate,
+    initial_attempt: PreparedUpstreamAttempt,
 }
 
 struct UpstreamSendRequest {
     request_id: u64,
+    peer: SocketAddr,
+    pid: Option<u32>,
+    initial_attempt: PreparedUpstreamAttempt,
     method: http::Method,
-    url: Url,
-    headers: HeaderMap,
+    forwarded_path: String,
+    incoming_query: Option<String>,
+    base_headers: HeaderMap,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
 }
@@ -104,34 +119,9 @@ async fn handle_proxy_inner(
     let request_id = state.runtime.next_request_id();
     let started = Instant::now();
     let cfg = state.runtime.config().await;
-    let resolved = resolve_provider_for_request(&state, &cfg, peer, request_id).await?;
-    let pid = resolved.pid;
-    let route_pid = resolved.route_pid;
-    let provider_name = resolved.provider_name;
-    let provider = resolved.provider;
+    let pid = resolve_request_pid(&state, peer, request_id).await;
 
     let (parts, body) = req.into_parts();
-
-    if cfg.logging.log_requests {
-        info!(
-            request_id,
-            pid = ?pid,
-            route_pid = ?route_pid,
-            peer = %peer,
-            provider = %provider_name,
-            method = %parts.method,
-            uri = %parts.uri,
-            "request"
-        );
-        debug!(
-            request_id,
-            pid = ?pid,
-            route_pid = ?route_pid,
-            provider = %provider_name,
-            headers = ?parts.headers,
-            "request headers"
-        );
-    }
 
     let forwarded_path = match strip_listen_base_path(&cfg.listen_base_path, parts.uri.path()) {
         Some(p) => p,
@@ -142,7 +132,39 @@ async fn handle_proxy_inner(
                 .body(Body::from("not found\n"))?);
         }
     };
-    let url = build_outgoing_url(&provider, forwarded_path, parts.uri.query())?;
+    let base_headers = filtered_incoming_headers(&parts.headers);
+    let initial_attempt = resolve_upstream_attempt(
+        &state,
+        &cfg,
+        pid,
+        peer,
+        request_id,
+        forwarded_path,
+        parts.uri.query(),
+        &base_headers,
+    )
+    .await?;
+
+    if cfg.logging.log_requests {
+        info!(
+            request_id,
+            pid = ?pid,
+            route_pid = ?initial_attempt.route_pid,
+            peer = %peer,
+            provider = %initial_attempt.provider_name,
+            method = %parts.method,
+            uri = %parts.uri,
+            "request"
+        );
+        debug!(
+            request_id,
+            pid = ?pid,
+            route_pid = ?initial_attempt.route_pid,
+            provider = %initial_attempt.provider_name,
+            headers = ?parts.headers,
+            "request headers"
+        );
+    }
 
     let exchange_logger = maybe_create_exchange_logger(
         &cfg.logging,
@@ -150,20 +172,13 @@ async fn handle_proxy_inner(
             request_id,
             peer,
             pid,
-            route_pid,
-            provider_name: &provider_name,
+            route_pid: initial_attempt.route_pid,
+            provider_name: &initial_attempt.provider_name,
             method: &parts.method,
             uri: &parts.uri,
-            upstream_url: &url,
+            upstream_url: &initial_attempt.url,
             request_headers: &parts.headers,
         },
-    );
-
-    let mut headers = filtered_incoming_headers(&parts.headers);
-    headers.insert(
-        header::AUTHORIZATION,
-        http::HeaderValue::from_str(&provider.authorization_value())
-            .context("build Authorization header")?,
     );
 
     let send_result = send_upstream_request(
@@ -171,33 +186,38 @@ async fn handle_proxy_inner(
         &cfg,
         UpstreamSendRequest {
             request_id,
+            peer,
+            pid,
+            initial_attempt: initial_attempt.clone(),
             method: parts.method.clone(),
-            url: url.clone(),
-            headers,
+            forwarded_path: forwarded_path.to_string(),
+            incoming_query: parts.uri.query().map(str::to_owned),
+            base_headers,
             body,
             exchange_logger: exchange_logger.clone(),
         },
     )
     .await;
 
-    let (resp, req_body_capture, _final_attempt, final_attempt_latency_ms) = match send_result {
-        Ok(resp) => resp,
-        Err(err) => {
-            let error_latency_ms = started.elapsed().as_millis();
-            let err_text = err.to_string();
-            with_exchange_logger_blocking(
-                exchange_logger.clone(),
-                request_id,
-                "mark upstream send error",
-                move |logger| {
-                    logger.mark_upstream_send_error(error_latency_ms, &err_text);
-                    logger.finalize();
-                },
-            )
-            .await;
-            return Err(err).context("send upstream request");
-        }
-    };
+    let (resp, final_attempt, req_body_capture, _final_attempt, final_attempt_latency_ms) =
+        match send_result {
+            Ok(resp) => resp,
+            Err(err) => {
+                let error_latency_ms = started.elapsed().as_millis();
+                let err_text = err.to_string();
+                with_exchange_logger_blocking(
+                    exchange_logger.clone(),
+                    request_id,
+                    "mark upstream send error",
+                    move |logger| {
+                        logger.mark_upstream_send_error(error_latency_ms, &err_text);
+                        logger.finalize();
+                    },
+                )
+                .await;
+                return Err(err).context("send upstream request");
+            }
+        };
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
@@ -206,9 +226,9 @@ async fn handle_proxy_inner(
             info!(
                 request_id,
                 pid = ?pid,
-                route_pid = ?route_pid,
+                route_pid = ?final_attempt.route_pid,
                 peer = %peer,
-                provider = %provider_name,
+                provider = %final_attempt.provider_name,
                 status = %status,
                 latency_ms = started.elapsed().as_millis(),
                 "response headers received"
@@ -217,9 +237,9 @@ async fn handle_proxy_inner(
             warn!(
                 request_id,
                 pid = ?pid,
-                route_pid = ?route_pid,
+                route_pid = ?final_attempt.route_pid,
                 peer = %peer,
-                provider = %provider_name,
+                provider = %final_attempt.provider_name,
                 status = %status,
                 latency_ms = started.elapsed().as_millis(),
                 "response headers received with non-2xx upstream status"
@@ -228,8 +248,8 @@ async fn handle_proxy_inner(
         debug!(
             request_id,
             pid = ?pid,
-            route_pid = ?route_pid,
-            provider = %provider_name,
+            route_pid = ?final_attempt.route_pid,
+            provider = %final_attempt.provider_name,
             headers = ?resp_headers,
             "response headers"
         );
@@ -237,19 +257,36 @@ async fn handle_proxy_inner(
 
     let resp_headers_for_log = resp_headers.clone();
     let upstream_latency_ms = started.elapsed().as_millis();
+    let final_provider_name = final_attempt.provider_name.clone();
+    let final_url = final_attempt.url.clone();
+    let final_route_pid = final_attempt.route_pid;
     with_exchange_logger_blocking(
         exchange_logger.clone(),
         request_id,
         "record final upstream attempt",
         move |logger| {
             logger.record_attempt(
+                crate::exchange_log::AttemptRouteContext {
+                    route_pid: final_route_pid,
+                    provider_name: &final_provider_name,
+                    upstream_url: &final_url,
+                },
                 status,
                 &resp_headers_for_log,
                 final_attempt_latency_ms,
                 None,
                 true,
             );
-            logger.write_response_headers(status, &resp_headers_for_log, upstream_latency_ms);
+            logger.write_response_headers(
+                crate::exchange_log::AttemptRouteContext {
+                    route_pid: final_route_pid,
+                    provider_name: &final_provider_name,
+                    upstream_url: &final_url,
+                },
+                status,
+                &resp_headers_for_log,
+                upstream_latency_ms,
+            );
         },
     )
     .await;
@@ -260,8 +297,8 @@ async fn handle_proxy_inner(
             debug!(
                 request_id,
                 pid = ?pid,
-                route_pid = ?route_pid,
-                provider = %provider_name,
+                route_pid = ?final_attempt.route_pid,
+                provider = %final_attempt.provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
                 "request body"
@@ -274,14 +311,16 @@ async fn handle_proxy_inner(
 
     let (resp_stream, resp_capture) =
         response_stream_and_capture(&cfg, request_id, resp, exchange_logger.clone());
+    let final_provider_name = final_attempt.provider_name.clone();
+    let final_route_pid = final_attempt.route_pid;
     let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
         if let Some(capture) = resp_capture {
             let summary = capture.lock().unwrap().summary();
             debug!(
                 request_id,
                 pid = ?pid,
-                route_pid = ?route_pid,
-                provider = %provider_name,
+                route_pid = ?final_route_pid,
+                provider = %final_provider_name,
                 truncated = summary.truncated,
                 body = %summary.as_lossy_utf8(),
                 "response body"
@@ -295,12 +334,7 @@ async fn handle_proxy_inner(
     Ok(builder.body(body)?)
 }
 
-async fn resolve_provider_for_request(
-    state: &ProxyState,
-    cfg: &crate::config::Config,
-    peer: SocketAddr,
-    request_id: u64,
-) -> Result<ResolvedProviderRoute> {
+async fn resolve_request_pid(state: &ProxyState, peer: SocketAddr, request_id: u64) -> Option<u32> {
     let pid_routes = state.runtime.pid_routes();
     let is_loopback_peer = peer.ip().is_loopback();
     let pid = if is_loopback_peer {
@@ -339,6 +373,16 @@ async fn resolve_provider_for_request(
         );
     }
 
+    pid
+}
+
+async fn resolve_provider_for_pid(
+    state: &ProxyState,
+    cfg: &crate::config::Config,
+    pid: Option<u32>,
+    peer: SocketAddr,
+    request_id: u64,
+) -> Result<ResolvedProviderRoute> {
     let default_provider = state.runtime.default_provider().await;
     let (provider_name, route_pid) = match pid {
         Some(pid) => match find_provider_for_pid_or_ancestors(state, pid).await {
@@ -364,23 +408,70 @@ async fn resolve_provider_for_request(
         .with_context(|| format!("provider {provider_name:?} missing from config"))?
         .clone();
     Ok(ResolvedProviderRoute {
-        pid,
         route_pid,
         provider_name,
         provider,
     })
 }
 
+fn prepare_upstream_attempt(
+    route: ResolvedProviderRoute,
+    forwarded_path: &str,
+    incoming_query: Option<&str>,
+    base_headers: &HeaderMap,
+) -> Result<PreparedUpstreamAttempt> {
+    let url = build_outgoing_url(&route.provider, forwarded_path, incoming_query)?;
+    let mut headers = base_headers.clone();
+    headers.insert(
+        header::AUTHORIZATION,
+        http::HeaderValue::from_str(&route.provider.authorization_value())
+            .context("build Authorization header")?,
+    );
+    Ok(PreparedUpstreamAttempt {
+        route_pid: route.route_pid,
+        provider_name: route.provider_name,
+        url,
+        headers,
+    })
+}
+
+async fn resolve_upstream_attempt(
+    state: &ProxyState,
+    cfg: &crate::config::Config,
+    pid: Option<u32>,
+    peer: SocketAddr,
+    request_id: u64,
+    forwarded_path: &str,
+    incoming_query: Option<&str>,
+    base_headers: &HeaderMap,
+) -> Result<PreparedUpstreamAttempt> {
+    let route = resolve_provider_for_pid(state, cfg, pid, peer, request_id).await?;
+    prepare_upstream_attempt(route, forwarded_path, incoming_query, base_headers)
+}
+
 async fn send_upstream_request(
     state: &ProxyState,
     cfg: &crate::config::Config,
     request: UpstreamSendRequest,
-) -> std::result::Result<(reqwest::Response, Option<SharedCapture>, u32, u128), std::io::Error> {
+) -> std::result::Result<
+    (
+        reqwest::Response,
+        PreparedUpstreamAttempt,
+        Option<SharedCapture>,
+        u32,
+        u128,
+    ),
+    std::io::Error,
+> {
     let UpstreamSendRequest {
         request_id,
+        peer,
+        pid,
+        initial_attempt,
         method,
-        url,
-        headers,
+        forwarded_path,
+        incoming_query,
+        base_headers,
         body,
         exchange_logger,
     } = request;
@@ -397,8 +488,8 @@ async fn send_upstream_request(
         let out = state
             .runtime
             .http_client()
-            .request(method, url)
-            .headers(headers)
+            .request(method, initial_attempt.url.clone())
+            .headers(initial_attempt.headers.clone())
             .body(req_body);
 
         let resp = send_with_optional_idle_timeout(
@@ -410,6 +501,7 @@ async fn send_upstream_request(
         .await?;
         Ok((
             resp,
+            initial_attempt,
             req_body_capture,
             1,
             attempt_started.elapsed().as_millis(),
@@ -417,26 +509,31 @@ async fn send_upstream_request(
     } else {
         let (request_body, req_body_capture) =
             buffer_request_body_for_retry(cfg, body, exchange_logger.clone(), request_id).await?;
-        let (resp, final_attempt, final_attempt_latency_ms) =
+        let (resp, final_attempt, attempt_count, final_attempt_latency_ms) =
             send_with_non_2xx_retries(RetrySendArgs {
+                state: state.clone(),
                 request_id,
+                peer,
+                pid,
                 transparent_retry_count: cfg.transparent_retry_count,
                 transparent_retry_backoff_step: cfg.transparent_retry_backoff_step,
                 idle_timeout: cfg.upstream_idle_timeout,
                 exchange_logger,
                 request: RetryRequestTemplate {
-                    http_client: state.runtime.http_client(),
                     method,
-                    url,
-                    headers,
+                    forwarded_path,
+                    incoming_query,
+                    base_headers,
                     request_body,
                 },
+                initial_attempt,
             })
             .await?;
         Ok((
             resp,
-            req_body_capture,
             final_attempt,
+            req_body_capture,
+            attempt_count,
             final_attempt_latency_ms,
         ))
     }
@@ -823,25 +920,73 @@ where
 
 async fn send_with_non_2xx_retries(
     args: RetrySendArgs,
-) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error> {
+) -> std::result::Result<(reqwest::Response, PreparedUpstreamAttempt, u32, u128), std::io::Error> {
     send_with_non_2xx_retries_with_sleep(args, tokio::time::sleep).await
+}
+
+async fn update_exchange_logger_upstream_target(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt: &PreparedUpstreamAttempt,
+) {
+    let provider_name = attempt.provider_name.clone();
+    let upstream_url = attempt.url.clone();
+    let route_pid = attempt.route_pid;
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "update exchange logger upstream target",
+        move |logger| {
+            logger.update_upstream_target(crate::exchange_log::AttemptRouteContext {
+                route_pid,
+                provider_name: &provider_name,
+                upstream_url: &upstream_url,
+            });
+        },
+    )
+    .await;
 }
 
 async fn send_with_non_2xx_retries_with_sleep<S, Fut>(
     args: RetrySendArgs,
     sleep_fn: S,
-) -> std::result::Result<(reqwest::Response, u32, u128), std::io::Error>
+) -> std::result::Result<(reqwest::Response, PreparedUpstreamAttempt, u32, u128), std::io::Error>
 where
     S: Fn(Duration) -> Fut,
     Fut: Future<Output = ()>,
 {
     for attempt in 0..=args.transparent_retry_count {
+        let current_attempt = if attempt == 0 {
+            args.initial_attempt.clone()
+        } else {
+            let cfg = args.state.runtime.config().await;
+            resolve_upstream_attempt(
+                &args.state,
+                &cfg,
+                args.pid,
+                args.peer,
+                args.request_id,
+                &args.request.forwarded_path,
+                args.request.incoming_query.as_deref(),
+                &args.request.base_headers,
+            )
+            .await
+            .map_err(std::io::Error::other)?
+        };
+        update_exchange_logger_upstream_target(
+            args.exchange_logger.clone(),
+            args.request_id,
+            &current_attempt,
+        )
+        .await;
+
         let attempt_started = Instant::now();
         let out = args
-            .request
-            .http_client
-            .request(args.request.method.clone(), args.request.url.clone())
-            .headers(args.request.headers.clone())
+            .state
+            .runtime
+            .http_client()
+            .request(args.request.method.clone(), current_attempt.url.clone())
+            .headers(current_attempt.headers.clone())
             .body(args.request.request_body.clone());
         let resp =
             send_with_optional_idle_timeout(args.request_id, args.idle_timeout, None, out.send())
@@ -851,7 +996,7 @@ where
         let attempt_latency_ms = attempt_started.elapsed().as_millis();
         let attempt_number = attempt.saturating_add(1);
         if status.is_success() || attempt == args.transparent_retry_count {
-            return Ok((resp, attempt_number, attempt_latency_ms));
+            return Ok((resp, current_attempt, attempt_number, attempt_latency_ms));
         }
 
         let resp_headers = resp.headers().clone();
@@ -862,12 +1007,20 @@ where
             "reading non-final retry response body",
         )
         .await?;
+        let attempt_provider_name = current_attempt.provider_name.clone();
+        let attempt_upstream_url = current_attempt.url.clone();
+        let attempt_route_pid = current_attempt.route_pid;
         with_exchange_logger_blocking(
             args.exchange_logger.clone(),
             args.request_id,
             "record retry attempt",
             move |logger| {
                 logger.record_attempt(
+                    crate::exchange_log::AttemptRouteContext {
+                        route_pid: attempt_route_pid,
+                        provider_name: &attempt_provider_name,
+                        upstream_url: &attempt_upstream_url,
+                    },
                     status,
                     &resp_headers,
                     attempt_latency_ms,
@@ -885,6 +1038,9 @@ where
             args.request_id,
             status = %status,
             attempt = attempt_number,
+            route_pid = ?attempt_route_pid,
+            provider = %current_attempt.provider_name,
+            upstream_url = %current_attempt.url,
             total_attempts = args.transparent_retry_count.saturating_add(1),
             retries_remaining = args.transparent_retry_count - attempt,
             retry_backoff_ms = retry_backoff.as_millis(),
@@ -1078,28 +1234,38 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
     };
 
     use axum::{
         body::Bytes,
         extract::State,
-        http::{HeaderMap, Method, StatusCode},
+        http::{header, HeaderMap, Method, StatusCode},
         response::IntoResponse,
         routing::any,
         Router,
     };
+    use pid_resolver::platform::default_pid_resolver;
     use tokio::sync::oneshot;
+    use tracing_subscriber::EnvFilter;
     use url::Url;
 
+    use crate::{
+        config::{BodyLogCompression, Config, LoggingConfig, Provider},
+        runtime::RuntimeState,
+    };
+
     use super::{
-        join_paths, linear_retry_backoff_delay, send_with_non_2xx_retries,
-        send_with_non_2xx_retries_with_sleep, strip_listen_base_path, RetryRequestTemplate,
-        RetrySendArgs,
+        join_paths, linear_retry_backoff_delay, resolve_upstream_attempt,
+        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep, strip_listen_base_path,
+        ProxyState, RetryRequestTemplate, RetrySendArgs,
     };
 
     #[test]
@@ -1191,28 +1357,177 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct AuthCaptureServerState {
+        status: StatusCode,
+        label: Arc<str>,
+        call_count: Arc<AtomicUsize>,
+        auth_headers: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn auth_capture_server_handler(
+        State(state): State<AuthCaptureServerState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        assert_eq!(body, Bytes::from_static(b"retry-body"));
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state.auth_headers.lock().unwrap().push(auth);
+        state.call_count.fetch_add(1, Ordering::SeqCst);
+        (state.status, state.label.to_string())
+    }
+
+    async fn spawn_auth_capture_server(
+        status: StatusCode,
+        label: &'static str,
+    ) -> (
+        Url,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let auth_headers = Arc::new(Mutex::new(Vec::new()));
+        let state = AuthCaptureServerState {
+            status,
+            label: Arc::from(label),
+            call_count: call_count.clone(),
+            auth_headers: auth_headers.clone(),
+        };
+        let app = Router::new()
+            .route("/", any(auth_capture_server_handler))
+            .with_state(state);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            call_count,
+            auth_headers,
+            shutdown_tx,
+        )
+    }
+
+    fn test_logging_config() -> LoggingConfig {
+        LoggingConfig {
+            log_requests: false,
+            log_responses: false,
+            log_bodies: false,
+            max_body_log_bytes: 8192,
+            exchange_log_dir: None,
+            exchange_body_max_bytes: None,
+            exchange_body_compression: BodyLogCompression::None,
+            reconstruct_responses: false,
+            level: "info".to_string(),
+            rule: None,
+        }
+    }
+
+    fn test_proxy_state(config: Config) -> ProxyState {
+        let (_filter_layer, filter_reload) =
+            tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
+        let runtime = RuntimeState::new(
+            Arc::new(config),
+            default_pid_resolver(),
+            reqwest::Client::new(),
+            filter_reload,
+        );
+        ProxyState {
+            listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            runtime,
+        }
+    }
+
+    fn test_config(default_provider: &str, providers: HashMap<String, Provider>) -> Config {
+        Config {
+            listen_addrs: vec!["127.0.0.1:8080".parse().unwrap()],
+            listen_base_path: "/".to_string(),
+            rpc_listen_addr: "127.0.0.1:8081".parse().unwrap(),
+            rpc_token: None,
+            upstream_idle_timeout: None,
+            transparent_retry_count: 0,
+            transparent_retry_backoff_step: Duration::ZERO,
+            default_provider: default_provider.to_string(),
+            providers,
+            logging: test_logging_config(),
+        }
+    }
+
+    async fn build_retry_args(
+        state: ProxyState,
+        request_id: u64,
+        peer: SocketAddr,
+        pid: Option<u32>,
+        transparent_retry_count: u32,
+        transparent_retry_backoff_step: Duration,
+    ) -> RetrySendArgs {
+        let cfg = state.runtime.config().await;
+        let initial_attempt = resolve_upstream_attempt(
+            &state,
+            &cfg,
+            pid,
+            peer,
+            request_id,
+            "/",
+            None,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        RetrySendArgs {
+            state,
+            request_id,
+            peer,
+            pid,
+            transparent_retry_count,
+            transparent_retry_backoff_step,
+            idle_timeout: None,
+            exchange_logger: None,
+            request: RetryRequestTemplate {
+                method: Method::POST,
+                forwarded_path: "/".to_string(),
+                incoming_query: None,
+                base_headers: HeaderMap::new(),
+                request_body: Bytes::from_static(b"retry-body"),
+            },
+            initial_attempt,
+        }
+    }
+
     #[tokio::test]
     async fn retries_non_2xx_status_until_success() {
         let (url, call_count, shutdown_tx) =
             spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let args = build_retry_args(state, 1, peer, None, 2, Duration::ZERO).await;
 
-        let (resp, final_attempt, _final_attempt_latency_ms) =
-            send_with_non_2xx_retries(RetrySendArgs {
-                request_id: 1,
-                transparent_retry_count: 2,
-                transparent_retry_backoff_step: Duration::ZERO,
-                idle_timeout: None,
-                exchange_logger: None,
-                request: RetryRequestTemplate {
-                    http_client: reqwest::Client::new(),
-                    method: Method::POST,
-                    url,
-                    headers: HeaderMap::new(),
-                    request_body: Bytes::from_static(b"retry-body"),
-                },
-            })
-            .await
-            .unwrap();
+        let (resp, _attempt_info, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries(args).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(final_attempt, 2);
@@ -1228,24 +1543,21 @@ mod tests {
             StatusCode::OK,
         ])
         .await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let peer: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let args = build_retry_args(state, 2, peer, None, 1, Duration::ZERO).await;
 
-        let (resp, final_attempt, _final_attempt_latency_ms) =
-            send_with_non_2xx_retries(RetrySendArgs {
-                request_id: 2,
-                transparent_retry_count: 1,
-                transparent_retry_backoff_step: Duration::ZERO,
-                idle_timeout: None,
-                exchange_logger: None,
-                request: RetryRequestTemplate {
-                    http_client: reqwest::Client::new(),
-                    method: Method::POST,
-                    url,
-                    headers: HeaderMap::new(),
-                    request_body: Bytes::from_static(b"retry-body"),
-                },
-            })
-            .await
-            .unwrap();
+        let (resp, _attempt_info, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries(args).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(final_attempt, 2);
@@ -1262,33 +1574,29 @@ mod tests {
         ])
         .await;
         let sleep_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let peer: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let args = build_retry_args(state, 3, peer, None, 2, Duration::from_millis(50)).await;
 
-        let (resp, final_attempt, _final_attempt_latency_ms) =
-            send_with_non_2xx_retries_with_sleep(
-                RetrySendArgs {
-                    request_id: 3,
-                    transparent_retry_count: 2,
-                    transparent_retry_backoff_step: Duration::from_millis(50),
-                    idle_timeout: None,
-                    exchange_logger: None,
-                    request: RetryRequestTemplate {
-                        http_client: reqwest::Client::new(),
-                        method: Method::POST,
-                        url,
-                        headers: HeaderMap::new(),
-                        request_body: Bytes::from_static(b"retry-body"),
-                    },
-                },
-                {
+        let (resp, _attempt_info, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries_with_sleep(args, {
+                let sleep_calls = sleep_calls.clone();
+                move |duration| {
                     let sleep_calls = sleep_calls.clone();
-                    move |duration| {
-                        let sleep_calls = sleep_calls.clone();
-                        async move {
-                            sleep_calls.lock().unwrap().push(duration);
-                        }
+                    async move {
+                        sleep_calls.lock().unwrap().push(duration);
                     }
-                },
-            )
+                }
+            })
             .await
             .unwrap();
 
@@ -1300,5 +1608,82 @@ mod tests {
             &[Duration::from_millis(50), Duration::from_millis(100)]
         );
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn reroutes_retry_attempts_when_provider_mapping_changes() {
+        let (url_a, call_count_a, auth_headers_a, shutdown_tx_a) =
+            spawn_auth_capture_server(StatusCode::INTERNAL_SERVER_ERROR, "provider-a").await;
+        let (url_b, call_count_b, auth_headers_b, shutdown_tx_b) =
+            spawn_auth_capture_server(StatusCode::OK, "provider-b").await;
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url_a,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        providers.insert(
+            "provider_b".to_string(),
+            Provider {
+                base_url: url_b,
+                api_key: "token-b".to_string(),
+                authorization_header: None,
+            },
+        );
+
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let pid = 4242u32;
+        state
+            .runtime
+            .pid_routes()
+            .insert(pid, "provider_a".to_string());
+
+        let peer: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+        let args = build_retry_args(
+            state.clone(),
+            4,
+            peer,
+            Some(pid),
+            1,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let (resp, final_attempt_info, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries_with_sleep(args, {
+                let state = state.clone();
+                move |_| {
+                    let state = state.clone();
+                    async move {
+                        state
+                            .runtime
+                            .pid_routes()
+                            .insert(pid, "provider_b".to_string());
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(final_attempt, 2);
+        assert_eq!(final_attempt_info.provider_name, "provider_b");
+        assert_eq!(call_count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            auth_headers_a.lock().unwrap().as_slice(),
+            &["Bearer token-a".to_string()]
+        );
+        assert_eq!(
+            auth_headers_b.lock().unwrap().as_slice(),
+            &["Bearer token-b".to_string()]
+        );
+
+        let _ = shutdown_tx_a.send(());
+        let _ = shutdown_tx_b.send(());
     }
 }

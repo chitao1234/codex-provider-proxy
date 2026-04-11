@@ -17,7 +17,7 @@ use url::Url;
 use crate::config::{BodyLogCompression, LoggingConfig};
 
 pub type SharedExchangeFileLogger = Arc<Mutex<ExchangeFileLogger>>;
-const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 2;
+const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 3;
 
 pub struct ExchangeLogContext<'a> {
     pub request_id: u64,
@@ -29,6 +29,12 @@ pub struct ExchangeLogContext<'a> {
     pub uri: &'a Uri,
     pub upstream_url: &'a Url,
     pub request_headers: &'a HeaderMap,
+}
+
+pub struct AttemptRouteContext<'a> {
+    pub route_pid: Option<u32>,
+    pub provider_name: &'a str,
+    pub upstream_url: &'a Url,
 }
 
 pub fn maybe_create_exchange_logger(
@@ -240,6 +246,7 @@ impl ExchangeFileLogger {
 
     pub fn record_attempt(
         &mut self,
+        route: AttemptRouteContext<'_>,
         status: StatusCode,
         headers: &HeaderMap,
         latency_ms: u128,
@@ -256,12 +263,17 @@ impl ExchangeFileLogger {
         ));
 
         let mut body = format!(
-            "attempt: {}\nstatus: {} {}\nlatency_ms: {}\n",
+            "attempt: {}\nprovider: {}\nupstream_url: {}\nstatus: {} {}\nlatency_ms: {}\n",
             attempt_number,
+            route.provider_name,
+            route.upstream_url,
             status.as_u16(),
             status_text,
             latency_ms
         );
+        if let Some(route_pid) = route.route_pid {
+            body.push_str(&format!("route_pid: {route_pid}\n"));
+        }
         if let Some(bytes) = response_body_bytes {
             body.push_str(&format!("response_body_bytes: {bytes}\n"));
         }
@@ -280,6 +292,9 @@ impl ExchangeFileLogger {
         self.metadata.attempts.push(ExchangeAttemptMetadata {
             attempt: attempt_number,
             is_final,
+            route_pid: route.route_pid,
+            provider: route.provider_name.to_string(),
+            upstream_url: route.upstream_url.to_string(),
             response_status_code: status.as_u16(),
             response_status_text: status_text.to_string(),
             upstream_latency_ms: latency_ms,
@@ -296,12 +311,23 @@ impl ExchangeFileLogger {
         self.persist_metadata_best_effort("write attempt metadata");
     }
 
+    pub fn update_upstream_target(&mut self, route: AttemptRouteContext<'_>) {
+        self.metadata.route_pid = route.route_pid;
+        self.metadata.provider = route.provider_name.to_string();
+        self.metadata.upstream_url = route.upstream_url.to_string();
+        self.persist_metadata_best_effort("update upstream target metadata");
+    }
+
     pub fn write_response_headers(
         &mut self,
+        route: AttemptRouteContext<'_>,
         status: StatusCode,
         headers: &HeaderMap,
         latency_ms: u128,
     ) {
+        self.metadata.route_pid = route.route_pid;
+        self.metadata.provider = route.provider_name.to_string();
+        self.metadata.upstream_url = route.upstream_url.to_string();
         let status_text = status.canonical_reason().unwrap_or("unknown");
         let mut body = format!(
             "status: {} {}\nlatency_ms: {}\n",
@@ -471,6 +497,9 @@ struct ExchangeMetadataFiles {
 struct ExchangeAttemptMetadata {
     attempt: u32,
     is_final: bool,
+    route_pid: Option<u32>,
+    provider: String,
+    upstream_url: String,
     response_status_code: u16,
     response_status_text: String,
     upstream_latency_ms: u128,
