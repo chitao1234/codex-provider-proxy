@@ -15,6 +15,7 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, TryStreamExt};
 use pin_project_lite::pin_project;
+use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, Sleep};
 use tracing::{debug, info, warn};
@@ -312,6 +313,15 @@ async fn handle_proxy_inner(
 
     let (resp_stream, resp_capture) =
         response_stream_and_capture(&cfg, request_id, resp, exchange_logger.clone());
+    let resp_stream = maybe_filter_responses_slow_down_stream(
+        &cfg,
+        request_id,
+        parts.uri.path(),
+        &resp_headers,
+        final_attempt.route_pid,
+        &final_attempt.provider_name,
+        resp_stream,
+    );
     let final_provider_name = final_attempt.provider_name.clone();
     let final_route_pid = final_attempt.route_pid;
     let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
@@ -857,6 +867,238 @@ fn response_stream_and_capture(
     }
 }
 
+fn maybe_filter_responses_slow_down_stream(
+    cfg: &crate::config::Config,
+    request_id: u64,
+    request_path: &str,
+    resp_headers: &HeaderMap,
+    route_pid: Option<u32>,
+    provider_name: &str,
+    stream: BoxRespStream,
+) -> BoxRespStream {
+    if !should_drop_responses_slow_down_errors(cfg, request_path, resp_headers) {
+        return stream;
+    }
+
+    Box::pin(ResponsesSlowDownDropStream::new(
+        stream,
+        request_id,
+        route_pid,
+        provider_name.to_string(),
+    ))
+}
+
+fn should_drop_responses_slow_down_errors(
+    cfg: &crate::config::Config,
+    request_path: &str,
+    resp_headers: &HeaderMap,
+) -> bool {
+    cfg.drop_responses_slow_down_errors
+        && path_ends_with_responses(request_path)
+        && is_text_event_stream(resp_headers)
+}
+
+fn is_text_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(|value| value.eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
+}
+
+fn path_ends_with_responses(path: &str) -> bool {
+    path_last_segment(path) == Some("responses")
+}
+
+fn path_last_segment(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.rsplit('/').next()
+}
+
+fn responses_slow_down_error_code(event_bytes: &[u8]) -> Option<&'static str> {
+    let payload = std::str::from_utf8(event_bytes).ok()?;
+    let mut event_name: Option<&str> = None;
+    let mut data_lines = Vec::new();
+
+    for line in payload.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim_start());
+        }
+    }
+
+    if data_lines.is_empty() {
+        return None;
+    }
+
+    let data = data_lines.join("\n");
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+
+    let json: Value = serde_json::from_str(data).ok()?;
+    let is_failed = json.get("type").and_then(Value::as_str) == Some("response.failed")
+        || event_name == Some("response.failed");
+    if !is_failed {
+        return None;
+    }
+
+    match json.pointer("/response/error/code").and_then(Value::as_str) {
+        Some("slow_down") => Some("slow_down"),
+        Some("server_is_overloaded") => Some("server_is_overloaded"),
+        _ => None,
+    }
+}
+
+fn find_sse_event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut idx = 0usize;
+    while idx < buf.len() {
+        match buf[idx] {
+            b'\n' if buf.get(idx + 1) == Some(&b'\n') => return Some(idx + 2),
+            b'\r'
+                if buf.get(idx + 1) == Some(&b'\n')
+                    && buf.get(idx + 2) == Some(&b'\r')
+                    && buf.get(idx + 3) == Some(&b'\n') =>
+            {
+                return Some(idx + 4);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn slow_down_disconnect_error(code: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        format!("dropped upstream responses SSE failure event with retryable overload code {code}"),
+    )
+}
+
+pin_project! {
+    struct ResponsesSlowDownDropStream<S> {
+        #[pin]
+        inner: S,
+        request_id: u64,
+        route_pid: Option<u32>,
+        provider_name: String,
+        pending: BytesMut,
+        pending_error: Option<std::io::Error>,
+        finished: bool,
+    }
+}
+
+impl<S> ResponsesSlowDownDropStream<S> {
+    fn new(inner: S, request_id: u64, route_pid: Option<u32>, provider_name: String) -> Self {
+        Self {
+            inner,
+            request_id,
+            route_pid,
+            provider_name,
+            pending: BytesMut::new(),
+            pending_error: None,
+            finished: false,
+        }
+    }
+}
+
+impl<S> Stream for ResponsesSlowDownDropStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        if let Some(err) = this.pending_error.take() {
+            return std::task::Poll::Ready(Some(Err(err)));
+        }
+
+        if *this.finished {
+            return std::task::Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending.extend_from_slice(&chunk);
+                    let mut passthrough = BytesMut::new();
+
+                    while let Some(boundary_end) = find_sse_event_boundary(this.pending.as_ref()) {
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        if let Some(code) = responses_slow_down_error_code(&event_bytes) {
+                            warn!(
+                                request_id = *this.request_id,
+                                route_pid = ?*this.route_pid,
+                                provider = %this.provider_name,
+                                code,
+                                "dropping upstream responses SSE overload event and disconnecting client"
+                            );
+                            this.pending.clear();
+                            *this.finished = true;
+                            let err = slow_down_disconnect_error(code);
+                            if !passthrough.is_empty() {
+                                *this.pending_error = Some(err);
+                                return std::task::Poll::Ready(Some(Ok(passthrough.freeze())));
+                            }
+                            return std::task::Poll::Ready(Some(Err(err)));
+                        }
+                        passthrough.extend_from_slice(&event_bytes);
+                    }
+
+                    if !passthrough.is_empty() {
+                        return std::task::Poll::Ready(Some(Ok(passthrough.freeze())));
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    this.pending.clear();
+                    *this.finished = true;
+                    return std::task::Poll::Ready(Some(Err(err)));
+                }
+                std::task::Poll::Ready(None) => {
+                    *this.finished = true;
+                    if this.pending.is_empty() {
+                        return std::task::Poll::Ready(None);
+                    }
+
+                    let tail = this.pending.split().freeze();
+                    if let Some(code) = responses_slow_down_error_code(&tail) {
+                        warn!(
+                            request_id = *this.request_id,
+                            route_pid = ?*this.route_pid,
+                            provider = %this.provider_name,
+                            code,
+                            "dropping upstream responses SSE overload event and disconnecting client"
+                        );
+                        return std::task::Poll::Ready(Some(Err(slow_down_disconnect_error(code))));
+                    }
+
+                    return std::task::Poll::Ready(Some(Ok(tail)));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
 fn map_axum_body_err(err: axum::Error) -> std::io::Error {
     std::io::Error::other(err)
 }
@@ -1253,6 +1495,8 @@ mod tests {
         routing::any,
         Router,
     };
+    use bytes::BytesMut;
+    use futures_util::{stream, StreamExt};
     use pid_resolver::platform::default_pid_resolver;
     use tokio::sync::oneshot;
     use tracing_subscriber::EnvFilter;
@@ -1264,9 +1508,11 @@ mod tests {
     };
 
     use super::{
-        join_paths, linear_retry_backoff_delay, resolve_upstream_attempt,
-        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep, strip_listen_base_path,
-        ProxyState, RetryRequestTemplate, RetrySendArgs,
+        is_text_event_stream, join_paths, linear_retry_backoff_delay,
+        maybe_filter_responses_slow_down_stream, resolve_upstream_attempt,
+        responses_slow_down_error_code, send_with_non_2xx_retries,
+        send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
+        strip_listen_base_path, ProxyState, RetryRequestTemplate, RetrySendArgs,
     };
 
     #[test]
@@ -1461,6 +1707,7 @@ mod tests {
             rpc_listen_addr: "127.0.0.1:8081".parse().unwrap(),
             rpc_token: None,
             upstream_idle_timeout: None,
+            drop_responses_slow_down_errors: true,
             transparent_retry_count: 0,
             transparent_retry_backoff_step: Duration::ZERO,
             default_provider: default_provider.to_string(),
@@ -1686,5 +1933,170 @@ mod tests {
 
         let _ = shutdown_tx_a.send(());
         let _ = shutdown_tx_b.send(());
+    }
+
+    #[test]
+    fn identifies_overload_response_failed_events() {
+        let slow_down = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
+        );
+        let overloaded = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+        );
+        let unrelated = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n",
+        );
+
+        assert_eq!(
+            responses_slow_down_error_code(slow_down.as_bytes()),
+            Some("slow_down")
+        );
+        assert_eq!(
+            responses_slow_down_error_code(overloaded.as_bytes()),
+            Some("server_is_overloaded")
+        );
+        assert_eq!(responses_slow_down_error_code(unrelated.as_bytes()), None);
+    }
+
+    #[test]
+    fn only_filters_responses_sse_when_enabled() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8".parse().unwrap(),
+        );
+
+        assert!(is_text_event_stream(&headers));
+        assert!(should_drop_responses_slow_down_errors(
+            &cfg,
+            "/v1/responses",
+            &headers
+        ));
+        assert!(!should_drop_responses_slow_down_errors(
+            &cfg,
+            "/v1/messages",
+            &headers
+        ));
+
+        cfg.drop_responses_slow_down_errors = false;
+        assert!(!should_drop_responses_slow_down_errors(
+            &cfg,
+            "/v1/responses",
+            &headers
+        ));
+    }
+
+    #[tokio::test]
+    async fn suppresses_slow_down_event_and_aborts_stream() {
+        let payload_1 = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        );
+        let payload_2 = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"error\":{\"code\":\"slow_down\"}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+
+        let stream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(&payload_1.as_bytes()[..20])),
+            Ok(Bytes::from_static(&payload_1.as_bytes()[20..])),
+            Ok(Bytes::from_static(&payload_2.as_bytes()[..35])),
+            Ok(Bytes::from_static(&payload_2.as_bytes()[35..])),
+        ]));
+        let mut stream = maybe_filter_responses_slow_down_stream(
+            &test_config(
+                "provider_a",
+                HashMap::from([(
+                    "provider_a".to_string(),
+                    Provider {
+                        base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                        api_key: "token-a".to_string(),
+                        authorization_header: None,
+                    },
+                )]),
+            ),
+            99,
+            "/v1/responses",
+            &headers,
+            Some(4242),
+            "provider_a",
+            stream,
+        );
+
+        let mut delivered = BytesMut::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => delivered.extend_from_slice(&chunk),
+                Err(err) => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+                    assert!(err.to_string().contains("slow_down"));
+                    break;
+                }
+            }
+        }
+
+        let delivered = String::from_utf8(delivered.to_vec()).unwrap();
+        assert_eq!(delivered, payload_1);
+        assert!(!delivered.contains("response.failed"));
+        assert!(!delivered.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn passes_through_non_matching_responses_sse() {
+        let payload = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+
+        let stream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(&payload.as_bytes()[..30])),
+            Ok(Bytes::from_static(&payload.as_bytes()[30..])),
+        ]));
+        let mut stream = maybe_filter_responses_slow_down_stream(
+            &test_config(
+                "provider_a",
+                HashMap::from([(
+                    "provider_a".to_string(),
+                    Provider {
+                        base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                        api_key: "token-a".to_string(),
+                        authorization_header: None,
+                    },
+                )]),
+            ),
+            100,
+            "/v1/responses",
+            &headers,
+            None,
+            "provider_a",
+            stream,
+        );
+
+        let mut delivered = BytesMut::new();
+        while let Some(item) = stream.next().await {
+            delivered.extend_from_slice(&item.unwrap());
+        }
+
+        assert_eq!(String::from_utf8(delivered.to_vec()).unwrap(), payload);
     }
 }

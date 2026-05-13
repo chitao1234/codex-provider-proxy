@@ -12,6 +12,7 @@ pub struct Config {
     pub rpc_listen_addr: SocketAddr,
     pub rpc_token: Option<String>,
     pub upstream_idle_timeout: Option<Duration>,
+    pub drop_responses_slow_down_errors: bool,
     pub transparent_retry_count: u32,
     pub transparent_retry_backoff_step: Duration,
     pub default_provider: String,
@@ -96,6 +97,8 @@ struct ConfigFile {
     rpc_token: Option<String>,
     #[serde(default = "default_upstream_idle_timeout_secs")]
     upstream_idle_timeout_secs: u64,
+    #[serde(default = "default_drop_responses_slow_down_errors")]
+    drop_responses_slow_down_errors: bool,
     #[serde(default = "default_transparent_retry_count")]
     transparent_retry_count: u32,
     #[serde(default = "default_transparent_retry_backoff_step_ms")]
@@ -161,6 +164,10 @@ fn default_rpc_listen_addr() -> SocketAddr {
 
 fn default_upstream_idle_timeout_secs() -> u64 {
     120
+}
+
+fn default_drop_responses_slow_down_errors() -> bool {
+    true
 }
 
 fn default_transparent_retry_count() -> u32 {
@@ -265,6 +272,7 @@ impl Config {
             rpc_listen_addr: file.rpc_listen_addr,
             rpc_token: file.rpc_token,
             upstream_idle_timeout,
+            drop_responses_slow_down_errors: file.drop_responses_slow_down_errors,
             transparent_retry_count: file.transparent_retry_count,
             transparent_retry_backoff_step: Duration::from_millis(
                 file.transparent_retry_backoff_step_ms,
@@ -385,8 +393,27 @@ mod tests {
         )
         .unwrap();
 
+        assert!(cfg.drop_responses_slow_down_errors);
         assert_eq!(cfg.transparent_retry_count, 0);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
+    }
+
+    #[test]
+    fn parses_disabled_drop_responses_slow_down_errors() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                drop_responses_slow_down_errors = false
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.drop_responses_slow_down_errors);
     }
 
     #[test]

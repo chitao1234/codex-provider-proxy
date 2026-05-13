@@ -22,9 +22,9 @@ cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
-addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`, `transparent_retry_count`,
-`transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect without restarting the
-process.
+addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`,
+`drop_responses_slow_down_errors`, `transparent_retry_count`, `transparent_retry_backoff_step_ms`,
+and all `[logging]` options takes effect without restarting the process.
 
 To print an example config:
 
@@ -81,6 +81,10 @@ the child, then transfers routing to the child PID.
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
 - If no upstream bytes are observed for `upstream_idle_timeout_secs` (default `120`), the proxy aborts the proxied
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
+- If `drop_responses_slow_down_errors = true` (the default), `*/responses` SSE streams are inspected event-by-event.
+  When the proxy sees `response.failed` with `response.error.code` of `slow_down` or
+  `server_is_overloaded`, it suppresses that SSE event, logs a warning, and aborts the downstream response so the
+  client can reconnect and retry.
 - If `transparent_retry_count > 0`, non-2xx upstream responses are retried transparently up to that many additional
   attempts before returning the final upstream response.
 - Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,
