@@ -121,19 +121,17 @@ async fn handle_proxy_inner(
     let request_id = state.runtime.next_request_id();
     let started = Instant::now();
     let cfg = state.runtime.config().await;
-    let pid = resolve_request_pid(&state, peer, request_id).await;
-
     let (parts, body) = req.into_parts();
 
     let forwarded_path = match strip_listen_base_path(&cfg.listen_base_path, parts.uri.path()) {
         Some(p) => p,
-        None => {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from("not found\n"))?);
-        }
+        None => return not_found_response(),
     };
+    if cfg.reject_messages_count_tokens && path_is_messages_count_tokens(forwarded_path) {
+        return not_found_response();
+    }
+
+    let pid = resolve_request_pid(&state, peer, request_id).await;
     let base_headers = filtered_incoming_headers(&parts.headers);
     let initial_attempt = resolve_upstream_attempt(
         &state,
@@ -343,6 +341,13 @@ async fn handle_proxy_inner(
     }));
 
     Ok(builder.body(body)?)
+}
+
+fn not_found_response() -> Result<Response<Body>> {
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from("not found\n"))?)
 }
 
 async fn resolve_request_pid(state: &ProxyState, peer: SocketAddr, request_id: u64) -> Option<u32> {
@@ -641,6 +646,10 @@ fn strip_listen_base_path<'a>(base_path: &str, incoming_path: &'a str) -> Option
     } else {
         Some(rest)
     }
+}
+
+fn path_is_messages_count_tokens(path: &str) -> bool {
+    path.trim_matches('/') == "messages/count_tokens"
 }
 
 fn build_outgoing_url(
@@ -1488,9 +1497,9 @@ mod tests {
     };
 
     use axum::{
-        body::Bytes,
+        body::{Body, Bytes},
         extract::State,
-        http::{header, HeaderMap, Method, StatusCode},
+        http::{header, HeaderMap, Method, Request, StatusCode, Uri},
         response::IntoResponse,
         routing::any,
         Router,
@@ -1508,9 +1517,9 @@ mod tests {
     };
 
     use super::{
-        is_text_event_stream, join_paths, linear_retry_backoff_delay,
-        maybe_filter_responses_slow_down_stream, resolve_upstream_attempt,
-        responses_slow_down_error_code, send_with_non_2xx_retries,
+        handle_proxy_inner, is_text_event_stream, join_paths, linear_retry_backoff_delay,
+        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
+        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
         send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
         strip_listen_base_path, ProxyState, RetryRequestTemplate, RetrySendArgs,
     };
@@ -1532,6 +1541,18 @@ mod tests {
         assert_eq!(strip_listen_base_path("/v1", "/v1/models"), Some("models"));
         assert_eq!(strip_listen_base_path("/v1", "/v1"), Some("/"));
         assert_eq!(strip_listen_base_path("/v1", "/v2/models"), None);
+    }
+
+    #[test]
+    fn detects_messages_count_tokens_endpoint() {
+        assert!(path_is_messages_count_tokens("/messages/count_tokens"));
+        assert!(path_is_messages_count_tokens("messages/count_tokens"));
+        assert!(path_is_messages_count_tokens("/messages/count_tokens/"));
+        assert!(!path_is_messages_count_tokens("/v1/messages/count_tokens"));
+        assert!(!path_is_messages_count_tokens(
+            "/messages/count_tokens/extra"
+        ));
+        assert!(!path_is_messages_count_tokens("/messages"));
     }
 
     #[test]
@@ -1670,6 +1691,48 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct PathCaptureServerState {
+        requests: Arc<Mutex<Vec<Uri>>>,
+    }
+
+    async fn path_capture_server_handler(
+        State(state): State<PathCaptureServerState>,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        state.requests.lock().unwrap().push(uri);
+        (StatusCode::OK, "ok")
+    }
+
+    async fn spawn_path_capture_server() -> (Url, Arc<Mutex<Vec<Uri>>>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = PathCaptureServerState {
+            requests: requests.clone(),
+        };
+        let app = Router::new()
+            .route("/messages/count_tokens", any(path_capture_server_handler))
+            .with_state(state);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            requests,
+            shutdown_tx,
+        )
+    }
+
     fn test_logging_config() -> LoggingConfig {
         LoggingConfig {
             log_requests: false,
@@ -1707,6 +1770,7 @@ mod tests {
             rpc_listen_addr: "127.0.0.1:8081".parse().unwrap(),
             rpc_token: None,
             upstream_idle_timeout: None,
+            reject_messages_count_tokens: true,
             drop_responses_slow_down_errors: true,
             transparent_retry_count: 0,
             transparent_retry_backoff_step: Duration::ZERO,
@@ -1714,6 +1778,69 @@ mod tests {
             providers,
             logging: test_logging_config(),
         }
+    }
+
+    #[tokio::test]
+    async fn blocks_messages_count_tokens_by_default() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens?beta=true")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50010".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn forwards_messages_count_tokens_when_rejection_disabled() {
+        let (url, requests, shutdown_tx) = spawn_path_capture_server().await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        cfg.reject_messages_count_tokens = false;
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens?beta=true")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50011".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].path(), "/messages/count_tokens");
+        assert_eq!(captured[0].query(), Some("beta=true"));
+        let _ = shutdown_tx.send(());
     }
 
     async fn build_retry_args(

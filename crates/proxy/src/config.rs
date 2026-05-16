@@ -12,6 +12,7 @@ pub struct Config {
     pub rpc_listen_addr: SocketAddr,
     pub rpc_token: Option<String>,
     pub upstream_idle_timeout: Option<Duration>,
+    pub reject_messages_count_tokens: bool,
     pub drop_responses_slow_down_errors: bool,
     pub transparent_retry_count: u32,
     pub transparent_retry_backoff_step: Duration,
@@ -97,6 +98,8 @@ struct ConfigFile {
     rpc_token: Option<String>,
     #[serde(default = "default_upstream_idle_timeout_secs")]
     upstream_idle_timeout_secs: u64,
+    #[serde(default = "default_reject_messages_count_tokens")]
+    reject_messages_count_tokens: bool,
     #[serde(default = "default_drop_responses_slow_down_errors")]
     drop_responses_slow_down_errors: bool,
     #[serde(default = "default_transparent_retry_count")]
@@ -167,6 +170,10 @@ fn default_upstream_idle_timeout_secs() -> u64 {
 }
 
 fn default_drop_responses_slow_down_errors() -> bool {
+    true
+}
+
+fn default_reject_messages_count_tokens() -> bool {
     true
 }
 
@@ -272,6 +279,7 @@ impl Config {
             rpc_listen_addr: file.rpc_listen_addr,
             rpc_token: file.rpc_token,
             upstream_idle_timeout,
+            reject_messages_count_tokens: file.reject_messages_count_tokens,
             drop_responses_slow_down_errors: file.drop_responses_slow_down_errors,
             transparent_retry_count: file.transparent_retry_count,
             transparent_retry_backoff_step: Duration::from_millis(
@@ -393,9 +401,28 @@ mod tests {
         )
         .unwrap();
 
+        assert!(cfg.reject_messages_count_tokens);
         assert!(cfg.drop_responses_slow_down_errors);
         assert_eq!(cfg.transparent_retry_count, 0);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
+    }
+
+    #[test]
+    fn parses_disabled_reject_messages_count_tokens() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                reject_messages_count_tokens = false
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.reject_messages_count_tokens);
     }
 
     #[test]

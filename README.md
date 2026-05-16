@@ -79,6 +79,8 @@ the child, then transfers routing to the child PID.
 - The proxy rewrites:
   - Destination URL to `provider.base_url + (incoming_path_minus_listen_base_path) + incoming_query`
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
+- If `reject_messages_count_tokens = true` (the default), requests whose routed path is `/messages/count_tokens`
+  return a local `404` and are not forwarded upstream. Query strings such as `?beta=true` do not bypass this check.
 - If no upstream bytes are observed for `upstream_idle_timeout_secs` (default `120`), the proxy aborts the proxied
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
 - If `drop_responses_slow_down_errors = true` (the default), `*/responses` SSE streams are inspected event-by-event.
