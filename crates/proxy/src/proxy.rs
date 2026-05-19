@@ -959,13 +959,18 @@ fn responses_slow_down_error_code(event_bytes: &[u8]) -> Option<&'static str> {
     }
 
     let json: Value = serde_json::from_str(data).ok()?;
-    let is_failed = json.get("type").and_then(Value::as_str) == Some("response.failed")
-        || event_name == Some("response.failed");
-    if !is_failed {
-        return None;
-    }
+    let event_type = json.get("type").and_then(Value::as_str);
+    let code = match (event_name, event_type) {
+        (Some("response.failed"), _) | (_, Some("response.failed")) => {
+            json.pointer("/response/error/code").and_then(Value::as_str)
+        }
+        (Some("error"), _) | (_, Some("error")) => {
+            json.pointer("/error/code").and_then(Value::as_str)
+        }
+        _ => None,
+    };
 
-    match json.pointer("/response/error/code").and_then(Value::as_str) {
+    match code {
         Some("slow_down") => Some("slow_down"),
         Some("server_is_overloaded") => Some("server_is_overloaded"),
         _ => None,
@@ -2071,9 +2076,17 @@ mod tests {
         let overloaded = concat!(
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
         );
+        let top_level_error = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\"}}\n\n",
+        );
         let unrelated = concat!(
             "event: response.failed\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n",
+        );
+        let unrelated_error = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n",
         );
 
         assert_eq!(
@@ -2084,7 +2097,15 @@ mod tests {
             responses_slow_down_error_code(overloaded.as_bytes()),
             Some("server_is_overloaded")
         );
+        assert_eq!(
+            responses_slow_down_error_code(top_level_error.as_bytes()),
+            Some("server_is_overloaded")
+        );
         assert_eq!(responses_slow_down_error_code(unrelated.as_bytes()), None);
+        assert_eq!(
+            responses_slow_down_error_code(unrelated_error.as_bytes()),
+            None
+        );
     }
 
     #[test]
@@ -2182,6 +2203,65 @@ mod tests {
         assert_eq!(delivered, payload_1);
         assert!(!delivered.contains("response.failed"));
         assert!(!delivered.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn suppresses_top_level_error_event_and_aborts_stream() {
+        let payload_1 = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        );
+        let payload_2 = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+
+        let stream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(&payload_1.as_bytes()[..20])),
+            Ok(Bytes::from_static(&payload_1.as_bytes()[20..])),
+            Ok(Bytes::from_static(&payload_2.as_bytes()[..35])),
+            Ok(Bytes::from_static(&payload_2.as_bytes()[35..])),
+        ]));
+        let mut stream = maybe_filter_responses_slow_down_stream(
+            &test_config(
+                "provider_a",
+                HashMap::from([(
+                    "provider_a".to_string(),
+                    Provider {
+                        base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                        api_key: "token-a".to_string(),
+                        authorization_header: None,
+                    },
+                )]),
+            ),
+            101,
+            "/v1/responses",
+            &headers,
+            Some(4242),
+            "provider_a",
+            stream,
+        );
+
+        let mut delivered = BytesMut::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => delivered.extend_from_slice(&chunk),
+                Err(err) => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+                    assert!(err.to_string().contains("server_is_overloaded"));
+                    break;
+                }
+            }
+        }
+
+        let delivered = String::from_utf8(delivered.to_vec()).unwrap();
+        assert_eq!(delivered, payload_1);
+        assert!(!delivered.contains("event: error"));
+        assert!(!delivered.contains("response.failed"));
     }
 
     #[tokio::test]

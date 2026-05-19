@@ -15,7 +15,7 @@ upstream_idle_timeout_secs = 120
 # Return a local 404 for `/messages/count_tokens` before any upstream forwarding.
 # Query strings do not bypass this check. Set to false to allow the endpoint through.
 reject_messages_count_tokens = true
-# When a `*/responses` SSE stream emits `response.failed` with an overload code like
+# When a `*/responses` SSE stream emits `response.failed` or `error` with an overload code like
 # `slow_down` or `server_is_overloaded`, suppress that event and disconnect the client so it can retry.
 drop_responses_slow_down_errors = true
 # Transparent retries for non-2xx upstream responses.
