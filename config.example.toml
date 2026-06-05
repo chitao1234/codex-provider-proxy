@@ -12,8 +12,9 @@ rpc_listen_addr = "127.0.0.1:8081"
 # The timeout is applied while uploading request bodies and downloading response bodies.
 # Set to 0 to disable idle-timeout termination.
 upstream_idle_timeout_secs = 120
-# Return a local 404 for `/messages/count_tokens` before any upstream forwarding.
-# Query strings do not bypass this check. Set to false to allow the endpoint through.
+# Return a local 404 for `/messages/count_tokens` and any path ending with that suffix before
+# any upstream forwarding. Query strings do not bypass this check. Set to false to allow the
+# endpoint through.
 reject_messages_count_tokens = true
 # When a `*/responses` SSE stream emits `response.failed` or `error` with an overload code like
 # `slow_down` or `server_is_overloaded`, suppress that event and disconnect the client so it can retry.

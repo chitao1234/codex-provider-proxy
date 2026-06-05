@@ -649,7 +649,8 @@ fn strip_listen_base_path<'a>(base_path: &str, incoming_path: &'a str) -> Option
 }
 
 fn path_is_messages_count_tokens(path: &str) -> bool {
-    path.trim_matches('/') == "messages/count_tokens"
+    let normalized = path.trim_matches('/');
+    normalized == "messages/count_tokens" || normalized.ends_with("/messages/count_tokens")
 }
 
 fn build_outgoing_url(
@@ -1553,7 +1554,10 @@ mod tests {
         assert!(path_is_messages_count_tokens("/messages/count_tokens"));
         assert!(path_is_messages_count_tokens("messages/count_tokens"));
         assert!(path_is_messages_count_tokens("/messages/count_tokens/"));
-        assert!(!path_is_messages_count_tokens("/v1/messages/count_tokens"));
+        assert!(path_is_messages_count_tokens("/v1/messages/count_tokens"));
+        assert!(path_is_messages_count_tokens(
+            "/api/v1/messages/count_tokens"
+        ));
         assert!(!path_is_messages_count_tokens(
             "/messages/count_tokens/extra"
         ));
@@ -1807,6 +1811,33 @@ mod tests {
             .unwrap();
 
         let resp = handle_proxy_inner(state, "127.0.0.1:50010".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn blocks_messages_count_tokens_by_suffix_when_base_path_is_root() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let cfg = test_config("provider_a", providers);
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens?beta=true")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50012".parse().unwrap(), req)
             .await
             .unwrap();
 
