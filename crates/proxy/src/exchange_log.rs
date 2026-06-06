@@ -17,7 +17,7 @@ use url::Url;
 use crate::config::{BodyLogCompression, LoggingConfig};
 
 pub type SharedExchangeFileLogger = Arc<Mutex<ExchangeFileLogger>>;
-const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 3;
+const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 4;
 
 pub struct ExchangeLogContext<'a> {
     pub request_id: u64,
@@ -31,6 +31,7 @@ pub struct ExchangeLogContext<'a> {
     pub request_headers: &'a HeaderMap,
 }
 
+#[derive(Clone, Copy)]
 pub struct AttemptRouteContext<'a> {
     pub route_pid: Option<u32>,
     pub provider_name: &'a str,
@@ -94,6 +95,7 @@ pub struct ExchangeFileLogger {
     response_body_logged_bytes: u64,
     request_body_truncated: bool,
     response_body_truncated: bool,
+    active_attempt: Option<ActiveAttemptLog>,
 }
 
 impl ExchangeFileLogger {
@@ -193,7 +195,132 @@ impl ExchangeFileLogger {
             response_body_logged_bytes: 0,
             request_body_truncated: false,
             response_body_truncated: false,
+            active_attempt: None,
         })
+    }
+
+    pub fn begin_attempt(
+        &mut self,
+        attempt_number: u32,
+        route: AttemptRouteContext<'_>,
+        method: &Method,
+        headers: &HeaderMap,
+        request_body: Option<&Bytes>,
+    ) {
+        if let Some(active_attempt) = self.active_attempt.take() {
+            self.finish_attempt_body_writers(active_attempt);
+        }
+
+        let request_headers_path = self.root_dir.join(format!(
+            "{}.attempt_{}.request_headers.txt",
+            self.stem, attempt_number
+        ));
+        let request_body_path = self.root_dir.join(format!(
+            "{}.attempt_{}.request_body{}",
+            self.stem,
+            attempt_number,
+            body_file_suffix(self.body_compression)
+        ));
+        let response_headers_path = self.root_dir.join(format!(
+            "{}.attempt_{}.response_headers.txt",
+            self.stem, attempt_number
+        ));
+        let response_body_path = self.root_dir.join(format!(
+            "{}.attempt_{}.response_body{}",
+            self.stem,
+            attempt_number,
+            body_file_suffix(self.body_compression)
+        ));
+
+        if let Err(err) = write_attempt_request_headers_file(
+            &request_headers_path,
+            attempt_number,
+            &route,
+            method,
+            headers,
+        ) {
+            warn!(
+                request_id = self.request_id,
+                attempt = attempt_number,
+                path = %request_headers_path.display(),
+                error = %err,
+                "failed to write attempt request headers log"
+            );
+        }
+
+        let request_body_writer =
+            match create_body_writer(&request_body_path, self.body_compression) {
+                Ok(writer) => Some(writer),
+                Err(err) => {
+                    warn!(
+                        request_id = self.request_id,
+                        attempt = attempt_number,
+                        path = %request_body_path.display(),
+                        error = %err,
+                        "failed to create attempt request body log"
+                    );
+                    None
+                }
+            };
+        let response_body_writer =
+            match create_body_writer(&response_body_path, self.body_compression) {
+                Ok(writer) => Some(writer),
+                Err(err) => {
+                    warn!(
+                        request_id = self.request_id,
+                        attempt = attempt_number,
+                        path = %response_body_path.display(),
+                        error = %err,
+                        "failed to create attempt response body log"
+                    );
+                    None
+                }
+            };
+
+        self.metadata.route_pid = route.route_pid;
+        self.metadata.provider = route.provider_name.to_string();
+        self.metadata.upstream_url = route.upstream_url.to_string();
+        self.metadata.attempts.push(ExchangeAttemptMetadata {
+            attempt: attempt_number,
+            is_final: false,
+            route_pid: route.route_pid,
+            provider: route.provider_name.to_string(),
+            upstream_url: route.upstream_url.to_string(),
+            response_status_code: None,
+            response_status_text: None,
+            upstream_latency_ms: None,
+            upstream_error: None,
+            request_body_bytes: None,
+            request_body_logged_bytes: None,
+            request_body_truncated: None,
+            response_body_bytes: None,
+            response_body_logged_bytes: None,
+            response_body_truncated: None,
+            request_headers: request_headers_path.display().to_string(),
+            request_body: request_body_path.display().to_string(),
+            response_headers: response_headers_path.display().to_string(),
+            response_body: response_body_path.display().to_string(),
+        });
+
+        self.active_attempt = Some(ActiveAttemptLog {
+            attempt_number,
+            request_body_path,
+            response_body_path,
+            request_body_writer,
+            response_body_writer,
+            request_body_bytes: 0,
+            response_body_bytes: 0,
+            request_body_logged_bytes: 0,
+            response_body_logged_bytes: 0,
+            request_body_truncated: false,
+            response_body_truncated: false,
+        });
+
+        if let Some(request_body) = request_body {
+            self.on_active_attempt_request_body_chunk(request_body);
+        }
+
+        self.persist_metadata_best_effort("begin attempt metadata");
     }
 
     pub fn on_request_body_chunk(&mut self, chunk: &Bytes) {
@@ -218,6 +345,7 @@ impl ExchangeFileLogger {
             to_write,
             "request body",
         );
+        self.on_active_attempt_request_body_chunk(chunk);
     }
 
     pub fn on_response_body_chunk(&mut self, chunk: &Bytes) {
@@ -242,20 +370,18 @@ impl ExchangeFileLogger {
             to_write,
             "response body",
         );
+        self.on_active_attempt_response_body_chunk(chunk);
     }
 
     pub fn record_attempt(
         &mut self,
+        attempt_number: u32,
         route: AttemptRouteContext<'_>,
         status: StatusCode,
         headers: &HeaderMap,
         latency_ms: u128,
-        response_body_bytes: Option<u64>,
         is_final: bool,
     ) {
-        let attempt_number = u32::try_from(self.metadata.attempts.len())
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
         let status_text = status.canonical_reason().unwrap_or("unknown");
         let attempt_headers_path = self.root_dir.join(format!(
             "{}.attempt_{}.response_headers.txt",
@@ -274,8 +400,13 @@ impl ExchangeFileLogger {
         if let Some(route_pid) = route.route_pid {
             body.push_str(&format!("route_pid: {route_pid}\n"));
         }
-        if let Some(bytes) = response_body_bytes {
-            body.push_str(&format!("response_body_bytes: {bytes}\n"));
+        if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
+            if let Some(bytes) = attempt_meta.request_body_bytes {
+                body.push_str(&format!("request_body_bytes: {bytes}\n"));
+            }
+            if let Some(bytes) = attempt_meta.response_body_bytes {
+                body.push_str(&format!("response_body_bytes: {bytes}\n"));
+            }
         }
         body.push_str(&format_headers(headers));
 
@@ -289,26 +420,65 @@ impl ExchangeFileLogger {
             );
         }
 
-        self.metadata.attempts.push(ExchangeAttemptMetadata {
-            attempt: attempt_number,
-            is_final,
-            route_pid: route.route_pid,
-            provider: route.provider_name.to_string(),
-            upstream_url: route.upstream_url.to_string(),
-            response_status_code: status.as_u16(),
-            response_status_text: status_text.to_string(),
-            upstream_latency_ms: latency_ms,
-            response_body_bytes,
-            response_body_logged_bytes: None,
-            response_body_truncated: None,
-            response_headers: attempt_headers_path.display().to_string(),
-            response_body: if is_final {
-                Some(self.response_body_path.display().to_string())
-            } else {
-                None
-            },
-        });
+        if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
+            attempt_meta.is_final = is_final;
+            attempt_meta.route_pid = route.route_pid;
+            attempt_meta.provider = route.provider_name.to_string();
+            attempt_meta.upstream_url = route.upstream_url.to_string();
+            attempt_meta.response_status_code = Some(status.as_u16());
+            attempt_meta.response_status_text = Some(status_text.to_string());
+            attempt_meta.upstream_latency_ms = Some(latency_ms);
+            attempt_meta.response_headers = attempt_headers_path.display().to_string();
+        } else {
+            self.metadata.attempts.push(ExchangeAttemptMetadata {
+                attempt: attempt_number,
+                is_final,
+                route_pid: route.route_pid,
+                provider: route.provider_name.to_string(),
+                upstream_url: route.upstream_url.to_string(),
+                response_status_code: Some(status.as_u16()),
+                response_status_text: Some(status_text.to_string()),
+                upstream_latency_ms: Some(latency_ms),
+                upstream_error: None,
+                request_body_bytes: None,
+                request_body_logged_bytes: None,
+                request_body_truncated: None,
+                response_body_bytes: None,
+                response_body_logged_bytes: None,
+                response_body_truncated: None,
+                request_headers: String::new(),
+                request_body: String::new(),
+                response_headers: attempt_headers_path.display().to_string(),
+                response_body: String::new(),
+            });
+        }
+
         self.persist_metadata_best_effort("write attempt metadata");
+    }
+
+    pub fn record_attempt_send_error(&mut self, attempt_number: u32, latency_ms: u128, err: &str) {
+        self.finish_active_attempt_if_matching(attempt_number);
+        if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
+            attempt_meta.is_final = true;
+            attempt_meta.upstream_latency_ms = Some(latency_ms);
+            attempt_meta.upstream_error = Some(truncate_meta_error(err));
+        }
+        self.persist_metadata_best_effort("write attempt send error metadata");
+    }
+
+    pub fn on_attempt_response_body_chunk(&mut self, attempt_number: u32, chunk: &Bytes) {
+        if self
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.attempt_number == attempt_number)
+        {
+            self.on_active_attempt_response_body_chunk(chunk);
+        }
+    }
+
+    pub fn finish_attempt(&mut self, attempt_number: u32) {
+        self.finish_active_attempt_if_matching(attempt_number);
+        self.persist_metadata_best_effort("finish attempt metadata");
     }
 
     pub fn update_upstream_target(&mut self, route: AttemptRouteContext<'_>) {
@@ -352,12 +522,27 @@ impl ExchangeFileLogger {
     }
 
     pub fn mark_upstream_send_error(&mut self, latency_ms: u128, err: &str) {
+        let active_attempt_number = self
+            .active_attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_number);
+        if let Some(attempt_number) = active_attempt_number {
+            self.finish_active_attempt_if_matching(attempt_number);
+            if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
+                attempt_meta.is_final = true;
+                attempt_meta.upstream_latency_ms = Some(latency_ms);
+                attempt_meta.upstream_error = Some(truncate_meta_error(err));
+            }
+        }
         self.metadata.upstream_latency_ms = Some(latency_ms);
         self.metadata.upstream_error = Some(truncate_meta_error(err));
         self.persist_metadata_best_effort("write upstream error metadata");
     }
 
     pub fn finalize(&mut self) {
+        if let Some(active_attempt) = self.active_attempt.take() {
+            self.finish_attempt_body_writers(active_attempt);
+        }
         flush_best_effort(
             self.request_id,
             &self.request_body_path,
@@ -412,6 +597,102 @@ impl ExchangeFileLogger {
         }
 
         self.persist_metadata_best_effort("finalize exchange metadata");
+    }
+
+    fn attempt_mut(&mut self, attempt_number: u32) -> Option<&mut ExchangeAttemptMetadata> {
+        self.metadata
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt == attempt_number)
+    }
+
+    fn on_active_attempt_request_body_chunk(&mut self, chunk: &Bytes) {
+        let Some(active_attempt) = self.active_attempt.as_mut() else {
+            return;
+        };
+        active_attempt.request_body_bytes = active_attempt
+            .request_body_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let (write_len, truncated) = limited_chunk_len(
+            self.body_max_bytes,
+            active_attempt.request_body_logged_bytes,
+            chunk.len(),
+        );
+        active_attempt.request_body_truncated |= truncated;
+        active_attempt.request_body_logged_bytes = active_attempt
+            .request_body_logged_bytes
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+
+        write_chunk_best_effort(
+            self.request_id,
+            &active_attempt.request_body_path,
+            &mut active_attempt.request_body_writer,
+            &chunk[..write_len],
+            "attempt request body",
+        );
+    }
+
+    fn on_active_attempt_response_body_chunk(&mut self, chunk: &Bytes) {
+        let Some(active_attempt) = self.active_attempt.as_mut() else {
+            return;
+        };
+        active_attempt.response_body_bytes = active_attempt
+            .response_body_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let (write_len, truncated) = limited_chunk_len(
+            self.body_max_bytes,
+            active_attempt.response_body_logged_bytes,
+            chunk.len(),
+        );
+        active_attempt.response_body_truncated |= truncated;
+        active_attempt.response_body_logged_bytes = active_attempt
+            .response_body_logged_bytes
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+
+        write_chunk_best_effort(
+            self.request_id,
+            &active_attempt.response_body_path,
+            &mut active_attempt.response_body_writer,
+            &chunk[..write_len],
+            "attempt response body",
+        );
+    }
+
+    fn finish_active_attempt_if_matching(&mut self, attempt_number: u32) {
+        if self
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.attempt_number == attempt_number)
+        {
+            if let Some(active_attempt) = self.active_attempt.take() {
+                self.finish_attempt_body_writers(active_attempt);
+            }
+        }
+    }
+
+    fn finish_attempt_body_writers(&mut self, mut active_attempt: ActiveAttemptLog) {
+        flush_best_effort(
+            self.request_id,
+            &active_attempt.request_body_path,
+            &mut active_attempt.request_body_writer,
+            "attempt request body",
+        );
+        flush_best_effort(
+            self.request_id,
+            &active_attempt.response_body_path,
+            &mut active_attempt.response_body_writer,
+            "attempt response body",
+        );
+
+        if let Some(attempt_meta) = self.attempt_mut(active_attempt.attempt_number) {
+            attempt_meta.request_body_bytes = Some(active_attempt.request_body_bytes);
+            attempt_meta.request_body_logged_bytes = Some(active_attempt.request_body_logged_bytes);
+            attempt_meta.request_body_truncated = Some(active_attempt.request_body_truncated);
+            attempt_meta.response_body_bytes = Some(active_attempt.response_body_bytes);
+            attempt_meta.response_body_logged_bytes =
+                Some(active_attempt.response_body_logged_bytes);
+            attempt_meta.response_body_truncated = Some(active_attempt.response_body_truncated);
+        }
     }
 
     fn reconstruct_and_write(&self) -> std::io::Result<()> {
@@ -500,14 +781,34 @@ struct ExchangeAttemptMetadata {
     route_pid: Option<u32>,
     provider: String,
     upstream_url: String,
-    response_status_code: u16,
-    response_status_text: String,
-    upstream_latency_ms: u128,
+    response_status_code: Option<u16>,
+    response_status_text: Option<String>,
+    upstream_latency_ms: Option<u128>,
+    upstream_error: Option<String>,
+    request_body_bytes: Option<u64>,
+    request_body_logged_bytes: Option<u64>,
+    request_body_truncated: Option<bool>,
     response_body_bytes: Option<u64>,
     response_body_logged_bytes: Option<u64>,
     response_body_truncated: Option<bool>,
+    request_headers: String,
+    request_body: String,
     response_headers: String,
-    response_body: Option<String>,
+    response_body: String,
+}
+
+struct ActiveAttemptLog {
+    attempt_number: u32,
+    request_body_path: PathBuf,
+    response_body_path: PathBuf,
+    request_body_writer: Option<BodyLogWriter>,
+    response_body_writer: Option<BodyLogWriter>,
+    request_body_bytes: u64,
+    response_body_bytes: u64,
+    request_body_logged_bytes: u64,
+    response_body_logged_bytes: u64,
+    request_body_truncated: bool,
+    response_body_truncated: bool,
 }
 
 enum BodyLogWriter {
@@ -557,6 +858,24 @@ fn write_request_headers_file(
     headers: &HeaderMap,
 ) -> std::io::Result<()> {
     let mut body = format!("method: {method}\nuri: {uri}\n");
+    body.push_str(&format_headers(headers));
+    fs::write(path, body.as_bytes())
+}
+
+fn write_attempt_request_headers_file(
+    path: &Path,
+    attempt_number: u32,
+    route: &AttemptRouteContext<'_>,
+    method: &Method,
+    headers: &HeaderMap,
+) -> std::io::Result<()> {
+    let mut body = format!(
+        "attempt: {attempt_number}\nprovider: {}\nupstream_url: {}\nmethod: {method}\n",
+        route.provider_name, route.upstream_url
+    );
+    if let Some(route_pid) = route.route_pid {
+        body.push_str(&format!("route_pid: {route_pid}\n"));
+    }
     body.push_str(&format_headers(headers));
     fs::write(path, body.as_bytes())
 }
@@ -987,7 +1306,14 @@ fn path_last_segment(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_supports_reconstruction, reconstruct_response_payload};
+    use axum::http::{HeaderMap, Method, StatusCode, Uri};
+    use bytes::Bytes;
+    use url::Url;
+
+    use super::{
+        path_supports_reconstruction, reconstruct_response_payload, AttemptRouteContext,
+        BodyLogCompression, ExchangeFileLogger,
+    };
 
     #[test]
     fn reconstructable_path_detection() {
@@ -1085,5 +1411,111 @@ mod tests {
         let payload = "upstream error: invalid API key\n";
         let out = reconstruct_response_payload(payload);
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn writes_request_and_response_files_for_each_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-attempt-log-{}-{}",
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let method = Method::POST;
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let upstream_url = Url::parse("https://api.example.com/v1/responses").unwrap();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("x-test", "root".parse().unwrap());
+
+        let mut logger = ExchangeFileLogger::new(
+            &root,
+            77,
+            "127.0.0.1:5000".parse().unwrap(),
+            Some(111),
+            Some(222),
+            "provider_a",
+            &method,
+            &uri,
+            &upstream_url,
+            &request_headers,
+            false,
+            None,
+            BodyLogCompression::None,
+        )
+        .unwrap();
+
+        let route = AttemptRouteContext {
+            route_pid: Some(222),
+            provider_name: "provider_a",
+            upstream_url: &upstream_url,
+        };
+        let request_body = Bytes::from_static(br#"{"model":"test"}"#);
+        logger.begin_attempt(1, route, &method, &request_headers, Some(&request_body));
+        logger.record_attempt(
+            1,
+            route,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &HeaderMap::new(),
+            12,
+            false,
+        );
+        logger.on_attempt_response_body_chunk(1, &Bytes::from_static(b"first failure"));
+        logger.finish_attempt(1);
+
+        logger.begin_attempt(2, route, &method, &request_headers, Some(&request_body));
+        logger.record_attempt(2, route, StatusCode::OK, &HeaderMap::new(), 34, true);
+        logger.on_response_body_chunk(&Bytes::from_static(b"final success"));
+        logger.finish_attempt(2);
+        logger.finalize();
+
+        assert_eq!(logger.metadata.schema_version, 4);
+        assert_eq!(logger.metadata.attempts.len(), 2);
+        let attempt_1 = &logger.metadata.attempts[0];
+        let attempt_2 = &logger.metadata.attempts[1];
+        assert!(!attempt_1.is_final);
+        assert!(attempt_2.is_final);
+        assert_eq!(
+            attempt_1.request_body_bytes,
+            Some(u64::try_from(request_body.len()).unwrap())
+        );
+        assert_eq!(
+            attempt_2.request_body_bytes,
+            Some(u64::try_from(request_body.len()).unwrap())
+        );
+        assert_eq!(attempt_1.response_body_bytes, Some(13));
+        assert_eq!(attempt_2.response_body_bytes, Some(13));
+
+        for path in [
+            &attempt_1.request_headers,
+            &attempt_1.request_body,
+            &attempt_1.response_headers,
+            &attempt_1.response_body,
+            &attempt_2.request_headers,
+            &attempt_2.request_body,
+            &attempt_2.response_headers,
+            &attempt_2.response_body,
+        ] {
+            assert!(std::path::Path::new(path).exists(), "{path} should exist");
+        }
+
+        assert_eq!(
+            std::fs::read(&attempt_1.request_body).unwrap(),
+            request_body
+        );
+        assert_eq!(
+            std::fs::read(&attempt_1.response_body).unwrap(),
+            b"first failure"
+        );
+        assert_eq!(
+            std::fs::read(&attempt_2.request_body).unwrap(),
+            request_body
+        );
+        assert_eq!(
+            std::fs::read(&attempt_2.response_body).unwrap(),
+            b"final success"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

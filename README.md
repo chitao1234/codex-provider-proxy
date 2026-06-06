@@ -143,10 +143,15 @@ If `logging.exchange_log_dir` is set, the proxy writes per-exchange files:
 - `<timestamp>_req_<id>.request_body.bin` (or `.bin.zst` when `exchange_body_compression = "zstd"`)
 - `<timestamp>_req_<id>.response_headers.txt`
 - `<timestamp>_req_<id>.response_body.bin` (or `.bin.zst` when `exchange_body_compression = "zstd"`)
-- `<timestamp>_req_<id>.attempt_<n>.response_headers.txt` (one per upstream attempt, including retries)
+- `<timestamp>_req_<id>.attempt_<n>.request_headers.txt`
+- `<timestamp>_req_<id>.attempt_<n>.request_body.bin` (or `.bin.zst`)
+- `<timestamp>_req_<id>.attempt_<n>.response_headers.txt`
+- `<timestamp>_req_<id>.attempt_<n>.response_body.bin` (or `.bin.zst`)
 
 When `transparent_retry_count > 0`, `*.meta.json` includes an `attempts` array with per-attempt provider, upstream
-URL, status/latency, and body-byte details.
+URL, status/latency, body-byte details, and paths for each attempt's request/response files. Non-final retry
+responses are saved before being discarded for the next transparent retry; the final response is saved while it is
+streamed to the downstream client.
 
 When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
 additionally produce:

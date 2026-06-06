@@ -199,7 +199,7 @@ async fn handle_proxy_inner(
     )
     .await;
 
-    let (resp, final_attempt, req_body_capture, _final_attempt, final_attempt_latency_ms) =
+    let (resp, final_attempt, req_body_capture, final_attempt_number, final_attempt_latency_ms) =
         match send_result {
             Ok(resp) => resp,
             Err(err) => {
@@ -266,6 +266,7 @@ async fn handle_proxy_inner(
         "record final upstream attempt",
         move |logger| {
             logger.record_attempt(
+                final_attempt_number,
                 crate::exchange_log::AttemptRouteContext {
                     route_pid: final_route_pid,
                     provider_name: &final_provider_name,
@@ -274,7 +275,6 @@ async fn handle_proxy_inner(
                 status,
                 &resp_headers_for_log,
                 final_attempt_latency_ms,
-                None,
                 true,
             );
             logger.write_response_headers(
@@ -336,7 +336,11 @@ async fn handle_proxy_inner(
             );
         }
         if let Some(exchange_logger) = exchange_logger {
-            finalize_exchange_logger_nonblocking(exchange_logger, request_id);
+            finish_and_finalize_exchange_logger_nonblocking(
+                exchange_logger,
+                request_id,
+                final_attempt_number,
+            );
         }
     }));
 
@@ -494,6 +498,15 @@ async fn send_upstream_request(
     if cfg.transparent_retry_count == 0 {
         let attempt_started = Instant::now();
         let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
+        begin_exchange_log_attempt(
+            exchange_logger.clone(),
+            request_id,
+            1,
+            &initial_attempt,
+            &method,
+            None,
+        )
+        .await;
         let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
             cfg,
             body,
@@ -514,7 +527,21 @@ async fn send_upstream_request(
             upload_activity,
             out.send(),
         )
-        .await?;
+        .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(err) => {
+                record_exchange_log_attempt_send_error(
+                    exchange_logger.clone(),
+                    request_id,
+                    1,
+                    attempt_started.elapsed().as_millis(),
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
+        };
         Ok((
             resp,
             initial_attempt,
@@ -578,13 +605,130 @@ async fn with_exchange_logger_blocking<F>(
     }
 }
 
-fn finalize_exchange_logger_nonblocking(
+async fn begin_exchange_log_attempt(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt_number: u32,
+    attempt: &PreparedUpstreamAttempt,
+    method: &http::Method,
+    request_body: Option<Bytes>,
+) {
+    let provider_name = attempt.provider_name.clone();
+    let upstream_url = attempt.url.clone();
+    let route_pid = attempt.route_pid;
+    let headers = attempt.headers.clone();
+    let method = method.clone();
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "begin exchange log attempt",
+        move |logger| {
+            logger.begin_attempt(
+                attempt_number,
+                crate::exchange_log::AttemptRouteContext {
+                    route_pid,
+                    provider_name: &provider_name,
+                    upstream_url: &upstream_url,
+                },
+                &method,
+                &headers,
+                request_body.as_ref(),
+            );
+        },
+    )
+    .await;
+}
+
+async fn record_exchange_log_attempt_response(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt_number: u32,
+    attempt: &PreparedUpstreamAttempt,
+    status: StatusCode,
+    headers: HeaderMap,
+    latency_ms: u128,
+    is_final: bool,
+) {
+    let provider_name = attempt.provider_name.clone();
+    let upstream_url = attempt.url.clone();
+    let route_pid = attempt.route_pid;
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "record exchange log attempt response",
+        move |logger| {
+            logger.record_attempt(
+                attempt_number,
+                crate::exchange_log::AttemptRouteContext {
+                    route_pid,
+                    provider_name: &provider_name,
+                    upstream_url: &upstream_url,
+                },
+                status,
+                &headers,
+                latency_ms,
+                is_final,
+            );
+        },
+    )
+    .await;
+}
+
+async fn record_exchange_log_attempt_send_error(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt_number: u32,
+    latency_ms: u128,
+    err: &std::io::Error,
+) {
+    let err = err.to_string();
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "record exchange log attempt send error",
+        move |logger| logger.record_attempt_send_error(attempt_number, latency_ms, &err),
+    )
+    .await;
+}
+
+async fn finish_exchange_log_attempt(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt_number: u32,
+) {
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "finish exchange log attempt",
+        move |logger| logger.finish_attempt(attempt_number),
+    )
+    .await;
+}
+
+async fn append_exchange_log_attempt_response_chunk(
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+    attempt_number: u32,
+    chunk: Bytes,
+) {
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "append attempt response body chunk",
+        move |logger| logger.on_attempt_response_body_chunk(attempt_number, &chunk),
+    )
+    .await;
+}
+
+fn finish_and_finalize_exchange_logger_nonblocking(
     exchange_logger: SharedExchangeFileLogger,
     request_id: u64,
+    final_attempt_number: u32,
 ) {
     if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
         runtime_handle.spawn_blocking(move || {
             if let Ok(mut logger) = exchange_logger.lock() {
+                logger.finish_attempt(final_attempt_number);
                 logger.finalize();
             }
         });
@@ -596,6 +740,7 @@ fn finalize_exchange_logger_nonblocking(
         "no active Tokio runtime while finalizing exchange logger; finalizing inline"
     );
     if let Ok(mut logger) = exchange_logger.lock() {
+        logger.finish_attempt(final_attempt_number);
         logger.finalize();
     }
 }
@@ -1239,6 +1384,16 @@ where
         .await;
 
         let attempt_started = Instant::now();
+        let attempt_number = attempt.saturating_add(1);
+        begin_exchange_log_attempt(
+            args.exchange_logger.clone(),
+            args.request_id,
+            attempt_number,
+            &current_attempt,
+            &args.request.method,
+            Some(args.request.request_body.clone()),
+        )
+        .await;
         let out = args
             .state
             .runtime
@@ -1248,46 +1403,56 @@ where
             .body(args.request.request_body.clone());
         let resp =
             send_with_optional_idle_timeout(args.request_id, args.idle_timeout, None, out.send())
-                .await?;
+                .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(err) => {
+                record_exchange_log_attempt_send_error(
+                    args.exchange_logger.clone(),
+                    args.request_id,
+                    attempt_number,
+                    attempt_started.elapsed().as_millis(),
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
+        };
 
         let status = resp.status();
+        let resp_headers = resp.headers().clone();
         let attempt_latency_ms = attempt_started.elapsed().as_millis();
-        let attempt_number = attempt.saturating_add(1);
+        record_exchange_log_attempt_response(
+            args.exchange_logger.clone(),
+            args.request_id,
+            attempt_number,
+            &current_attempt,
+            status,
+            resp_headers.clone(),
+            attempt_latency_ms,
+            status.is_success() || attempt == args.transparent_retry_count,
+        )
+        .await;
         if status.is_success() || attempt == args.transparent_retry_count {
             return Ok((resp, current_attempt, attempt_number, attempt_latency_ms));
         }
 
-        let resp_headers = resp.headers().clone();
-        let retry_body_bytes = drain_response_body_with_optional_idle_timeout(
+        drain_response_body_with_optional_idle_timeout(
             args.request_id,
             args.idle_timeout,
+            args.exchange_logger.clone(),
+            attempt_number,
             resp,
             "reading non-final retry response body",
         )
         .await?;
-        let attempt_provider_name = current_attempt.provider_name.clone();
-        let attempt_upstream_url = current_attempt.url.clone();
-        let attempt_route_pid = current_attempt.route_pid;
-        with_exchange_logger_blocking(
+        finish_exchange_log_attempt(
             args.exchange_logger.clone(),
             args.request_id,
-            "record retry attempt",
-            move |logger| {
-                logger.record_attempt(
-                    crate::exchange_log::AttemptRouteContext {
-                        route_pid: attempt_route_pid,
-                        provider_name: &attempt_provider_name,
-                        upstream_url: &attempt_upstream_url,
-                    },
-                    status,
-                    &resp_headers,
-                    attempt_latency_ms,
-                    Some(retry_body_bytes),
-                    false,
-                );
-            },
+            attempt_number,
         )
         .await;
+        let attempt_route_pid = current_attempt.route_pid;
 
         let retry_backoff =
             linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
@@ -1326,6 +1491,8 @@ fn linear_retry_backoff_delay(backoff_step: Duration, retry_number: u32) -> Dura
 async fn drain_response_body_with_optional_idle_timeout(
     request_id: u64,
     idle_timeout: Option<Duration>,
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    attempt_number: u32,
     resp: reqwest::Response,
     phase: &'static str,
 ) -> std::result::Result<u64, std::io::Error> {
@@ -1353,6 +1520,13 @@ async fn drain_response_body_with_optional_idle_timeout(
             break;
         };
         total_bytes = total_bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        append_exchange_log_attempt_response_chunk(
+            exchange_logger.clone(),
+            request_id,
+            attempt_number,
+            chunk,
+        )
+        .await;
     }
 
     Ok(total_bytes)
@@ -1499,11 +1673,11 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
-        body::{Body, Bytes},
+        body::{to_bytes, Body, Bytes},
         extract::State,
         http::{header, HeaderMap, Method, Request, StatusCode, Uri},
         response::IntoResponse,
@@ -1974,6 +2148,100 @@ mod tests {
         assert_eq!(final_attempt, 2);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn exchange_logs_include_request_and_response_files_for_each_retry_attempt() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.transparent_retry_count = 1;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::ZERO)
+            .as_nanos();
+        let log_dir = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-retry-log-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        cfg.logging.exchange_log_dir = Some(log_dir.clone());
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .body(Body::from(Bytes::from_static(b"retry-body")))
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50013".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, Bytes::from_static(b"attempt-1"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+
+        let meta_path = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".meta.json"))
+            })
+            .expect("meta file exists");
+        let mut matched = false;
+        for _ in 0..50 {
+            let meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            let attempts = meta
+                .get("attempts")
+                .and_then(serde_json::Value::as_array)
+                .unwrap();
+            if attempts.len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+
+            let mut all_match = true;
+            for (index, expected_response) in ["attempt-0", "attempt-1"].iter().enumerate() {
+                let attempt = &attempts[index];
+                let request_body = attempt
+                    .get("request_body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap();
+                let response_body = attempt
+                    .get("response_body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap();
+                all_match &= std::fs::read(request_body).is_ok_and(|body| body == b"retry-body");
+                all_match &= std::fs::read(response_body)
+                    .is_ok_and(|body| body == expected_response.as_bytes());
+            }
+
+            if all_match {
+                matched = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matched,
+            "attempt request and response body files should match"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(log_dir);
     }
 
     #[tokio::test]
