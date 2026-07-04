@@ -1352,6 +1352,60 @@ async fn update_exchange_logger_upstream_target(
     .await;
 }
 
+enum TransparentRetryReason<'a> {
+    SendError(&'a std::io::Error),
+    Non2xxStatus(StatusCode),
+}
+
+async fn wait_before_transparent_retry<S, Fut>(
+    args: &RetrySendArgs,
+    attempt_index: u32,
+    attempt_number: u32,
+    current_attempt: &PreparedUpstreamAttempt,
+    reason: TransparentRetryReason<'_>,
+    sleep_fn: &S,
+) where
+    S: Fn(Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let retry_backoff =
+        linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
+    match reason {
+        TransparentRetryReason::SendError(err) => {
+            warn!(
+                args.request_id,
+                error = %err,
+                attempt = attempt_number,
+                route_pid = ?current_attempt.route_pid,
+                provider = %current_attempt.provider_name,
+                upstream_url = %current_attempt.url,
+                total_attempts = args.transparent_retry_count.saturating_add(1),
+                retries_remaining = args.transparent_retry_count - attempt_index,
+                retry_backoff_ms = retry_backoff.as_millis(),
+                "upstream request send failed before downstream response; retrying transparently"
+            );
+        }
+        TransparentRetryReason::Non2xxStatus(status) => {
+            warn!(
+                args.request_id,
+                status = %status,
+                attempt = attempt_number,
+                route_pid = ?current_attempt.route_pid,
+                provider = %current_attempt.provider_name,
+                upstream_url = %current_attempt.url,
+                total_attempts = args.transparent_retry_count.saturating_add(1),
+                retries_remaining = args.transparent_retry_count - attempt_index,
+                retry_backoff_ms = retry_backoff.as_millis(),
+                "upstream returned non-2xx status; retrying transparently"
+            );
+        }
+    }
+
+    if !retry_backoff.is_zero() {
+        sleep_fn(retry_backoff).await;
+    }
+}
+
 async fn send_with_non_2xx_retries_with_sleep<S, Fut>(
     args: RetrySendArgs,
     sleep_fn: S,
@@ -1423,25 +1477,15 @@ where
                     return Err(err);
                 }
 
-                let attempt_route_pid = current_attempt.route_pid;
-                let retry_backoff =
-                    linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
-                warn!(
-                    args.request_id,
-                    error = %err,
-                    attempt = attempt_number,
-                    route_pid = ?attempt_route_pid,
-                    provider = %current_attempt.provider_name,
-                    upstream_url = %current_attempt.url,
-                    total_attempts = args.transparent_retry_count.saturating_add(1),
-                    retries_remaining = args.transparent_retry_count - attempt,
-                    retry_backoff_ms = retry_backoff.as_millis(),
-                    "upstream request send failed before downstream response; retrying transparently"
-                );
-
-                if !retry_backoff.is_zero() {
-                    sleep_fn(retry_backoff).await;
-                }
+                wait_before_transparent_retry(
+                    &args,
+                    attempt,
+                    attempt_number,
+                    &current_attempt,
+                    TransparentRetryReason::SendError(&err),
+                    &sleep_fn,
+                )
+                .await;
                 continue;
             }
         };
@@ -1479,27 +1523,15 @@ where
             attempt_number,
         )
         .await;
-        let attempt_route_pid = current_attempt.route_pid;
-
-        let retry_backoff =
-            linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
-
-        warn!(
-            args.request_id,
-            status = %status,
-            attempt = attempt_number,
-            route_pid = ?attempt_route_pid,
-            provider = %current_attempt.provider_name,
-            upstream_url = %current_attempt.url,
-            total_attempts = args.transparent_retry_count.saturating_add(1),
-            retries_remaining = args.transparent_retry_count - attempt,
-            retry_backoff_ms = retry_backoff.as_millis(),
-            "upstream returned non-2xx status; retrying transparently"
-        );
-
-        if !retry_backoff.is_zero() {
-            sleep_fn(retry_backoff).await;
-        }
+        wait_before_transparent_retry(
+            &args,
+            attempt,
+            attempt_number,
+            &current_attempt,
+            TransparentRetryReason::Non2xxStatus(status),
+            &sleep_fn,
+        )
+        .await;
     }
 
     unreachable!("retry loop always returns")
