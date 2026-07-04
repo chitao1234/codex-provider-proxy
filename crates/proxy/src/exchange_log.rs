@@ -456,10 +456,16 @@ impl ExchangeFileLogger {
         self.persist_metadata_best_effort("write attempt metadata");
     }
 
-    pub fn record_attempt_send_error(&mut self, attempt_number: u32, latency_ms: u128, err: &str) {
+    pub fn record_attempt_send_error(
+        &mut self,
+        attempt_number: u32,
+        latency_ms: u128,
+        err: &str,
+        is_final: bool,
+    ) {
         self.finish_active_attempt_if_matching(attempt_number);
         if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
-            attempt_meta.is_final = true;
+            attempt_meta.is_final = is_final;
             attempt_meta.upstream_latency_ms = Some(latency_ms);
             attempt_meta.upstream_error = Some(truncate_meta_error(err));
         }

@@ -88,8 +88,9 @@ the child, then transfers routing to the child PID.
   When the proxy sees `response.failed` with `response.error.code`, or `error` with `error.code`, of `slow_down` or
   `server_is_overloaded`, it suppresses that SSE event, logs a warning, and aborts the downstream response so the
   client can reconnect and retry.
-- If `transparent_retry_count > 0`, non-2xx upstream responses are retried transparently up to that many additional
-  attempts before returning the final upstream response.
+- If `transparent_retry_count > 0`, non-2xx upstream responses and upstream request-send failures that occur before
+  any downstream response is started are retried transparently up to that many additional attempts before returning
+  the final upstream response or error.
 - Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,
   default-provider changes, and provider config reloads can affect later attempts within the same proxied request.
 - `transparent_retry_backoff_step_ms` adds linear delay between those retries. A value of `250` waits 250 ms before

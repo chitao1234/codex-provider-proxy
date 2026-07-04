@@ -537,6 +537,7 @@ async fn send_upstream_request(
                     1,
                     attempt_started.elapsed().as_millis(),
                     &err,
+                    true,
                 )
                 .await;
                 return Err(err);
@@ -680,13 +681,14 @@ async fn record_exchange_log_attempt_send_error(
     attempt_number: u32,
     latency_ms: u128,
     err: &std::io::Error,
+    is_final: bool,
 ) {
     let err = err.to_string();
     with_exchange_logger_blocking(
         exchange_logger,
         request_id,
         "record exchange log attempt send error",
-        move |logger| logger.record_attempt_send_error(attempt_number, latency_ms, &err),
+        move |logger| logger.record_attempt_send_error(attempt_number, latency_ms, &err, is_final),
     )
     .await;
 }
@@ -1407,15 +1409,40 @@ where
         let resp = match resp {
             Ok(resp) => resp,
             Err(err) => {
+                let is_final_attempt = attempt == args.transparent_retry_count;
                 record_exchange_log_attempt_send_error(
                     args.exchange_logger.clone(),
                     args.request_id,
                     attempt_number,
                     attempt_started.elapsed().as_millis(),
                     &err,
+                    is_final_attempt,
                 )
                 .await;
-                return Err(err);
+                if is_final_attempt {
+                    return Err(err);
+                }
+
+                let attempt_route_pid = current_attempt.route_pid;
+                let retry_backoff =
+                    linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
+                warn!(
+                    args.request_id,
+                    error = %err,
+                    attempt = attempt_number,
+                    route_pid = ?attempt_route_pid,
+                    provider = %current_attempt.provider_name,
+                    upstream_url = %current_attempt.url,
+                    total_attempts = args.transparent_retry_count.saturating_add(1),
+                    retries_remaining = args.transparent_retry_count - attempt,
+                    retry_backoff_ms = retry_backoff.as_millis(),
+                    "upstream request send failed before downstream response; retrying transparently"
+                );
+
+                if !retry_backoff.is_zero() {
+                    sleep_fn(retry_backoff).await;
+                }
+                continue;
             }
         };
 
@@ -1808,6 +1835,13 @@ mod tests {
         )
     }
 
+    fn unused_loopback_url() -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        Url::parse(&format!("http://{addr}/")).unwrap()
+    }
+
     #[derive(Clone)]
     struct AuthCaptureServerState {
         status: StatusCode,
@@ -2148,6 +2182,101 @@ mod tests {
         assert_eq!(final_attempt, 2);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn retries_send_error_before_downstream_response_until_success() {
+        let (success_url, success_call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::OK]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: unused_loopback_url(),
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        providers.insert(
+            "provider_b".to_string(),
+            Provider {
+                base_url: success_url,
+                api_key: "token-b".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let sleep_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer: SocketAddr = "127.0.0.1:50014".parse().unwrap();
+        let args =
+            build_retry_args(state.clone(), 5, peer, None, 1, Duration::from_millis(25)).await;
+
+        let (resp, final_attempt_info, final_attempt, _final_attempt_latency_ms) =
+            send_with_non_2xx_retries_with_sleep(args, {
+                let state = state.clone();
+                let sleep_calls = sleep_calls.clone();
+                move |duration| {
+                    let state = state.clone();
+                    let sleep_calls = sleep_calls.clone();
+                    async move {
+                        sleep_calls.lock().unwrap().push(duration);
+                        state
+                            .runtime
+                            .set_default_provider("provider_b".to_string())
+                            .await;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(final_attempt_info.provider_name, "provider_b");
+        assert_eq!(final_attempt, 2);
+        assert_eq!(success_call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sleep_calls.lock().unwrap().as_slice(),
+            &[Duration::from_millis(25)]
+        );
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn returns_send_error_when_retry_limit_exhausted() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: unused_loopback_url(),
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+        let sleep_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer: SocketAddr = "127.0.0.1:50015".parse().unwrap();
+        let args = build_retry_args(state, 6, peer, None, 1, Duration::from_millis(25)).await;
+
+        let result = send_with_non_2xx_retries_with_sleep(args, {
+            let sleep_calls = sleep_calls.clone();
+            move |duration| {
+                let sleep_calls = sleep_calls.clone();
+                async move {
+                    sleep_calls.lock().unwrap().push(duration);
+                }
+            }
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected upstream send error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            sleep_calls.lock().unwrap().as_slice(),
+            &[Duration::from_millis(25)]
+        );
     }
 
     #[tokio::test]
