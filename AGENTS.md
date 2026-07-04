@@ -53,6 +53,8 @@ Crates:
 - **Authorization rewrite:** outgoing `Authorization` is replaced using the selected provider configuration.
 - **Path prefix stripping:** `listen_base_path` (e.g. `"/v1"`) is stripped from the incoming URL path before
   joining onto the provider `base_url` path (e.g. `https://example.com/v2`).
+- **Transparent retries:** retry budget/backoff applies to non-2xx upstream responses and upstream request-send
+  failures only while no downstream response has started.
 
 ## Development Commands
 
@@ -71,3 +73,5 @@ Crates:
 - Prefer minimal, focused changes. Update `config.example.toml` and `README.md` when behavior/config changes.
 - When modifying proxy forwarding behavior, ensure hop-by-hop headers remain filtered and body streaming stays
   streaming (avoid buffering full bodies unless explicitly requested).
+- When modifying transparent retry behavior, preserve route re-resolution on each retry and keep exchange-log
+  attempt metadata accurate, with only the final attempt marked final.
