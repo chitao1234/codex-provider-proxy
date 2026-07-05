@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, Request, Response, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode},
     Router,
 };
 use bytes::{Bytes, BytesMut};
@@ -27,7 +27,7 @@ use crate::{
         maybe_create_exchange_logger, ExchangeFileLogger, ExchangeLogContext,
         SharedExchangeFileLogger,
     },
-    log_capture::{Capture, CaptureConfig, SharedCapture},
+    log_capture::{Capture, CaptureConfig, CaptureSummary, SharedCapture},
     runtime::RuntimeState,
 };
 
@@ -124,11 +124,10 @@ pub async fn handle_proxy(
         Err(err) => {
             let err_chain = format!("{err:#}");
             warn!(error = %err_chain, "proxy error");
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(format!("proxy error: {err_chain}\n")))
-                .unwrap()
+            text_response(
+                StatusCode::BAD_GATEWAY,
+                Body::from(format!("proxy error: {err_chain}\n")),
+            )
         }
     }
 }
@@ -313,21 +312,21 @@ async fn handle_proxy_inner(
 
     if cfg.logging.log_bodies {
         if let Some(cap) = req_body_capture {
-            let summary = cap.lock().unwrap().summary();
-            debug!(
-                request_id,
-                pid = ?pid,
-                route_pid = ?final_attempt.route_pid,
-                provider = %final_attempt.provider_name,
-                truncated = summary.truncated,
-                body = %summary.as_lossy_utf8(),
-                "request body"
-            );
+            if let Some(summary) = capture_summary(&cap, request_id, "request") {
+                debug!(
+                    request_id,
+                    pid = ?pid,
+                    route_pid = ?final_attempt.route_pid,
+                    provider = %final_attempt.provider_name,
+                    truncated = summary.truncated,
+                    body = %summary.as_lossy_utf8(),
+                    "request body"
+                );
+            }
         }
     }
 
-    let mut builder = Response::builder().status(status);
-    copy_response_headers(&resp_headers, builder.headers_mut().unwrap())?;
+    let out_headers = filtered_response_headers(&resp_headers);
 
     let (resp_stream, resp_capture) =
         response_stream_and_capture(&cfg, request_id, resp, exchange_logger.clone());
@@ -344,16 +343,17 @@ async fn handle_proxy_inner(
     let final_route_pid = final_attempt.route_pid;
     let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
         if let Some(capture) = resp_capture {
-            let summary = capture.lock().unwrap().summary();
-            debug!(
-                request_id,
-                pid = ?pid,
-                route_pid = ?final_route_pid,
-                provider = %final_provider_name,
-                truncated = summary.truncated,
-                body = %summary.as_lossy_utf8(),
-                "response body"
-            );
+            if let Some(summary) = capture_summary(&capture, request_id, "response") {
+                debug!(
+                    request_id,
+                    pid = ?pid,
+                    route_pid = ?final_route_pid,
+                    provider = %final_provider_name,
+                    truncated = summary.truncated,
+                    body = %summary.as_lossy_utf8(),
+                    "response body"
+                );
+            }
         }
         if let Some(exchange_logger) = exchange_logger {
             finish_and_finalize_exchange_logger_nonblocking(
@@ -364,7 +364,19 @@ async fn handle_proxy_inner(
         }
     }));
 
-    Ok(builder.body(body)?)
+    let mut response = Response::builder().status(status).body(body)?;
+    *response.headers_mut() = out_headers;
+    Ok(response)
+}
+
+fn text_response(status: StatusCode, body: Body) -> Response<Body> {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn not_found_response() -> Result<Response<Body>> {
@@ -860,14 +872,15 @@ fn filtered_incoming_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-fn copy_response_headers(headers: &HeaderMap, out: &mut HeaderMap) -> Result<()> {
+fn filtered_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name) {
             continue;
         }
         out.append(name, value.clone());
     }
-    Ok(())
+    out
 }
 
 fn is_hop_by_hop(name: &header::HeaderName) -> bool {
@@ -883,6 +896,25 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
             | "te"
             | "trailer"
     )
+}
+
+fn capture_summary(
+    capture: &SharedCapture,
+    request_id: u64,
+    body_direction: &'static str,
+) -> Option<CaptureSummary> {
+    match capture.lock() {
+        Ok(capture) => Some(capture.summary()),
+        Err(err) => {
+            warn!(
+                request_id,
+                body_direction,
+                error = %err,
+                "body capture lock poisoned; skipping body log"
+            );
+            None
+        }
+    }
 }
 
 fn maybe_wrap_request_body_for_logging(

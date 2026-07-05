@@ -162,7 +162,7 @@ fn default_listen_base_path() -> String {
 
 fn default_rpc_listen_addr() -> SocketAddr {
     // Local-only management endpoint by default.
-    "127.0.0.1:8081".parse().expect("default RPC addr parses")
+    SocketAddr::from(([127, 0, 0, 1], 8081))
 }
 
 fn default_upstream_idle_timeout_secs() -> u64 {

@@ -1,6 +1,6 @@
-use std::{env, net::TcpStream, thread, time::Duration};
+use std::{env, io, net::TcpStream, thread, time::Duration};
 
-fn main() {
+fn main() -> io::Result<()> {
     let mut addr: Option<String> = None;
     let mut sleep_ms: u64 = 10_000;
 
@@ -24,6 +24,7 @@ fn main() {
         std::process::exit(2);
     };
 
-    let _stream = TcpStream::connect(addr).unwrap();
+    let _stream = TcpStream::connect(addr.as_str())?;
     thread::sleep(Duration::from_millis(sleep_ms));
+    Ok(())
 }
