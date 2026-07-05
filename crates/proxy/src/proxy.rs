@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
-    config::Provider,
+    config::{Config, Provider},
     exchange_log::{
         maybe_create_exchange_logger, ExchangeFileLogger, ExchangeLogContext,
         SharedExchangeFileLogger,
@@ -77,6 +77,17 @@ struct RetrySendArgs {
     initial_attempt: PreparedUpstreamAttempt,
 }
 
+struct ResolveUpstreamAttemptArgs<'a> {
+    state: &'a ProxyState,
+    cfg: &'a Config,
+    pid: Option<u32>,
+    peer: SocketAddr,
+    request_id: u64,
+    forwarded_path: &'a str,
+    incoming_query: Option<&'a str>,
+    base_headers: &'a HeaderMap,
+}
+
 struct UpstreamSendRequest {
     request_id: u64,
     peer: SocketAddr,
@@ -88,6 +99,15 @@ struct UpstreamSendRequest {
     base_headers: HeaderMap,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+}
+
+struct AttemptResponseLog<'a> {
+    attempt_number: u32,
+    attempt: &'a PreparedUpstreamAttempt,
+    status: StatusCode,
+    headers: HeaderMap,
+    latency_ms: u128,
+    is_final: bool,
 }
 
 pub fn router(state: ProxyState) -> Router {
@@ -133,16 +153,16 @@ async fn handle_proxy_inner(
 
     let pid = resolve_request_pid(&state, peer, request_id).await;
     let base_headers = filtered_incoming_headers(&parts.headers);
-    let initial_attempt = resolve_upstream_attempt(
-        &state,
-        &cfg,
+    let initial_attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
+        state: &state,
+        cfg: &cfg,
         pid,
         peer,
         request_id,
         forwarded_path,
-        parts.uri.query(),
-        &base_headers,
-    )
+        incoming_query: parts.uri.query(),
+        base_headers: &base_headers,
+    })
     .await?;
 
     if cfg.logging.log_requests {
@@ -398,7 +418,7 @@ async fn resolve_request_pid(state: &ProxyState, peer: SocketAddr, request_id: u
 
 async fn resolve_provider_for_pid(
     state: &ProxyState,
-    cfg: &crate::config::Config,
+    cfg: &Config,
     pid: Option<u32>,
     peer: SocketAddr,
     request_id: u64,
@@ -456,22 +476,22 @@ fn prepare_upstream_attempt(
 }
 
 async fn resolve_upstream_attempt(
-    state: &ProxyState,
-    cfg: &crate::config::Config,
-    pid: Option<u32>,
-    peer: SocketAddr,
-    request_id: u64,
-    forwarded_path: &str,
-    incoming_query: Option<&str>,
-    base_headers: &HeaderMap,
+    args: ResolveUpstreamAttemptArgs<'_>,
 ) -> Result<PreparedUpstreamAttempt> {
-    let route = resolve_provider_for_pid(state, cfg, pid, peer, request_id).await?;
-    prepare_upstream_attempt(route, forwarded_path, incoming_query, base_headers)
+    let route =
+        resolve_provider_for_pid(args.state, args.cfg, args.pid, args.peer, args.request_id)
+            .await?;
+    prepare_upstream_attempt(
+        route,
+        args.forwarded_path,
+        args.incoming_query,
+        args.base_headers,
+    )
 }
 
 async fn send_upstream_request(
     state: &ProxyState,
-    cfg: &crate::config::Config,
+    cfg: &Config,
     request: UpstreamSendRequest,
 ) -> std::result::Result<
     (
@@ -643,16 +663,16 @@ async fn begin_exchange_log_attempt(
 async fn record_exchange_log_attempt_response(
     exchange_logger: Option<SharedExchangeFileLogger>,
     request_id: u64,
-    attempt_number: u32,
-    attempt: &PreparedUpstreamAttempt,
-    status: StatusCode,
-    headers: HeaderMap,
-    latency_ms: u128,
-    is_final: bool,
+    entry: AttemptResponseLog<'_>,
 ) {
-    let provider_name = attempt.provider_name.clone();
-    let upstream_url = attempt.url.clone();
-    let route_pid = attempt.route_pid;
+    let provider_name = entry.attempt.provider_name.clone();
+    let upstream_url = entry.attempt.url.clone();
+    let route_pid = entry.attempt.route_pid;
+    let attempt_number = entry.attempt_number;
+    let status = entry.status;
+    let headers = entry.headers;
+    let latency_ms = entry.latency_ms;
+    let is_final = entry.is_final;
     with_exchange_logger_blocking(
         exchange_logger,
         request_id,
@@ -1419,16 +1439,16 @@ where
             args.initial_attempt.clone()
         } else {
             let cfg = args.state.runtime.config().await;
-            resolve_upstream_attempt(
-                &args.state,
-                &cfg,
-                args.pid,
-                args.peer,
-                args.request_id,
-                &args.request.forwarded_path,
-                args.request.incoming_query.as_deref(),
-                &args.request.base_headers,
-            )
+            resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
+                state: &args.state,
+                cfg: &cfg,
+                pid: args.pid,
+                peer: args.peer,
+                request_id: args.request_id,
+                forwarded_path: &args.request.forwarded_path,
+                incoming_query: args.request.incoming_query.as_deref(),
+                base_headers: &args.request.base_headers,
+            })
             .await
             .map_err(std::io::Error::other)?
         };
@@ -1496,12 +1516,14 @@ where
         record_exchange_log_attempt_response(
             args.exchange_logger.clone(),
             args.request_id,
-            attempt_number,
-            &current_attempt,
-            status,
-            resp_headers.clone(),
-            attempt_latency_ms,
-            status.is_success() || attempt == args.transparent_retry_count,
+            AttemptResponseLog {
+                attempt_number,
+                attempt: &current_attempt,
+                status,
+                headers: resp_headers.clone(),
+                latency_ms: attempt_latency_ms,
+                is_final: status.is_success() || attempt == args.transparent_retry_count,
+            },
         )
         .await;
         if status.is_success() || attempt == args.transparent_retry_count {
@@ -1760,7 +1782,8 @@ mod tests {
         maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
         resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
         send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
-        strip_listen_base_path, ProxyState, RetryRequestTemplate, RetrySendArgs,
+        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
+        RetrySendArgs,
     };
 
     #[test]
@@ -2128,16 +2151,16 @@ mod tests {
         transparent_retry_backoff_step: Duration,
     ) -> RetrySendArgs {
         let cfg = state.runtime.config().await;
-        let initial_attempt = resolve_upstream_attempt(
-            &state,
-            &cfg,
+        let initial_attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
+            state: &state,
+            cfg: &cfg,
             pid,
             peer,
             request_id,
-            "/",
-            None,
-            &HeaderMap::new(),
-        )
+            forwarded_path: "/",
+            incoming_query: None,
+            base_headers: &HeaderMap::new(),
+        })
         .await
         .unwrap();
         RetrySendArgs {
@@ -2328,7 +2351,7 @@ mod tests {
         cfg.transparent_retry_count = 1;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::ZERO)
+            .unwrap_or(Duration::ZERO)
             .as_nanos();
         let log_dir = std::env::temp_dir().join(format!(
             "codex-provider-proxy-retry-log-{}-{}",
@@ -2533,9 +2556,8 @@ mod tests {
             "event: response.failed\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
         );
-        let overloaded = concat!(
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
-        );
+        let overloaded =
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n";
         let top_level_error = concat!(
             "event: error\n",
             "data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\"}}\n\n",
