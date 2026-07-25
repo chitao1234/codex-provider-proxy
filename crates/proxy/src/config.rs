@@ -14,6 +14,7 @@ pub struct Config {
     pub upstream_idle_timeout: Option<Duration>,
     pub reject_messages_count_tokens: bool,
     pub drop_responses_slow_down_errors: bool,
+    pub convert_429_to_503: bool,
     pub transparent_retry_count: u32,
     pub transparent_retry_backoff_step: Duration,
     pub default_provider: String,
@@ -102,6 +103,8 @@ struct ConfigFile {
     reject_messages_count_tokens: bool,
     #[serde(default = "default_drop_responses_slow_down_errors")]
     drop_responses_slow_down_errors: bool,
+    #[serde(default = "default_convert_429_to_503")]
+    convert_429_to_503: bool,
     #[serde(default = "default_transparent_retry_count")]
     transparent_retry_count: u32,
     #[serde(default = "default_transparent_retry_backoff_step_ms")]
@@ -170,6 +173,10 @@ fn default_upstream_idle_timeout_secs() -> u64 {
 }
 
 fn default_drop_responses_slow_down_errors() -> bool {
+    true
+}
+
+fn default_convert_429_to_503() -> bool {
     true
 }
 
@@ -281,6 +288,7 @@ impl Config {
             upstream_idle_timeout,
             reject_messages_count_tokens: file.reject_messages_count_tokens,
             drop_responses_slow_down_errors: file.drop_responses_slow_down_errors,
+            convert_429_to_503: file.convert_429_to_503,
             transparent_retry_count: file.transparent_retry_count,
             transparent_retry_backoff_step: Duration::from_millis(
                 file.transparent_retry_backoff_step_ms,
@@ -403,6 +411,7 @@ mod tests {
 
         assert!(cfg.reject_messages_count_tokens);
         assert!(cfg.drop_responses_slow_down_errors);
+        assert!(cfg.convert_429_to_503);
         assert_eq!(cfg.transparent_retry_count, 0);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
     }
@@ -441,6 +450,24 @@ mod tests {
         .unwrap();
 
         assert!(!cfg.drop_responses_slow_down_errors);
+    }
+
+    #[test]
+    fn parses_disabled_convert_429_to_503() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                convert_429_to_503 = false
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.convert_429_to_503);
     }
 
     #[test]

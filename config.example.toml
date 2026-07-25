@@ -19,6 +19,8 @@ reject_messages_count_tokens = true
 # When a `*/responses` SSE stream emits `response.failed` or `error` with an overload code like
 # `slow_down` or `server_is_overloaded`, suppress that event and disconnect the client so it can retry.
 drop_responses_slow_down_errors = true
+# Return upstream HTTP 429 responses to downstream clients as HTTP 503. This is enabled by default.
+convert_429_to_503 = true
 # Transparent retries for non-2xx upstream responses and pre-downstream upstream send failures.
 # Value is the number of additional attempts after the first one (0 disables retries).
 # Each retry re-resolves the current provider/default route and rewrites Authorization again.

@@ -23,8 +23,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
 addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`,
-`drop_responses_slow_down_errors`, `transparent_retry_count`, `transparent_retry_backoff_step_ms`,
-and all `[logging]` options takes effect without restarting the process.
+`drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
+`transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect without restarting the process.
 
 To print an example config:
 
@@ -88,6 +88,8 @@ the child, then transfers routing to the child PID.
   When the proxy sees `response.failed` with `response.error.code`, or `error` with `error.code`, of `slow_down` or
   `server_is_overloaded`, it suppresses that SSE event, logs a warning, and aborts the downstream response so the
   client can reconnect and retry.
+- If `convert_429_to_503 = true` (the default), final upstream HTTP `429 Too Many Requests` responses are returned
+  downstream as HTTP `503 Service Unavailable`. Disable it to preserve upstream `429` responses unchanged.
 - If `transparent_retry_count > 0`, non-2xx upstream responses and upstream request-send failures that occur before
   any downstream response is started are retried transparently up to that many additional attempts before returning
   the final upstream response or error.

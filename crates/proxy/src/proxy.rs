@@ -238,6 +238,7 @@ async fn handle_proxy_inner(
             }
         };
     let status = resp.status();
+    let downstream_status = downstream_response_status(&cfg, status);
     let resp_headers = resp.headers().clone();
 
     if cfg.logging.log_responses {
@@ -249,6 +250,7 @@ async fn handle_proxy_inner(
                 peer = %peer,
                 provider = %final_attempt.provider_name,
                 status = %status,
+                downstream_status = %downstream_status,
                 latency_ms = started.elapsed().as_millis(),
                 "response headers received"
             );
@@ -260,6 +262,7 @@ async fn handle_proxy_inner(
                 peer = %peer,
                 provider = %final_attempt.provider_name,
                 status = %status,
+                downstream_status = %downstream_status,
                 latency_ms = started.elapsed().as_millis(),
                 "response headers received with non-2xx upstream status"
             );
@@ -302,7 +305,7 @@ async fn handle_proxy_inner(
                     provider_name: &final_provider_name,
                     upstream_url: &final_url,
                 },
-                status,
+                downstream_status,
                 &resp_headers_for_log,
                 upstream_latency_ms,
             );
@@ -364,7 +367,7 @@ async fn handle_proxy_inner(
         }
     }));
 
-    let mut response = Response::builder().status(status).body(body)?;
+    let mut response = Response::builder().status(downstream_status).body(body)?;
     *response.headers_mut() = out_headers;
     Ok(response)
 }
@@ -881,6 +884,17 @@ fn filtered_response_headers(headers: &HeaderMap) -> HeaderMap {
         out.append(name, value.clone());
     }
     out
+}
+
+fn downstream_response_status(
+    cfg: &crate::config::Config,
+    upstream_status: StatusCode,
+) -> StatusCode {
+    if cfg.convert_429_to_503 && upstream_status == StatusCode::TOO_MANY_REQUESTS {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        upstream_status
+    }
 }
 
 fn is_hop_by_hop(name: &header::HeaderName) -> bool {
@@ -1810,12 +1824,12 @@ mod tests {
     };
 
     use super::{
-        handle_proxy_inner, is_text_event_stream, join_paths, linear_retry_backoff_delay,
-        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
-        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
-        send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
-        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
-        RetrySendArgs,
+        downstream_response_status, handle_proxy_inner, is_text_event_stream, join_paths,
+        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
+        path_is_messages_count_tokens, resolve_upstream_attempt, responses_slow_down_error_code,
+        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep,
+        should_drop_responses_slow_down_errors, strip_listen_base_path, ProxyState,
+        ResolveUpstreamAttemptArgs, RetryRequestTemplate, RetrySendArgs,
     };
 
     #[test]
@@ -2076,6 +2090,7 @@ mod tests {
             upstream_idle_timeout: None,
             reject_messages_count_tokens: true,
             drop_responses_slow_down_errors: true,
+            convert_429_to_503: true,
             transparent_retry_count: 0,
             transparent_retry_backoff_step: Duration::ZERO,
             default_provider: default_provider.to_string(),
@@ -2172,6 +2187,96 @@ mod tests {
         assert_eq!(captured[0].path(), "/messages/count_tokens");
         assert_eq!(captured[0].query(), Some("beta=true"));
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn converts_upstream_429_to_503_by_default() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::TOO_MANY_REQUESTS]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let state = test_proxy_state(test_config("provider_a", providers));
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .body(Body::from(Bytes::from_static(b"retry-body")))
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50016".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, Bytes::from_static(b"attempt-0"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn preserves_upstream_429_when_conversion_disabled() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::TOO_MANY_REQUESTS]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.convert_429_to_503 = false;
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .body(Body::from(Bytes::from_static(b"retry-body")))
+            .unwrap();
+
+        let resp = handle_proxy_inner(state, "127.0.0.1:50017".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, Bytes::from_static(b"attempt-0"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn maps_downstream_status_only_for_429_when_enabled() {
+        let cfg = test_config(
+            "provider_a",
+            HashMap::from([(
+                "provider_a".to_string(),
+                Provider {
+                    base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+                    api_key: "token-a".to_string(),
+                    authorization_header: None,
+                },
+            )]),
+        );
+
+        assert_eq!(
+            downstream_response_status(&cfg, StatusCode::TOO_MANY_REQUESTS),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            downstream_response_status(&cfg, StatusCode::BAD_GATEWAY),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     async fn build_retry_args(
