@@ -23,6 +23,7 @@ use url::Url;
 
 use crate::{
     config::{Config, Provider},
+    content_encoding,
     exchange_log::{
         maybe_create_exchange_logger, ExchangeFileLogger, ExchangeLogContext,
         SharedExchangeFileLogger,
@@ -344,18 +345,36 @@ async fn handle_proxy_inner(
     );
     let final_provider_name = final_attempt.provider_name.clone();
     let final_route_pid = final_attempt.route_pid;
+    let resp_headers_for_body_log = resp_headers.clone();
     let body = Body::from_stream(LogOnEndStream::new(resp_stream, move || {
         if let Some(capture) = resp_capture {
             if let Some(summary) = capture_summary(&capture, request_id, "response") {
-                debug!(
-                    request_id,
-                    pid = ?pid,
-                    route_pid = ?final_route_pid,
-                    provider = %final_provider_name,
-                    truncated = summary.truncated,
-                    body = %summary.as_lossy_utf8(),
-                    "response body"
-                );
+                match response_body_for_log(&summary, &resp_headers_for_body_log) {
+                    Ok(body) => {
+                        debug!(
+                            request_id,
+                            pid = ?pid,
+                            route_pid = ?final_route_pid,
+                            provider = %final_provider_name,
+                            truncated = summary.truncated,
+                            body = %body,
+                            "response body"
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            request_id,
+                            pid = ?pid,
+                            route_pid = ?final_route_pid,
+                            provider = %final_provider_name,
+                            truncated = summary.truncated,
+                            captured_bytes = summary.bytes.len(),
+                            content_encoding = ?resp_headers_for_body_log.get(header::CONTENT_ENCODING),
+                            error = %err,
+                            "response body capture could not be decoded for logging"
+                        );
+                    }
+                }
             }
         }
         if let Some(exchange_logger) = exchange_logger {
@@ -929,6 +948,14 @@ fn capture_summary(
             None
         }
     }
+}
+
+fn response_body_for_log(
+    summary: &CaptureSummary,
+    headers: &HeaderMap,
+) -> Result<String, std::io::Error> {
+    content_encoding::decode_content_encoded_body(headers, &summary.bytes)
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
 }
 
 fn maybe_wrap_request_body_for_logging(
@@ -1806,7 +1833,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body, Bytes},
         extract::State,
-        http::{header, HeaderMap, Method, Request, StatusCode, Uri},
+        http::{header, HeaderMap, Method, Request, Response, StatusCode, Uri},
         response::IntoResponse,
         routing::any,
         Router,
@@ -2051,6 +2078,35 @@ mod tests {
         )
     }
 
+    async fn compressed_response_handler() -> Response<Body> {
+        let payload = br#"{"error":{"message":"decoded upstream response"},"type":"error"}"#;
+        let compressed = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_ENCODING, "zstd")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(compressed))
+            .unwrap()
+    }
+
+    async fn spawn_compressed_response_server() -> (Url, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/messages", any(compressed_response_handler));
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (Url::parse(&format!("http://{addr}/")).unwrap(), shutdown_tx)
+    }
+
     fn test_logging_config() -> LoggingConfig {
         LoggingConfig {
             log_requests: false,
@@ -2253,6 +2309,80 @@ mod tests {
         assert_eq!(body, Bytes::from_static(b"attempt-0"));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn preserves_compressed_downstream_response_and_decodes_exchange_reconstruction() {
+        let (url, shutdown_tx) = spawn_compressed_response_server().await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let log_dir = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-compressed-response-{}-{unique}",
+            std::process::id()
+        ));
+        cfg.logging.exchange_log_dir = Some(log_dir.clone());
+        cfg.logging.exchange_body_compression = BodyLogCompression::Zstd;
+        cfg.logging.reconstruct_responses = true;
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50018".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "zstd"
+        );
+        let downstream_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let decoded_downstream = zstd::stream::decode_all(downstream_body.as_ref()).unwrap();
+        assert_eq!(
+            decoded_downstream,
+            br#"{"error":{"message":"decoded upstream response"},"type":"error"}"#
+        );
+
+        let reconstructed_path = (0..50)
+            .find_map(|_| {
+                let path = std::fs::read_dir(&log_dir)
+                    .ok()?
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.ends_with(".response_reconstructed.txt"))
+                    });
+                if path.as_ref().is_some_and(|path| path.exists()) {
+                    path
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("reconstructed exchange response exists");
+        assert_eq!(
+            std::fs::read(&reconstructed_path).unwrap(),
+            br#"{"error":{"message":"decoded upstream response"},"type":"error"}"#
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(log_dir);
     }
 
     #[test]

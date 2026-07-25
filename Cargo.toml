@@ -15,11 +15,13 @@ edition = "2021"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["macros"] }
+brotli = "8"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 futures-util = "0.3"
+flate2 = "1"
 http = "1"
 http-body-util = "0.1"
 pin-project-lite = "0.2"

@@ -161,8 +161,10 @@ additionally produce:
 - `<timestamp>_req_<id>.response_reconstructed.txt`
 
 Reconstruction is best-effort for OpenAI `v1/responses` SSE streams and Anthropic `v1/messages` SSE streams,
-with plain-text error fallback. Any reconstruction failure is logged as a warning and does not affect proxy
-forwarding behavior.
+with plain-text error fallback. Before reconstructing, it decodes `gzip`, `deflate`, `br`, and `zstd` content
+codings from the upstream response. Exchange response-body files always retain the original wire bytes, so an
+upstream `zstd` response with `exchange_body_compression = "zstd"` has two distinct zstd layers. Any
+reconstruction failure is logged as a warning and does not affect proxy forwarding behavior.
 
 `*.meta.json` also records machine-readable exchange status fields such as:
 - `response_status_code`

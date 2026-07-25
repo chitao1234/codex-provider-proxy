@@ -14,7 +14,10 @@ use serde_json::{Map, Value};
 use tracing::warn;
 use url::Url;
 
-use crate::config::{BodyLogCompression, LoggingConfig};
+use crate::{
+    config::{BodyLogCompression, LoggingConfig},
+    content_encoding,
+};
 
 pub type SharedExchangeFileLogger = Arc<Mutex<ExchangeFileLogger>>;
 const EXCHANGE_LOG_SCHEMA_VERSION: u32 = 4;
@@ -85,6 +88,8 @@ pub struct ExchangeFileLogger {
     request_body_writer: Option<BodyLogWriter>,
     response_body_writer: Option<BodyLogWriter>,
     response_headers_path: PathBuf,
+    response_content_encodings: Vec<String>,
+    response_content_encoding_error: Option<String>,
     reconstructed_path: PathBuf,
     should_reconstruct: bool,
     body_max_bytes: Option<u64>,
@@ -185,6 +190,8 @@ impl ExchangeFileLogger {
             request_body_writer: Some(create_body_writer(&request_body_path, body_compression)?),
             response_body_writer: Some(create_body_writer(&response_body_path, body_compression)?),
             response_headers_path,
+            response_content_encodings: Vec::new(),
+            response_content_encoding_error: None,
             reconstructed_path,
             should_reconstruct,
             body_max_bytes,
@@ -501,6 +508,16 @@ impl ExchangeFileLogger {
         headers: &HeaderMap,
         latency_ms: u128,
     ) {
+        match content_encoding::content_encodings(headers) {
+            Ok(encodings) => {
+                self.response_content_encodings = encodings;
+                self.response_content_encoding_error = None;
+            }
+            Err(err) => {
+                self.response_content_encodings.clear();
+                self.response_content_encoding_error = Some(err.to_string());
+            }
+        }
         self.metadata.route_pid = route.route_pid;
         self.metadata.provider = route.provider_name.to_string();
         self.metadata.upstream_url = route.upstream_url.to_string();
@@ -706,8 +723,27 @@ impl ExchangeFileLogger {
         if raw.is_empty() {
             return Ok(());
         }
-        let raw_text = String::from_utf8_lossy(&raw);
-        let reconstructed = reconstruct_response_payload(&raw_text);
+        if self.response_body_truncated && !self.response_content_encodings.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot decode a truncated content-encoded response body",
+            ));
+        }
+        if let Some(err) = &self.response_content_encoding_error {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cannot decode response body: {err}"),
+            ));
+        }
+        let decoded =
+            content_encoding::decode_content_encodings(&raw, &self.response_content_encodings)?;
+        let decoded_text = String::from_utf8(decoded).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decoded response body is not valid UTF-8: {err}"),
+            )
+        })?;
+        let reconstructed = reconstruct_response_payload(&decoded_text);
         fs::write(&self.reconstructed_path, reconstructed.as_bytes())
     }
 
@@ -1417,6 +1453,63 @@ mod tests {
         let payload = "upstream error: invalid API key\n";
         let out = reconstruct_response_payload(payload);
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn reconstructs_zstd_encoded_response_and_retains_compressed_wire_body() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-zstd-reconstruction-{}-{}",
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let method = Method::POST;
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        let upstream_url = Url::parse("https://api.example.com/v1/messages").unwrap();
+        let request_headers = HeaderMap::new();
+        let mut logger = ExchangeFileLogger::new(
+            &root,
+            78,
+            "127.0.0.1:5001".parse().unwrap(),
+            None,
+            None,
+            "provider_a",
+            &method,
+            &uri,
+            &upstream_url,
+            &request_headers,
+            true,
+            None,
+            BodyLogCompression::Zstd,
+        )
+        .unwrap();
+        let route = AttemptRouteContext {
+            route_pid: None,
+            provider_name: "provider_a",
+            upstream_url: &upstream_url,
+        };
+        let payload = br#"{"error":{"message":"decoded"},"type":"error"}"#;
+        let compressed_payload = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert("content-encoding", "zstd".parse().unwrap());
+
+        logger.write_response_headers(route, StatusCode::NOT_FOUND, &response_headers, 12);
+        logger.on_response_body_chunk(&Bytes::from(compressed_payload.clone()));
+        logger.finalize();
+
+        assert_eq!(logger.metadata.reconstruction_succeeded, Some(true));
+        assert_eq!(
+            std::fs::read(&logger.reconstructed_path).unwrap(),
+            payload.as_slice()
+        );
+        assert_eq!(
+            super::read_logged_body_file(&logger.response_body_path, BodyLogCompression::Zstd)
+                .unwrap(),
+            compressed_payload
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
