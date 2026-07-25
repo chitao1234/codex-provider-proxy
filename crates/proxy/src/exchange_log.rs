@@ -866,6 +866,13 @@ impl BodyLogWriter {
         }
     }
 
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Zstd(writer) => writer.flush(),
+        }
+    }
+
     fn finish(self) -> std::io::Result<()> {
         match self {
             Self::Plain(mut writer) => writer.flush(),
@@ -992,13 +999,16 @@ fn write_chunk_best_effort(
     let Some(writer_inner) = writer.as_mut() else {
         return;
     };
-    if let Err(err) = writer_inner.write_all(chunk) {
+    if let Err(err) = writer_inner
+        .write_all(chunk)
+        .and_then(|_| writer_inner.flush())
+    {
         warn!(
             request_id,
             path = %path.display(),
             kind,
             error = %err,
-            "failed to append exchange log chunk"
+            "failed to append or flush exchange log chunk"
         );
         *writer = None;
     }
@@ -1510,6 +1520,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn flushes_body_chunks_to_disk_before_exchange_finalization() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-body-flush-{}-{}.bin",
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        let mut writer = Some(super::create_body_writer(&path, BodyLogCompression::None).unwrap());
+
+        super::write_chunk_best_effort(
+            78,
+            &path,
+            &mut writer,
+            b"visible immediately",
+            "response body",
+        );
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"visible immediately");
+        writer.take().unwrap().finish().unwrap();
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -156,6 +156,9 @@ URL, status/latency, body-byte details, and paths for each attempt's request/res
 responses are saved before being discarded for the next transparent retry; the final response is saved while it is
 streamed to the downstream client.
 
+Exchange body chunks are flushed after each write, so active body files grow during a streamed exchange. Metadata
+and compressed body frames are finalized when the exchange completes.
+
 When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
 additionally produce:
 - `<timestamp>_req_<id>.response_reconstructed.txt`
