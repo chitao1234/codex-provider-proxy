@@ -354,9 +354,11 @@ name = "codex-provider-proxyctl"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "brotli",
  "chrono",
  "clap",
  "codex-provider-proxy-rpc-types",
+ "flate2",
  "regex",
  "reqwest",
  "serde",

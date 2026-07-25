@@ -1,13 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde::Deserialize;
 use serde_json::Value;
+
+const MAX_DECODED_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-provider-proxy-log-analyze")]
@@ -272,6 +276,7 @@ fn analyze_exchange(
                     }
                     match extract_completed_response_from_log(
                         &response_body_path,
+                        &response_headers_path,
                         meta.body_compression.as_deref(),
                     ) {
                         Ok(response) => {
@@ -320,6 +325,7 @@ fn analyze_exchange(
         None => {
             let parsed = extract_completed_response_from_log(
                 &response_body_path,
+                &response_headers_path,
                 meta.body_compression.as_deref(),
             );
             match parsed {
@@ -404,9 +410,10 @@ fn extract_model_from_response(response: &Value) -> Option<String> {
 
 fn extract_completed_response_from_log(
     path: &Path,
+    response_headers_path: &Path,
     body_compression: Option<&str>,
 ) -> Result<Option<Value>> {
-    let bytes = read_logged_body(path, body_compression)
+    let bytes = read_logged_response_body(path, response_headers_path, body_compression)
         .with_context(|| format!("read response body {}", path.display()))?;
     if bytes.is_empty() {
         return Ok(None);
@@ -427,6 +434,21 @@ fn extract_completed_response_from_log(
     }
 }
 
+fn read_logged_response_body(
+    path: &Path,
+    response_headers_path: &Path,
+    body_compression: Option<&str>,
+) -> Result<Vec<u8>> {
+    let body = read_logged_body(path, body_compression)?;
+    let encodings = read_response_content_encodings(response_headers_path)?;
+    decode_content_encodings(body, &encodings).with_context(|| {
+        format!(
+            "decode content encoding from response headers {}",
+            response_headers_path.display()
+        )
+    })
+}
+
 fn read_logged_body(path: &Path, body_compression: Option<&str>) -> Result<Vec<u8>> {
     let is_zstd = body_compression
         .map(|v| v.eq_ignore_ascii_case("zstd"))
@@ -442,6 +464,83 @@ fn read_logged_body(path: &Path, body_compression: Option<&str>) -> Result<Vec<u
         return Ok(bytes);
     }
     fs::read(path).with_context(|| format!("read {}", path.display()))
+}
+
+fn read_response_content_encodings(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let headers = fs::read_to_string(path)
+        .with_context(|| format!("read response headers {}", path.display()))?;
+    let mut encodings = Vec::new();
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("content-encoding") {
+            continue;
+        }
+        for encoding in value.split(',') {
+            let encoding = encoding.trim();
+            if encoding.is_empty() {
+                bail!("empty Content-Encoding value in {}", path.display());
+            }
+            encodings.push(encoding.to_ascii_lowercase());
+        }
+    }
+    Ok(encodings)
+}
+
+fn decode_content_encodings(mut body: Vec<u8>, encodings: &[String]) -> Result<Vec<u8>> {
+    // Content codings are applied in header order and therefore decoded in reverse order.
+    for encoding in encodings.iter().rev() {
+        body = decode_one_content_encoding(body, encoding)?;
+    }
+    Ok(body)
+}
+
+fn decode_one_content_encoding(body: Vec<u8>, encoding: &str) -> Result<Vec<u8>> {
+    match encoding {
+        "identity" => Ok(body),
+        "gzip" | "x-gzip" => Ok(read_decoded_limited(GzDecoder::new(body.as_slice()))?),
+        "deflate" => decode_deflate(&body),
+        "br" => Ok(read_decoded_limited(brotli::Decompressor::new(
+            body.as_slice(),
+            4096,
+        ))?),
+        "zstd" => {
+            let decoder = zstd::stream::read::Decoder::new(body.as_slice())?;
+            Ok(read_decoded_limited(decoder)?)
+        }
+        _ => bail!("unsupported content encoding {encoding:?}"),
+    }
+}
+
+fn decode_deflate(body: &[u8]) -> Result<Vec<u8>> {
+    match read_decoded_limited(ZlibDecoder::new(body)) {
+        Ok(decoded) => Ok(decoded),
+        Err(zlib_err) => read_decoded_limited(DeflateDecoder::new(body)).map_err(|raw_err| {
+            anyhow::anyhow!(
+                "failed to decode deflate content with zlib ({zlib_err}) or raw deflate ({raw_err})"
+            )
+        }),
+    }
+}
+
+fn read_decoded_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut reader = reader.take(MAX_DECODED_RESPONSE_BODY_BYTES.saturating_add(1));
+    reader.read_to_end(&mut decoded)?;
+    if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > MAX_DECODED_RESPONSE_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decoded response exceeds the {MAX_DECODED_RESPONSE_BODY_BYTES}-byte analysis limit"
+            ),
+        ));
+    }
+    Ok(decoded)
 }
 
 fn looks_like_sse(payload: &str) -> bool {
@@ -820,18 +919,29 @@ mod tests {
             "proxyctl-log-analyze-zstd-{}-{unique}.response_body.bin.zst",
             std::process::id()
         ));
+        let response_headers_path = std::env::temp_dir().join(format!(
+            "proxyctl-log-analyze-zstd-{}-{unique}.response_headers.txt",
+            std::process::id()
+        ));
         let payload = r#"{"response":{"id":"resp_zstd","usage":{"input_tokens":1}}}"#;
-        let encoded = zstd::stream::encode_all(payload.as_bytes(), 3).expect("encode zstd");
-        fs::write(&path, encoded).expect("write zstd payload");
+        let upstream_encoded =
+            zstd::stream::encode_all(payload.as_bytes(), 3).expect("encode upstream zstd");
+        let stored =
+            zstd::stream::encode_all(upstream_encoded.as_slice(), 3).expect("encode exchange zstd");
+        fs::write(&path, stored).expect("write zstd payload");
+        fs::write(&response_headers_path, "content-encoding: zstd\n")
+            .expect("write response headers");
 
-        let response = extract_completed_response_from_log(&path, Some("zstd"))
-            .expect("extract")
-            .expect("response exists");
+        let response =
+            extract_completed_response_from_log(&path, &response_headers_path, Some("zstd"))
+                .expect("extract")
+                .expect("response exists");
         assert_eq!(
             response.get("id").and_then(|v| v.as_str()),
             Some("resp_zstd")
         );
 
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&response_headers_path);
     }
 }

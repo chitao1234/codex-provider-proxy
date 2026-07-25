@@ -183,6 +183,9 @@ You can analyze captured exchange logs (token usage, token categories, cache rat
 cargo run -p codex-provider-proxyctl --bin log_analyze -- -d logs/exchanges
 ```
 
+The analyzer decodes the exchange body-file compression first and then any upstream response
+`Content-Encoding` (`gzip`, `deflate`, `br`, or `zstd`) recorded in the response headers.
+
 Filter examples (filters can be combined; combination is AND):
 
 ```bash
