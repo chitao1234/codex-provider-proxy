@@ -16,6 +16,7 @@ pub struct Config {
     pub drop_responses_slow_down_errors: bool,
     pub convert_429_to_503: bool,
     pub transparent_retry_count: u32,
+    pub transparent_retry_head_requests: bool,
     pub transparent_retry_backoff_step: Duration,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
@@ -107,6 +108,8 @@ struct ConfigFile {
     convert_429_to_503: bool,
     #[serde(default = "default_transparent_retry_count")]
     transparent_retry_count: u32,
+    #[serde(default)]
+    transparent_retry_head_requests: bool,
     #[serde(default = "default_transparent_retry_backoff_step_ms")]
     transparent_retry_backoff_step_ms: u64,
     default_provider: String,
@@ -290,6 +293,7 @@ impl Config {
             drop_responses_slow_down_errors: file.drop_responses_slow_down_errors,
             convert_429_to_503: file.convert_429_to_503,
             transparent_retry_count: file.transparent_retry_count,
+            transparent_retry_head_requests: file.transparent_retry_head_requests,
             transparent_retry_backoff_step: Duration::from_millis(
                 file.transparent_retry_backoff_step_ms,
             ),
@@ -413,6 +417,7 @@ mod tests {
         assert!(cfg.drop_responses_slow_down_errors);
         assert!(cfg.convert_429_to_503);
         assert_eq!(cfg.transparent_retry_count, 0);
+        assert!(!cfg.transparent_retry_head_requests);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
     }
 
@@ -476,6 +481,7 @@ mod tests {
             r#"
                 listen_addr = "127.0.0.1:8080"
                 transparent_retry_count = 3
+                transparent_retry_head_requests = true
                 transparent_retry_backoff_step_ms = 250
                 default_provider = "provider_a"
 
@@ -487,6 +493,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.transparent_retry_count, 3);
+        assert!(cfg.transparent_retry_head_requests);
         assert_eq!(
             cfg.transparent_retry_backoff_step,
             Duration::from_millis(250)

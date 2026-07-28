@@ -25,6 +25,9 @@ convert_429_to_503 = true
 # Value is the number of additional attempts after the first one (0 disables retries).
 # Each retry re-resolves the current provider/default route and rewrites Authorization again.
 transparent_retry_count = 0
+# HEAD requests remain single-attempt by default even when transparent retries are enabled.
+# Set to true to include them in transparent retries.
+transparent_retry_head_requests = false
 # Linear backoff step between transparent retries, in milliseconds.
 # The first retry waits 1x this value, the second waits 2x, and so on. Set to 0 for no delay.
 transparent_retry_backoff_step_ms = 0

@@ -549,7 +549,7 @@ async fn send_upstream_request(
         body,
         exchange_logger,
     } = request;
-    if cfg.transparent_retry_count == 0 {
+    if !transparent_retries_enabled(cfg, &method) {
         let attempt_started = Instant::now();
         let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
         begin_exchange_log_attempt(
@@ -635,6 +635,11 @@ async fn send_upstream_request(
             final_attempt_latency_ms,
         ))
     }
+}
+
+fn transparent_retries_enabled(cfg: &Config, method: &http::Method) -> bool {
+    cfg.transparent_retry_count > 0
+        && (*method != http::Method::HEAD || cfg.transparent_retry_head_requests)
 }
 
 async fn with_exchange_logger_blocking<F>(
@@ -1917,9 +1922,12 @@ mod tests {
 
     async fn retry_server_handler(
         State(state): State<RetryServerState>,
+        method: Method,
         body: Bytes,
     ) -> impl IntoResponse {
-        assert_eq!(body, Bytes::from_static(b"retry-body"));
+        if method != Method::HEAD {
+            assert_eq!(body, Bytes::from_static(b"retry-body"));
+        }
 
         let call_index = state.call_count.fetch_add(1, Ordering::SeqCst);
         let status = state
@@ -2148,6 +2156,7 @@ mod tests {
             drop_responses_slow_down_errors: true,
             convert_429_to_503: true,
             transparent_retry_count: 0,
+            transparent_retry_head_requests: false,
             transparent_retry_backoff_step: Duration::ZERO,
             default_provider: default_provider.to_string(),
             providers,
@@ -2472,6 +2481,69 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(final_attempt, 2);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_head_requests_by_default() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.transparent_retry_count = 1;
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50019".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn retries_head_requests_when_enabled() {
+        let (url, call_count, shutdown_tx) =
+            spawn_retry_server(vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]).await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.transparent_retry_count = 1;
+        cfg.transparent_retry_head_requests = true;
+        let state = test_proxy_state(cfg);
+
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50020".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         let _ = shutdown_tx.send(());
     }

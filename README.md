@@ -24,7 +24,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
 addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`,
 `drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
-`transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect without restarting the process.
+`transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect
+without restarting the process.
 
 To print an example config:
 
@@ -93,6 +94,8 @@ the child, then transfers routing to the child PID.
 - If `transparent_retry_count > 0`, non-2xx upstream responses and upstream request-send failures that occur before
   any downstream response is started are retried transparently up to that many additional attempts before returning
   the final upstream response or error.
+- `HEAD` requests are excluded from transparent retries by default, even when `transparent_retry_count > 0`. Set
+  `transparent_retry_head_requests = true` to opt in.
 - Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,
   default-provider changes, and provider config reloads can affect later attempts within the same proxied request.
 - `transparent_retry_backoff_step_ms` adds linear delay between those retries. A value of `250` waits 250 ms before
