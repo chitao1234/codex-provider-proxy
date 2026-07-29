@@ -1,4 +1,5 @@
 use std::{
+    error::Error as StdError,
     future::Future,
     net::SocketAddr,
     sync::Arc,
@@ -224,7 +225,7 @@ async fn handle_proxy_inner(
             Ok(resp) => resp,
             Err(err) => {
                 let error_latency_ms = started.elapsed().as_millis();
-                let err_text = err.to_string();
+                let err_text = format_error_chain(&err);
                 with_exchange_logger_blocking(
                     exchange_logger.clone(),
                     request_id,
@@ -742,7 +743,7 @@ async fn record_exchange_log_attempt_send_error(
     err: &std::io::Error,
     is_final: bool,
 ) {
-    let err = err.to_string();
+    let err = format_error_chain(err);
     with_exchange_logger_blocking(
         exchange_logger,
         request_id,
@@ -1367,6 +1368,74 @@ fn map_reqwest_body_err(err: reqwest::Error) -> std::io::Error {
     std::io::Error::other(err)
 }
 
+struct ErrorLogDetails {
+    chain: String,
+    root_cause: String,
+}
+
+fn error_chain_parts(err: &(dyn StdError + 'static)) -> Vec<String> {
+    let mut parts = Vec::new();
+    push_error_chain_part(&mut parts, err.to_string());
+
+    let mut source = next_error_in_chain(err);
+    while let Some(cause) = source {
+        push_error_chain_part(&mut parts, cause.to_string());
+        source = next_error_in_chain(cause);
+    }
+
+    parts
+}
+
+fn next_error_in_chain<'a>(
+    err: &'a (dyn StdError + 'static),
+) -> Option<&'a (dyn StdError + 'static)> {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        if let Some(inner) = io_err.get_ref() {
+            return Some(inner as &(dyn StdError + 'static));
+        }
+    }
+
+    err.source()
+}
+
+fn push_error_chain_part(parts: &mut Vec<String>, part: String) {
+    if parts.last() != Some(&part) {
+        parts.push(part);
+    }
+}
+
+fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    error_chain_parts(err).join(": ")
+}
+
+fn error_log_details(err: &(dyn StdError + 'static)) -> ErrorLogDetails {
+    let parts = error_chain_parts(err);
+    let root_cause = parts.last().cloned().unwrap_or_else(|| err.to_string());
+    ErrorLogDetails {
+        chain: parts.join(": "),
+        root_cause,
+    }
+}
+
+fn find_error_in_chain<'a, E>(err: &'a (dyn StdError + 'static)) -> Option<&'a E>
+where
+    E: StdError + 'static,
+{
+    if let Some(found) = err.downcast_ref::<E>() {
+        return Some(found);
+    }
+
+    let mut source = next_error_in_chain(err);
+    while let Some(cause) = source {
+        if let Some(found) = cause.downcast_ref::<E>() {
+            return Some(found);
+        }
+        source = next_error_in_chain(cause);
+    }
+
+    None
+}
+
 async fn send_with_idle_timeout<F>(
     request_id: u64,
     idle_timeout: Duration,
@@ -1470,9 +1539,22 @@ async fn wait_before_transparent_retry<S, Fut>(
         linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
     match reason {
         TransparentRetryReason::SendError(err) => {
+            let error_details = error_log_details(err);
+            let reqwest_error = find_error_in_chain::<reqwest::Error>(err);
+            let reqwest_is_request = reqwest_error.is_some_and(reqwest::Error::is_request);
+            let reqwest_is_connect = reqwest_error.is_some_and(reqwest::Error::is_connect);
+            let reqwest_is_timeout = reqwest_error.is_some_and(reqwest::Error::is_timeout);
+            let reqwest_is_body = reqwest_error.is_some_and(reqwest::Error::is_body);
             warn!(
                 args.request_id,
                 error = %err,
+                error_kind = ?err.kind(),
+                error_root_cause = %error_details.root_cause,
+                error_chain = %error_details.chain,
+                reqwest_is_request,
+                reqwest_is_connect,
+                reqwest_is_timeout,
+                reqwest_is_body,
                 attempt = attempt_number,
                 route_pid = ?current_attempt.route_pid,
                 provider = %current_attempt.provider_name,
@@ -1827,6 +1909,8 @@ where
 mod tests {
     use std::{
         collections::HashMap,
+        error::Error as StdError,
+        fmt,
         net::SocketAddr,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1856,13 +1940,34 @@ mod tests {
     };
 
     use super::{
-        downstream_response_status, handle_proxy_inner, is_text_event_stream, join_paths,
-        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
-        path_is_messages_count_tokens, resolve_upstream_attempt, responses_slow_down_error_code,
-        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep,
-        should_drop_responses_slow_down_errors, strip_listen_base_path, ProxyState,
-        ResolveUpstreamAttemptArgs, RetryRequestTemplate, RetrySendArgs,
+        downstream_response_status, error_log_details, format_error_chain, handle_proxy_inner,
+        is_text_event_stream, join_paths, linear_retry_backoff_delay,
+        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
+        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
+        send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
+        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
+        RetrySendArgs,
     };
+
+    #[derive(Debug)]
+    struct ChainedTestError {
+        message: &'static str,
+        source: Option<Box<ChainedTestError>>,
+    }
+
+    impl fmt::Display for ChainedTestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl StdError for ChainedTestError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_deref()
+                .map(|err| err as &(dyn StdError + 'static))
+        }
+    }
 
     #[test]
     fn joins_paths_with_prefix() {
@@ -1911,6 +2016,50 @@ mod tests {
         assert_eq!(
             linear_retry_backoff_delay(Duration::ZERO, 3),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn formats_full_error_chain_for_send_error_logging() {
+        let err = ChainedTestError {
+            message: "error sending request for url (https://example.test/v1/responses)",
+            source: Some(Box::new(ChainedTestError {
+                message: "client error (Connect)",
+                source: Some(Box::new(ChainedTestError {
+                    message: "tcp connect error: Connection refused (os error 111)",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            format_error_chain(&err),
+            "error sending request for url (https://example.test/v1/responses): client error (Connect): tcp connect error: Connection refused (os error 111)"
+        );
+
+        let details = error_log_details(&err);
+        assert_eq!(
+            details.root_cause,
+            "tcp connect error: Connection refused (os error 111)"
+        );
+    }
+
+    #[test]
+    fn formats_io_error_wrapped_source_chain_for_send_error_logging() {
+        let err = std::io::Error::other(ChainedTestError {
+            message: "error sending request for url (https://example.test/v1/responses)",
+            source: Some(Box::new(ChainedTestError {
+                message: "client error (Connect)",
+                source: Some(Box::new(ChainedTestError {
+                    message: "tcp connect error: Connection refused (os error 111)",
+                    source: None,
+                })),
+            })),
+        });
+
+        assert_eq!(
+            format_error_chain(&err),
+            "error sending request for url (https://example.test/v1/responses): client error (Connect): tcp connect error: Connection refused (os error 111)"
         );
     }
 
