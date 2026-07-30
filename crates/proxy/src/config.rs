@@ -11,6 +11,7 @@ pub struct Config {
     pub listen_base_path: String,
     pub rpc_listen_addr: SocketAddr,
     pub rpc_token: Option<String>,
+    pub upstream_connect_timeout: Option<Duration>,
     pub upstream_idle_timeout: Option<Duration>,
     pub reject_messages_count_tokens: bool,
     pub drop_responses_slow_down_errors: bool,
@@ -98,6 +99,8 @@ struct ConfigFile {
     rpc_listen_addr: SocketAddr,
     #[serde(default)]
     rpc_token: Option<String>,
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    upstream_connect_timeout_secs: u64,
     #[serde(default = "default_upstream_idle_timeout_secs")]
     upstream_idle_timeout_secs: u64,
     #[serde(default = "default_reject_messages_count_tokens")]
@@ -175,6 +178,10 @@ fn default_upstream_idle_timeout_secs() -> u64 {
     120
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    10
+}
+
 fn default_drop_responses_slow_down_errors() -> bool {
     true
 }
@@ -245,6 +252,10 @@ impl Config {
         let file: ConfigFile = toml::from_str(toml_str).context("parse config toml")?;
         let listen_addrs = normalize_listen_addrs(file.listen_addr, file.listen_addrs)?;
         let listen_base_path = normalize_base_path(&file.listen_base_path)?;
+        let upstream_connect_timeout = match file.upstream_connect_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let upstream_idle_timeout = match file.upstream_idle_timeout_secs {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
@@ -288,6 +299,7 @@ impl Config {
             listen_base_path,
             rpc_listen_addr: file.rpc_listen_addr,
             rpc_token: file.rpc_token,
+            upstream_connect_timeout,
             upstream_idle_timeout,
             reject_messages_count_tokens: file.reject_messages_count_tokens,
             drop_responses_slow_down_errors: file.drop_responses_slow_down_errors,
@@ -379,6 +391,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.upstream_idle_timeout.unwrap().as_secs(), 120);
+    }
+
+    #[test]
+    fn applies_default_upstream_connect_timeout() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.upstream_connect_timeout.unwrap().as_secs(), 10);
+    }
+
+    #[test]
+    fn parses_upstream_connect_timeout() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                upstream_connect_timeout_secs = 3
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.upstream_connect_timeout.unwrap().as_secs(), 3);
+    }
+
+    #[test]
+    fn allows_disabling_upstream_connect_timeout_with_zero() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                upstream_connect_timeout_secs = 0
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.upstream_connect_timeout.is_none());
     }
 
     #[test]

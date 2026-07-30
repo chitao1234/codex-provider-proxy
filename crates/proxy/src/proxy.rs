@@ -2300,6 +2300,7 @@ mod tests {
             listen_base_path: "/".to_string(),
             rpc_listen_addr: "127.0.0.1:8081".parse().unwrap(),
             rpc_token: None,
+            upstream_connect_timeout: None,
             upstream_idle_timeout: None,
             reject_messages_count_tokens: true,
             drop_responses_slow_down_errors: true,

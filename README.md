@@ -22,7 +22,7 @@ cargo run -p codex-provider-proxy -- --config config.toml
 ```
 
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
-addresses, `rpc_listen_addr`, `rpc_token`, `upstream_idle_timeout_secs`,
+addresses, `rpc_listen_addr`, `rpc_token`, `upstream_connect_timeout_secs`, `upstream_idle_timeout_secs`,
 `drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
 `transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect
 without restarting the process.
@@ -85,6 +85,9 @@ the child, then transfers routing to the child PID.
   as `?beta=true` do not bypass this check.
 - If no upstream bytes are observed for `upstream_idle_timeout_secs` (default `120`), the proxy aborts the proxied
   exchange and closes both sides. Set `upstream_idle_timeout_secs = 0` to disable this behavior.
+- New upstream connection setup, including TCP connect and TLS handshake, is bounded by
+  `upstream_connect_timeout_secs` (default `10`). Set `upstream_connect_timeout_secs = 0` to disable this specific
+  connect timeout; `upstream_idle_timeout_secs` can still bound the broader send/header-wait phase.
 - If `drop_responses_slow_down_errors = true` (the default), `*/responses` SSE streams are inspected event-by-event.
   When the proxy sees `response.failed` with `response.error.code`, or `error` with `error.code`, of `slow_down` or
   `server_is_overloaded`, it suppresses that SSE event, logs a warning, and aborts the downstream response so the
@@ -94,6 +97,8 @@ the child, then transfers routing to the child PID.
 - If `transparent_retry_count > 0`, non-2xx upstream responses and upstream request-send failures that occur before
   any downstream response is started are retried transparently up to that many additional attempts before returning
   the final upstream response or error.
+- Connection setup timeouts, including TLS handshake timeouts, are upstream request-send failures. With transparent
+  retries enabled, each timeout consumes one attempt and then the proxy continues to the next retry.
 - `HEAD` requests are excluded from transparent retries by default, even when `transparent_retry_count > 0`. Set
   `transparent_retry_head_requests = true` to opt in.
 - Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,

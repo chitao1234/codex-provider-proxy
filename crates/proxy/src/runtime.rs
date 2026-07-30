@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock as StdRwLock,
     },
 };
 
@@ -54,6 +54,14 @@ impl ConfigOverrides {
     }
 }
 
+pub fn build_http_client(config: &Config) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().user_agent("codex-provider-proxy/0.1.2");
+    if let Some(timeout) = config.upstream_connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    builder.build().context("build reqwest client")
+}
+
 #[derive(Clone)]
 pub struct RuntimeState {
     inner: Arc<RuntimeInner>,
@@ -64,7 +72,7 @@ struct RuntimeInner {
     default_provider: RwLock<String>,
     pid_routes: Arc<DashMap<u32, String>>,
     pid_resolver: Arc<dyn PidResolver>,
-    http_client: reqwest::Client,
+    http_client: StdRwLock<reqwest::Client>,
     request_seq: AtomicU64,
     log_reload: LogReloadHandle,
 }
@@ -86,7 +94,7 @@ impl RuntimeState {
                 config: RwLock::new(config),
                 pid_routes: Arc::new(DashMap::new()),
                 pid_resolver,
-                http_client,
+                http_client: StdRwLock::new(http_client),
                 request_seq: AtomicU64::new(1),
                 log_reload,
             }),
@@ -114,7 +122,11 @@ impl RuntimeState {
     }
 
     pub fn http_client(&self) -> reqwest::Client {
-        self.inner.http_client.clone()
+        self.inner
+            .http_client
+            .read()
+            .expect("http client lock poisoned")
+            .clone()
     }
 
     pub fn next_request_id(&self) -> u64 {
@@ -123,6 +135,16 @@ impl RuntimeState {
 
     pub async fn apply_config(&self, config: Arc<Config>) -> Result<ApplyConfigSummary> {
         let filter = config.logging.env_filter()?;
+        let should_rebuild_http_client = {
+            let current = self.inner.config.read().await;
+            current.upstream_connect_timeout != config.upstream_connect_timeout
+        };
+        let rebuilt_http_client = if should_rebuild_http_client {
+            Some(build_http_client(&config)?)
+        } else {
+            None
+        };
+
         self.inner
             .log_reload
             .reload(filter)
@@ -139,6 +161,17 @@ impl RuntimeState {
         {
             let mut cfg = self.inner.config.write().await;
             *cfg = config.clone();
+        }
+        if let Some(http_client) = rebuilt_http_client {
+            *self
+                .inner
+                .http_client
+                .write()
+                .expect("http client lock poisoned") = http_client;
+            info!(
+                upstream_connect_timeout_secs = ?config.upstream_connect_timeout.map(|d| d.as_secs()),
+                "upstream HTTP client rebuilt"
+            );
         }
         {
             let mut default_provider = self.inner.default_provider.write().await;

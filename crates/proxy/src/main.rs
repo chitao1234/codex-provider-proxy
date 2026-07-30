@@ -11,7 +11,9 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use clap::Parser;
 use pid_resolver::platform::default_pid_resolver;
-use runtime::{spawn_config_watcher, ConfigOverrides, RuntimeState, ServerManager};
+use runtime::{
+    build_http_client, spawn_config_watcher, ConfigOverrides, RuntimeState, ServerManager,
+};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -72,10 +74,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let http_client = reqwest::Client::builder()
-        .user_agent("codex-provider-proxy/0.1.1")
-        .build()
-        .context("build reqwest client")?;
+    let http_client = build_http_client(&initial_config)?;
     let runtime = RuntimeState::new(
         Arc::new(initial_config.clone()),
         default_pid_resolver(),
