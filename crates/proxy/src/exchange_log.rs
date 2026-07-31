@@ -1046,9 +1046,226 @@ fn reconstruct_response_payload(payload: &str) -> String {
         return payload.to_string();
     }
 
-    reconstruct_openai_response_from_sse(payload)
+    reconstruct_chat_completion_from_sse(payload)
+        .or_else(|| reconstruct_openai_response_from_sse(payload))
         .or_else(|| reconstruct_anthropic_message_from_sse(payload))
         .unwrap_or_else(|| payload.to_string())
+}
+
+fn reconstruct_chat_completion_from_sse(payload: &str) -> Option<String> {
+    let events = parse_sse_events(payload);
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut has_chat_completion_chunks = false;
+    let mut completion = Map::new();
+    let mut choices: Vec<Option<Map<String, Value>>> = Vec::new();
+
+    for event in events {
+        let data = event.data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if !is_chat_completion_chunk(&json) {
+            continue;
+        }
+
+        has_chat_completion_chunks = true;
+        copy_chat_completion_metadata(&mut completion, &json);
+        if let Some(usage) = json.get("usage") {
+            completion.insert("usage".to_string(), usage.clone());
+        }
+
+        let Some(chunk_choices) = json.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for chunk_choice in chunk_choices {
+            let Some(index) = event_index(chunk_choice) else {
+                continue;
+            };
+            ensure_chat_choice_slot(&mut choices, index);
+            let choice = choices[index].get_or_insert_with(|| {
+                let mut choice = Map::new();
+                choice.insert("index".to_string(), Value::from(index));
+                choice.insert("message".to_string(), Value::Object(Map::new()));
+                choice
+            });
+
+            if let Some(delta) = chunk_choice.get("delta").and_then(Value::as_object) {
+                merge_chat_completion_delta(choice, delta);
+            }
+            for field in ["finish_reason", "logprobs"] {
+                if let Some(value) = chunk_choice.get(field) {
+                    choice.insert(field.to_string(), value.clone());
+                }
+            }
+        }
+    }
+
+    if !has_chat_completion_chunks {
+        return None;
+    }
+
+    completion.insert(
+        "object".to_string(),
+        Value::String("chat.completion".to_string()),
+    );
+    completion.insert(
+        "choices".to_string(),
+        Value::Array(choices.into_iter().flatten().map(Value::Object).collect()),
+    );
+
+    let completion = Value::Object(completion);
+    serde_json::to_string_pretty(&completion)
+        .ok()
+        .or_else(|| Some(completion.to_string()))
+}
+
+fn is_chat_completion_chunk(json: &Value) -> bool {
+    json.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
+        || json
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| choices.iter().any(|choice| choice.get("delta").is_some()))
+}
+
+fn copy_chat_completion_metadata(completion: &mut Map<String, Value>, chunk: &Value) {
+    for field in [
+        "id",
+        "created",
+        "model",
+        "service_tier",
+        "system_fingerprint",
+    ] {
+        if let Some(value) = chunk.get(field) {
+            completion.insert(field.to_string(), value.clone());
+        }
+    }
+}
+
+fn ensure_chat_choice_slot(choices: &mut Vec<Option<Map<String, Value>>>, index: usize) {
+    if choices.len() <= index {
+        choices.resize_with(index + 1, || None);
+    }
+}
+
+fn merge_chat_completion_delta(choice: &mut Map<String, Value>, delta: &Map<String, Value>) {
+    let message = choice
+        .entry("message".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(message) = message.as_object_mut() else {
+        return;
+    };
+
+    for (field, value) in delta {
+        match field.as_str() {
+            "content" | "refusal" | "reasoning_content" => {
+                append_json_string(message, field, value);
+            }
+            "function_call" => merge_function_call(message, value),
+            "tool_calls" => merge_tool_calls(message, value),
+            _ => {
+                message.insert(field.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn append_json_string(object: &mut Map<String, Value>, field: &str, value: &Value) {
+    let Some(delta) = value.as_str() else {
+        object.insert(field.to_string(), value.clone());
+        return;
+    };
+    let current = object
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut combined = String::with_capacity(current.len() + delta.len());
+    combined.push_str(current);
+    combined.push_str(delta);
+    object.insert(field.to_string(), Value::String(combined));
+}
+
+fn merge_function_call(message: &mut Map<String, Value>, value: &Value) {
+    let Some(delta) = value.as_object() else {
+        message.insert("function_call".to_string(), value.clone());
+        return;
+    };
+    let function_call = message
+        .entry("function_call".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(function_call) = function_call.as_object_mut() else {
+        return;
+    };
+    for (field, value) in delta {
+        if matches!(field.as_str(), "name" | "arguments") {
+            append_json_string(function_call, field, value);
+        } else {
+            function_call.insert(field.clone(), value.clone());
+        }
+    }
+}
+
+fn merge_tool_calls(message: &mut Map<String, Value>, value: &Value) {
+    let Some(delta_tool_calls) = value.as_array() else {
+        message.insert("tool_calls".to_string(), value.clone());
+        return;
+    };
+    let tool_calls = message
+        .entry("tool_calls".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(tool_calls) = tool_calls.as_array_mut() else {
+        return;
+    };
+
+    for (position, delta_tool_call) in delta_tool_calls.iter().enumerate() {
+        let Some(delta_tool_call) = delta_tool_call.as_object() else {
+            continue;
+        };
+        let index = delta_tool_call
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(position);
+        if tool_calls.len() <= index {
+            tool_calls.resize_with(index + 1, || Value::Object(Map::new()));
+        }
+        let Some(tool_call) = tool_calls[index].as_object_mut() else {
+            continue;
+        };
+
+        for (field, value) in delta_tool_call {
+            if field == "function" {
+                merge_tool_function(tool_call, value);
+            } else if field != "index" {
+                tool_call.insert(field.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn merge_tool_function(tool_call: &mut Map<String, Value>, value: &Value) {
+    let Some(delta) = value.as_object() else {
+        tool_call.insert("function".to_string(), value.clone());
+        return;
+    };
+    let function = tool_call
+        .entry("function".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(function) = function.as_object_mut() else {
+        return;
+    };
+    for (field, value) in delta {
+        if matches!(field.as_str(), "name" | "arguments") {
+            append_json_string(function, field, value);
+        } else {
+            function.insert(field.clone(), value.clone());
+        }
+    }
 }
 
 fn reconstruct_openai_response_from_sse(payload: &str) -> Option<String> {
@@ -1337,7 +1554,9 @@ fn parse_sse_events(payload: &str) -> Vec<SseEvent> {
 }
 
 fn path_supports_reconstruction(path: &str) -> bool {
-    path_ends_with_responses(path) || path_ends_with_messages(path)
+    path_ends_with_responses(path)
+        || path_ends_with_messages(path)
+        || path_is_chat_completions(path)
 }
 
 fn path_ends_with_responses(path: &str) -> bool {
@@ -1346,6 +1565,13 @@ fn path_ends_with_responses(path: &str) -> bool {
 
 fn path_ends_with_messages(path: &str) -> bool {
     path_last_segment(path) == Some("messages")
+}
+
+fn path_is_chat_completions(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/completions")
+        .is_some_and(|prefix| path_last_segment(prefix) == Some("chat"))
 }
 
 fn path_last_segment(path: &str) -> Option<&str> {
@@ -1373,9 +1599,11 @@ mod tests {
         assert!(path_supports_reconstruction("/v1/chat/responses/"));
         assert!(path_supports_reconstruction("/v1/messages"));
         assert!(path_supports_reconstruction("/v1/messages/"));
+        assert!(path_supports_reconstruction("/v1/chat/completions"));
+        assert!(path_supports_reconstruction("/v1/chat/completions/"));
         assert!(!path_supports_reconstruction("/v1/responses/stream"));
         assert!(!path_supports_reconstruction("/v1/messages/count_tokens"));
-        assert!(!path_supports_reconstruction("/v1/chat/completions"));
+        assert!(!path_supports_reconstruction("/v1/chat/completions/stream"));
     }
 
     #[test]
@@ -1405,6 +1633,65 @@ mod tests {
         );
         let out = reconstruct_response_payload(payload);
         assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn reconstructs_chat_completion_text_and_usage() {
+        let payload = concat!(
+            "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-test\",\"system_fingerprint\":\"fp_1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello \"},\"logprobs\":null,\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"logprobs\":null,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let out = reconstruct_response_payload(payload);
+        let completion: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(completion["object"], "chat.completion");
+        assert_eq!(completion["id"], "chatcmpl_1");
+        assert_eq!(completion["system_fingerprint"], "fp_1");
+        assert_eq!(completion["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(
+            completion["choices"][0]["message"]["content"],
+            "Hello world"
+        );
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        assert_eq!(completion["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn reconstructs_chat_completion_function_and_tool_calls() {
+        let payload = concat!(
+            r#"data: {"object":"chat.completion.chunk","id":"chatcmpl_tool","created":456,"model":"gpt-test","choices":[{"index":0,"delta":{"function_call":{"name":"look","arguments":"{\"q\":\"ru"}},"finish_reason":null},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"wea","arguments":"{\"city\":\"San"}}]},"finish_reason":null}]}
+
+"#,
+            r#"data: {"object":"chat.completion.chunk","id":"chatcmpl_tool","created":456,"model":"gpt-test","choices":[{"index":0,"delta":{"function_call":{"name":"up","arguments":"st\"}"}},"finish_reason":"function_call"},{"index":1,"delta":{"tool_calls":[{"index":0,"function":{"name":"ther","arguments":" Francisco\"}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+            "data: [DONE]\n\n",
+        );
+        let out = reconstruct_response_payload(payload);
+        let completion: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(
+            completion["choices"][0]["message"]["function_call"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            completion["choices"][0]["message"]["function_call"]["arguments"],
+            "{\"q\":\"rust\"}"
+        );
+        assert_eq!(
+            completion["choices"][1]["message"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            completion["choices"][1]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            completion["choices"][1]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"San Francisco\"}"
+        );
     }
 
     #[test]

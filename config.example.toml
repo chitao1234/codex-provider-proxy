@@ -51,7 +51,7 @@ max_body_log_bytes = 8192
 exchange_body_max_bytes = 0
 # Compression for exchange request/response body files: "none" or "zstd".
 exchange_body_compression = "none"
-# Best-effort reconstruction for URLs ending in `responses`.
+# Best-effort reconstruction for URLs ending in `responses` or `messages`, and `/chat/completions`.
 # This only affects file output and never alters proxy behavior.
 reconstruct_responses = true
 

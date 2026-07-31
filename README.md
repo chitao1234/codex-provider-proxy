@@ -167,11 +167,13 @@ streamed to the downstream client.
 Exchange body chunks are flushed after each write, so active body files grow during a streamed exchange. Metadata
 and compressed body frames are finalized when the exchange completes.
 
-When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`
+When `logging.reconstruct_responses = true`, requests whose URL path ends in `responses` or `messages`, or is
+`chat/completions`,
 additionally produce:
 - `<timestamp>_req_<id>.response_reconstructed.txt`
 
-Reconstruction is best-effort for OpenAI `v1/responses` SSE streams and Anthropic `v1/messages` SSE streams,
+Reconstruction is best-effort for OpenAI `v1/responses` and `v1/chat/completions` SSE streams and Anthropic
+`v1/messages` SSE streams,
 with plain-text error fallback. Before reconstructing, it decodes `gzip`, `deflate`, `br`, and `zstd` content
 codings from the upstream response. Exchange response-body files always retain the original wire bytes, so an
 upstream `zstd` response with `exchange_body_compression = "zstd"` has two distinct zstd layers. Any
