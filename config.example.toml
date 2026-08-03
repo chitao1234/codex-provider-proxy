@@ -46,6 +46,8 @@ default_provider = "provider_a"
 # - messages: `output_config.effort` (`thinking.type` is still recognized for older captured shapes)
 # - chat completions: `reasoning_effort` unless an existing `reasoning` object is present
 # Messages effort rewrites also ensure `anthropic-beta` contains an effort beta marker.
+# For Anthropic Messages, `to_model = "claude-sonnet-5[1m]"` keeps body model
+# `claude-sonnet-5` and ensures `anthropic-beta` contains a context-1m marker.
 #
 # [[rewrite.model_mappings]]
 # provider = "provider_a"

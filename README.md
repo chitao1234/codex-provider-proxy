@@ -161,6 +161,14 @@ captured real exchanges:
   shapes
 - Chat completions: `reasoning_effort`; if an existing `reasoning` object is present, that shape is preserved
 
+For Anthropic Messages requests only, a model name ending in `[1m]` is interpreted as Claude's 1M-context model
+variant. For example, `to_model = "claude-sonnet-5[1m]"` keeps JSON body `model = "claude-sonnet-5"` and ensures
+`anthropic-beta` contains a `context-1m` marker, matching the captured Claude Code request shape. Incoming Messages
+requests that already contain a `context-1m` beta marker have an effective model of `base-model[1m]` for matching;
+mapping that effective model to a non-`[1m]` target removes existing `context-1m` beta markers. A base `from_model`
+can still match as a fallback, with variant-specific mappings preferred among entries with the same provider and
+effort specificity. The `[1m]` suffix is not special-cased for Responses or Chat Completions requests.
+
 For Claude Code 2.1.137 with `--model sonnet`, `--effort low|medium|high|max` sends
 `output_config.effort = "low"|"medium"|"high"|"max"` and keeps `thinking.type = "adaptive"`. `--effort xhigh`
 is accepted by the CLI but sends `output_config.effort = "high"` for `claude-sonnet-4-6`. When a Messages effort

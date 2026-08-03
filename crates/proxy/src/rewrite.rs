@@ -16,7 +16,7 @@ pub struct RequestRewriteOutcome {
     pub body: Bytes,
     pub body_changed: bool,
     pub applied_model_mapping: Option<AppliedModelMapping>,
-    pub requires_anthropic_effort_beta: bool,
+    pub anthropic_beta_updates: Vec<AnthropicBetaUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,23 @@ pub struct AppliedModelMapping {
     pub from_reasoning_effort: Option<String>,
     pub to_model: String,
     pub to_reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicBetaUpdate {
+    Ensure(AnthropicBetaMarker),
+    RemoveByPrefix(AnthropicBetaPrefix),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicBetaMarker {
+    Effort,
+    Context1m,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicBetaPrefix {
+    Context1m,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +57,9 @@ enum SetFieldResult {
     Unchanged,
     Changed,
 }
+
+const CLAUDE_CONTEXT_1M_MODEL_SUFFIX: &str = "[1m]";
+const ANTHROPIC_CONTEXT_1M_BETA_PREFIX: &str = "context-1m";
 
 pub fn request_rewrites_may_apply(cfg: &Config, ctx: &RequestRewriteContext<'_>) -> bool {
     cfg.rewrite.is_enabled()
@@ -70,26 +90,42 @@ pub fn apply_request_rewrites(
     let Some(model) = top_level_string(&json, "model").map(str::to_owned) else {
         return passthrough(body);
     };
+    let current_model = current_model(endpoint, &model, ctx.headers);
     let reasoning_effort = current_reasoning_effort(&json);
     let Some(mapping) = select_model_mapping(
         &cfg.rewrite.model_mappings,
         ctx.provider_name,
         &model,
+        &current_model,
         reasoning_effort.as_deref(),
     ) else {
         return passthrough(body);
     };
 
     let mut body_changed = false;
-    body_changed |= set_top_level_string(&mut json, "model", &mapping.to_model);
-    let mut requires_anthropic_effort_beta = false;
+    let mut anthropic_beta_updates = Vec::new();
+    let target_model = target_body_model(endpoint, &mapping.to_model);
+    body_changed |= set_top_level_string(&mut json, "model", &target_model);
+    if endpoint == ModelEndpoint::Messages {
+        update_messages_context_1m_beta(
+            ctx.headers,
+            &current_model,
+            &mapping.to_model,
+            &mut anthropic_beta_updates,
+        );
+    }
     if let Some(to_reasoning_effort) = &mapping.to_reasoning_effort {
         body_changed |= set_reasoning_effort(&mut json, endpoint, to_reasoning_effort);
-        requires_anthropic_effort_beta = endpoint == ModelEndpoint::Messages;
+        if endpoint == ModelEndpoint::Messages {
+            push_unique_anthropic_beta_update(
+                &mut anthropic_beta_updates,
+                AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort),
+            );
+        }
     }
 
     let applied_model_mapping = Some(AppliedModelMapping {
-        from_model: model,
+        from_model: current_model,
         from_reasoning_effort: reasoning_effort,
         to_model: mapping.to_model.clone(),
         to_reasoning_effort: mapping.to_reasoning_effort.clone(),
@@ -100,7 +136,7 @@ pub fn apply_request_rewrites(
             body,
             body_changed,
             applied_model_mapping,
-            requires_anthropic_effort_beta,
+            anthropic_beta_updates,
         };
     }
 
@@ -109,13 +145,13 @@ pub fn apply_request_rewrites(
             body: Bytes::from(rewritten),
             body_changed,
             applied_model_mapping,
-            requires_anthropic_effort_beta,
+            anthropic_beta_updates,
         },
         Err(_) => RequestRewriteOutcome {
             body,
             body_changed: false,
             applied_model_mapping: None,
-            requires_anthropic_effort_beta: false,
+            anthropic_beta_updates: Vec::new(),
         },
     }
 }
@@ -125,7 +161,7 @@ fn passthrough(body: Bytes) -> RequestRewriteOutcome {
         body,
         body_changed: false,
         applied_model_mapping: None,
-        requires_anthropic_effort_beta: false,
+        anthropic_beta_updates: Vec::new(),
     }
 }
 
@@ -162,20 +198,28 @@ fn request_content_encoding_allows_json(headers: &HeaderMap) -> bool {
 fn select_model_mapping<'a>(
     mappings: &'a [ModelMapping],
     provider_name: &str,
-    model: &str,
+    body_model: &str,
+    current_model: &str,
     reasoning_effort: Option<&str>,
 ) -> Option<&'a ModelMapping> {
     let mut best = None;
-    let mut best_score = (false, false);
+    let mut best_score = (false, false, false);
 
     for mapping in mappings {
-        if !mapping_matches(mapping, provider_name, model, reasoning_effort) {
+        let Some(model_specific) = mapping_matches(
+            mapping,
+            provider_name,
+            body_model,
+            current_model,
+            reasoning_effort,
+        ) else {
             continue;
-        }
+        };
 
         let score = (
             mapping.provider.is_some(),
             mapping.from_reasoning_effort.is_some(),
+            model_specific,
         );
         if best.is_none() || score > best_score {
             best = Some(mapping);
@@ -189,27 +233,109 @@ fn select_model_mapping<'a>(
 fn mapping_matches(
     mapping: &ModelMapping,
     provider_name: &str,
-    model: &str,
+    body_model: &str,
+    current_model: &str,
     reasoning_effort: Option<&str>,
-) -> bool {
+) -> Option<bool> {
     if mapping
         .provider
         .as_deref()
         .is_some_and(|p| p != provider_name)
     {
-        return false;
+        return None;
     }
-    if mapping.from_model != model {
-        return false;
-    }
+    let model_specific = if mapping.from_model == current_model {
+        true
+    } else if current_model != body_model && mapping.from_model == body_model {
+        false
+    } else {
+        return None;
+    };
     match mapping.from_reasoning_effort.as_deref() {
-        Some(expected) => reasoning_effort == Some(expected),
-        None => true,
+        Some(expected) if reasoning_effort != Some(expected) => None,
+        _ => Some(model_specific),
     }
 }
 
 fn top_level_string<'a>(json: &'a Value, field: &str) -> Option<&'a str> {
     json.as_object()?.get(field)?.as_str()
+}
+
+fn current_model(endpoint: ModelEndpoint, body_model: &str, headers: &HeaderMap) -> String {
+    if endpoint != ModelEndpoint::Messages {
+        return body_model.to_string();
+    }
+    if split_context_1m_model(body_model).is_some() || !headers_have_context_1m_beta(headers) {
+        return body_model.to_string();
+    }
+    format!("{body_model}{CLAUDE_CONTEXT_1M_MODEL_SUFFIX}")
+}
+
+fn target_body_model(endpoint: ModelEndpoint, model: &str) -> String {
+    if endpoint == ModelEndpoint::Messages {
+        if let Some(base_model) = split_context_1m_model(model) {
+            return base_model.to_string();
+        }
+    }
+    model.to_string()
+}
+
+fn update_messages_context_1m_beta(
+    headers: &HeaderMap,
+    current_model: &str,
+    target_model: &str,
+    updates: &mut Vec<AnthropicBetaUpdate>,
+) {
+    if split_context_1m_model(target_model).is_some() {
+        push_unique_anthropic_beta_update(
+            updates,
+            AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Context1m),
+        );
+    } else if split_context_1m_model(current_model).is_some()
+        || headers_have_context_1m_beta(headers)
+    {
+        push_unique_anthropic_beta_update(
+            updates,
+            AnthropicBetaUpdate::RemoveByPrefix(AnthropicBetaPrefix::Context1m),
+        );
+    }
+}
+
+fn split_context_1m_model(model: &str) -> Option<&str> {
+    let base = model.strip_suffix(CLAUDE_CONTEXT_1M_MODEL_SUFFIX)?;
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+fn headers_have_context_1m_beta(headers: &HeaderMap) -> bool {
+    headers.get_all("anthropic-beta").iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(beta_token_is_context_1m)
+        })
+    })
+}
+
+fn beta_token_is_context_1m(beta: &str) -> bool {
+    beta.eq_ignore_ascii_case(ANTHROPIC_CONTEXT_1M_BETA_PREFIX)
+        || beta
+            .get(..ANTHROPIC_CONTEXT_1M_BETA_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ANTHROPIC_CONTEXT_1M_BETA_PREFIX))
+            && beta.as_bytes().get(ANTHROPIC_CONTEXT_1M_BETA_PREFIX.len()) == Some(&b'-')
+}
+
+fn push_unique_anthropic_beta_update(
+    updates: &mut Vec<AnthropicBetaUpdate>,
+    update: AnthropicBetaUpdate,
+) {
+    if !updates.contains(&update) {
+        updates.push(update);
+    }
 }
 
 fn current_reasoning_effort(json: &Value) -> Option<String> {
@@ -366,7 +492,10 @@ mod tests {
         BodyLogCompression, Config, LoggingConfig, ModelMapping, Provider, RewriteConfig,
     };
 
-    use super::{apply_request_rewrites, request_rewrites_may_apply, RequestRewriteContext};
+    use super::{
+        apply_request_rewrites, request_rewrites_may_apply, AnthropicBetaMarker,
+        AnthropicBetaPrefix, AnthropicBetaUpdate, RequestRewriteContext,
+    };
 
     fn test_config(model_mappings: Vec<ModelMapping>) -> Config {
         Config {
@@ -455,6 +584,7 @@ mod tests {
         assert!(!out.body_changed);
         assert_eq!(out.body, body);
         assert!(out.applied_model_mapping.is_none());
+        assert!(out.anthropic_beta_updates.is_empty());
     }
 
     #[test]
@@ -472,7 +602,7 @@ mod tests {
         assert_eq!(out.body, body);
         assert!(!out.body_changed);
         assert!(out.applied_model_mapping.is_none());
-        assert!(!out.requires_anthropic_effort_beta);
+        assert!(out.anthropic_beta_updates.is_empty());
     }
 
     #[test]
@@ -490,7 +620,7 @@ mod tests {
         assert_eq!(out.body, body);
         assert!(!out.body_changed);
         assert!(out.applied_model_mapping.is_none());
-        assert!(!out.requires_anthropic_effort_beta);
+        assert!(out.anthropic_beta_updates.is_empty());
     }
 
     #[test]
@@ -521,7 +651,10 @@ mod tests {
         let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
 
         assert!(out.body_changed);
-        assert!(out.requires_anthropic_effort_beta);
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)]
+        );
         assert_eq!(rewritten["model"], "claude-opus-4-7");
         assert_eq!(rewritten["output_config"]["effort"], "max");
     }
@@ -553,7 +686,7 @@ mod tests {
         let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
 
         assert!(out.body_changed);
-        assert!(!out.requires_anthropic_effort_beta);
+        assert!(out.anthropic_beta_updates.is_empty());
         assert_eq!(rewritten["model"], "grok-4.5");
         assert_eq!(rewritten["reasoning"]["effort"], "high");
         assert_eq!(rewritten["reasoning"]["summary"], "auto");
@@ -587,7 +720,10 @@ mod tests {
         let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
 
         assert!(out.body_changed);
-        assert!(out.requires_anthropic_effort_beta);
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)]
+        );
         assert_eq!(rewritten["model"], "claude-opus-4-7");
         assert_eq!(rewritten["thinking"]["type"], "adaptive");
         assert_eq!(rewritten["output_config"]["effort"], "max");
@@ -620,9 +756,134 @@ mod tests {
         let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
 
         assert!(out.body_changed);
-        assert!(out.requires_anthropic_effort_beta);
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)]
+        );
         assert_eq!(rewritten["model"], "claude-sonnet-5");
         assert_eq!(rewritten["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn rewrites_messages_model_to_claude_context_1m_header_variant() {
+        let cfg = test_config(vec![mapping(
+            "claude-sonnet-5",
+            None,
+            "claude-sonnet-5[1m]",
+            None,
+        )]);
+        let headers = HeaderMap::new();
+        let body = Bytes::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "xhigh"},
+                "max_tokens": 32000,
+                "messages": []
+            })
+            .to_string(),
+        );
+
+        let out = apply_request_rewrites(
+            &cfg,
+            &ctx(&Method::POST, "/v1/messages", "provider_a", &headers),
+            body.clone(),
+        );
+
+        assert!(!out.body_changed);
+        assert_eq!(out.body, body);
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Context1m)]
+        );
+        let applied = out.applied_model_mapping.unwrap();
+        assert_eq!(applied.from_model, "claude-sonnet-5");
+        assert_eq!(applied.to_model, "claude-sonnet-5[1m]");
+    }
+
+    #[test]
+    fn rewrites_messages_model_from_claude_context_1m_header_variant() {
+        let cfg = test_config(vec![mapping(
+            "claude-sonnet-5[1m]",
+            None,
+            "claude-sonnet-5",
+            None,
+        )]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "claude-code-20250219,context-1m-2025-08-07,effort-2025-11-24"
+                .parse()
+                .unwrap(),
+        );
+        let body = Bytes::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "xhigh"},
+                "max_tokens": 32000,
+                "messages": []
+            })
+            .to_string(),
+        );
+
+        let out = apply_request_rewrites(
+            &cfg,
+            &ctx(&Method::POST, "/v1/messages", "provider_a", &headers),
+            body.clone(),
+        );
+
+        assert!(!out.body_changed);
+        assert_eq!(out.body, body);
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::RemoveByPrefix(
+                AnthropicBetaPrefix::Context1m
+            )]
+        );
+        let applied = out.applied_model_mapping.unwrap();
+        assert_eq!(applied.from_model, "claude-sonnet-5[1m]");
+        assert_eq!(applied.to_model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn messages_context_1m_model_mapping_beats_base_model_mapping_at_same_specificity() {
+        let cfg = test_config(vec![
+            mapping("claude-sonnet-5", None, "base-target", None),
+            mapping("claude-sonnet-5[1m]", None, "variant-target", None),
+        ]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "claude-code-20250219,context-1m-2025-08-07"
+                .parse()
+                .unwrap(),
+        );
+        let body = Bytes::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": []
+            })
+            .to_string(),
+        );
+
+        let out = apply_request_rewrites(
+            &cfg,
+            &ctx(&Method::POST, "/v1/messages", "provider_a", &headers),
+            body,
+        );
+        let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+
+        assert_eq!(rewritten["model"], "variant-target");
+        assert_eq!(
+            out.anthropic_beta_updates,
+            vec![AnthropicBetaUpdate::RemoveByPrefix(
+                AnthropicBetaPrefix::Context1m
+            )]
+        );
+        let applied = out.applied_model_mapping.unwrap();
+        assert_eq!(applied.from_model, "claude-sonnet-5[1m]");
+        assert_eq!(applied.to_model, "variant-target");
     }
 
     #[test]

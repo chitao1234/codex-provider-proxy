@@ -30,13 +30,19 @@ use crate::{
         SharedExchangeFileLogger,
     },
     log_capture::{Capture, CaptureConfig, CaptureSummary, SharedCapture},
-    rewrite::{apply_request_rewrites, request_rewrites_may_apply, RequestRewriteContext},
+    rewrite::{
+        apply_request_rewrites, request_rewrites_may_apply, AnthropicBetaMarker,
+        AnthropicBetaPrefix, AnthropicBetaUpdate, RequestRewriteContext,
+    },
     runtime::RuntimeState,
 };
 
 const MAX_ANCESTOR_PID_DEPTH: usize = 64;
 const ANTHROPIC_BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
 const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
+const ANTHROPIC_EFFORT_BETA_PREFIX: &str = "effort";
+const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+const ANTHROPIC_CONTEXT_1M_BETA_PREFIX: &str = "context-1m";
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -1036,9 +1042,7 @@ fn rewrite_request_body_for_attempt(
         if out.body_changed {
             attempt.headers.remove(header::CONTENT_LENGTH);
         }
-        if out.requires_anthropic_effort_beta {
-            ensure_anthropic_effort_beta(&mut attempt.headers);
-        }
+        apply_anthropic_beta_updates(&mut attempt.headers, &out.anthropic_beta_updates);
         info!(
             request_id,
             attempt = attempt_number,
@@ -1057,13 +1061,40 @@ fn rewrite_request_body_for_attempt(
     out.body
 }
 
-fn ensure_anthropic_effort_beta(headers: &mut HeaderMap) {
+fn apply_anthropic_beta_updates(headers: &mut HeaderMap, updates: &[AnthropicBetaUpdate]) {
+    for update in updates {
+        match *update {
+            AnthropicBetaUpdate::Ensure(marker) => {
+                ensure_anthropic_beta(headers, marker);
+            }
+            AnthropicBetaUpdate::RemoveByPrefix(prefix) => {
+                remove_anthropic_beta_by_prefix(headers, anthropic_beta_prefix_value(prefix));
+            }
+        }
+    }
+}
+
+fn anthropic_beta_marker_value(marker: AnthropicBetaMarker) -> &'static str {
+    match marker {
+        AnthropicBetaMarker::Effort => ANTHROPIC_EFFORT_BETA,
+        AnthropicBetaMarker::Context1m => ANTHROPIC_CONTEXT_1M_BETA,
+    }
+}
+
+fn anthropic_beta_prefix_value(prefix: AnthropicBetaPrefix) -> &'static str {
+    match prefix {
+        AnthropicBetaPrefix::Context1m => ANTHROPIC_CONTEXT_1M_BETA_PREFIX,
+    }
+}
+
+fn ensure_anthropic_beta(headers: &mut HeaderMap, marker: AnthropicBetaMarker) {
+    let marker_value = anthropic_beta_marker_value(marker);
     if headers.get_all(&ANTHROPIC_BETA_HEADER).iter().any(|value| {
         value.to_str().ok().is_some_and(|value| {
             value
                 .split(',')
                 .map(str::trim)
-                .any(|beta| beta.eq_ignore_ascii_case(ANTHROPIC_EFFORT_BETA))
+                .any(|beta| anthropic_beta_marker_matches(marker, beta))
         })
     }) {
         return;
@@ -1077,19 +1108,68 @@ fn ensure_anthropic_effort_beta(headers: &mut HeaderMap) {
     else {
         headers.insert(
             ANTHROPIC_BETA_HEADER,
-            HeaderValue::from_static(ANTHROPIC_EFFORT_BETA),
+            HeaderValue::from_static(marker_value),
         );
         return;
     };
 
-    if let Ok(value) = HeaderValue::from_str(&format!("{existing},{ANTHROPIC_EFFORT_BETA}")) {
+    if let Ok(value) = HeaderValue::from_str(&format!("{existing},{marker_value}")) {
         headers.insert(ANTHROPIC_BETA_HEADER, value);
     } else {
         headers.append(
             ANTHROPIC_BETA_HEADER,
-            HeaderValue::from_static(ANTHROPIC_EFFORT_BETA),
+            HeaderValue::from_static(marker_value),
         );
     }
+}
+
+fn anthropic_beta_marker_matches(marker: AnthropicBetaMarker, beta: &str) -> bool {
+    match marker {
+        AnthropicBetaMarker::Effort => {
+            beta_token_matches_prefix(beta, ANTHROPIC_EFFORT_BETA_PREFIX)
+        }
+        AnthropicBetaMarker::Context1m => {
+            beta_token_matches_prefix(beta, ANTHROPIC_CONTEXT_1M_BETA_PREFIX)
+        }
+    }
+}
+
+fn remove_anthropic_beta_by_prefix(headers: &mut HeaderMap, prefix: &str) {
+    let values = headers
+        .get_all(&ANTHROPIC_BETA_HEADER)
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(values) = values else {
+        return;
+    };
+
+    let remaining = values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|beta| !beta.is_empty())
+        .filter(|beta| !beta_token_matches_prefix(beta, prefix))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    headers.remove(&ANTHROPIC_BETA_HEADER);
+    if remaining.is_empty() {
+        return;
+    }
+
+    let value = remaining.join(",");
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(ANTHROPIC_BETA_HEADER, value);
+    }
+}
+
+fn beta_token_matches_prefix(beta: &str, prefix: &str) -> bool {
+    beta.eq_ignore_ascii_case(prefix)
+        || beta
+            .get(..prefix.len())
+            .is_some_and(|token_prefix| token_prefix.eq_ignore_ascii_case(prefix))
+            && beta.as_bytes().get(prefix.len()) == Some(&b'-')
 }
 
 async fn body_from_bytes_for_logging(
@@ -2120,11 +2200,12 @@ mod tests {
         config::{
             BodyLogCompression, Config, LoggingConfig, ModelMapping, Provider, RewriteConfig,
         },
+        rewrite::{AnthropicBetaMarker, AnthropicBetaPrefix, AnthropicBetaUpdate},
         runtime::RuntimeState,
     };
 
     use super::{
-        downstream_response_status, ensure_anthropic_effort_beta, error_log_details,
+        apply_anthropic_beta_updates, downstream_response_status, error_log_details,
         format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
         linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
         path_is_messages_count_tokens, resolve_upstream_attempt, responses_slow_down_error_code,
@@ -2134,9 +2215,12 @@ mod tests {
     };
 
     #[test]
-    fn ensure_anthropic_effort_beta_adds_and_deduplicates_header() {
+    fn apply_anthropic_beta_updates_adds_deduplicates_and_removes_by_prefix() {
         let mut headers = HeaderMap::new();
-        ensure_anthropic_effort_beta(&mut headers);
+        apply_anthropic_beta_updates(
+            &mut headers,
+            &[AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)],
+        );
         assert!(headers
             .get(ANTHROPIC_BETA_HEADER)
             .unwrap()
@@ -2148,7 +2232,10 @@ mod tests {
             ANTHROPIC_BETA_HEADER,
             "claude-code-20250219".parse().unwrap(),
         );
-        ensure_anthropic_effort_beta(&mut headers);
+        apply_anthropic_beta_updates(
+            &mut headers,
+            &[AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)],
+        );
         let beta = headers
             .get(ANTHROPIC_BETA_HEADER)
             .unwrap()
@@ -2157,7 +2244,36 @@ mod tests {
         assert!(beta.contains("claude-code-20250219"));
         assert!(beta.contains("effort"));
 
-        ensure_anthropic_effort_beta(&mut headers);
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            "claude-code-20250219,context-1m-2099-01-01"
+                .parse()
+                .unwrap(),
+        );
+        apply_anthropic_beta_updates(
+            &mut headers,
+            &[AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Context1m)],
+        );
+        let beta = headers
+            .get(ANTHROPIC_BETA_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            beta.split(',')
+                .map(str::trim)
+                .filter(|token| token.starts_with("context-1m"))
+                .count(),
+            1
+        );
+
+        apply_anthropic_beta_updates(
+            &mut headers,
+            &[
+                AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort),
+                AnthropicBetaUpdate::RemoveByPrefix(AnthropicBetaPrefix::Context1m),
+            ],
+        );
         let beta = headers
             .get(ANTHROPIC_BETA_HEADER)
             .unwrap()
@@ -2165,6 +2281,7 @@ mod tests {
             .unwrap();
         assert!(beta.contains("claude-code-20250219"));
         assert!(beta.contains("effort"));
+        assert!(!beta.contains("context-1m"));
     }
 
     #[derive(Debug)]
@@ -2730,6 +2847,63 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .expect("rewritten request has content-length");
         assert_eq!(content_length, captured_bodies[0].len());
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn rewrites_messages_model_mapping_to_context_1m_header_variant() {
+        let (url, bodies, headers, shutdown_tx) = spawn_body_capture_server("/messages").await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        cfg.rewrite.model_mappings.push(ModelMapping {
+            provider: Some("provider_a".to_string()),
+            from_model: "claude-sonnet-5".to_string(),
+            from_reasoning_effort: None,
+            to_model: "claude-sonnet-5[1m]".to_string(),
+            to_reasoning_effort: None,
+        });
+        let state = test_proxy_state(cfg);
+        let original_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"},"max_tokens":32000,"messages":[]}"#,
+        );
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages?beta=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(ANTHROPIC_BETA_HEADER, "claude-code-20250219")
+            .header(header::CONTENT_LENGTH, original_body.len())
+            .body(Body::from(original_body))
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured_bodies = bodies.lock().unwrap();
+        assert_eq!(captured_bodies.len(), 1);
+        let captured: serde_json::Value = serde_json::from_slice(&captured_bodies[0]).unwrap();
+        assert_eq!(captured["model"], "claude-sonnet-5");
+
+        let captured_headers = headers.lock().unwrap();
+        let beta = captured_headers[0]
+            .get(ANTHROPIC_BETA_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("rewritten request has anthropic-beta");
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta
+            .split(',')
+            .map(str::trim)
+            .any(|token| token.starts_with("context-1m")));
         let _ = shutdown_tx.send(());
     }
 
