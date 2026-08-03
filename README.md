@@ -24,8 +24,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
 addresses, `rpc_listen_addr`, `rpc_token`, `upstream_connect_timeout_secs`, `upstream_idle_timeout_secs`,
 `drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
-`transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, and all `[logging]` options takes effect
-without restarting the process.
+`transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, `rewrite.model_mappings`, and all
+`[logging]` options takes effect without restarting the process.
 
 To print an example config:
 
@@ -80,6 +80,8 @@ the child, then transfers routing to the child PID.
 - The proxy rewrites:
   - Destination URL to `provider.base_url + (incoming_path_minus_listen_base_path) + incoming_query`
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
+- If `[[rewrite.model_mappings]]` entries are configured, eligible JSON request bodies are rewritten before
+  forwarding. With no mappings configured, request bodies use the existing streaming passthrough path.
 - If `reject_messages_count_tokens = true` (the default), requests whose routed path is `/messages/count_tokens`
   or ends with that path segment suffix return a local `404` and are not forwarded upstream. Query strings such
   as `?beta=true` do not bypass this check.
@@ -101,8 +103,9 @@ the child, then transfers routing to the child PID.
   retries enabled, each timeout consumes one attempt and then the proxy continues to the next retry.
 - `HEAD` requests are excluded from transparent retries by default, even when `transparent_retry_count > 0`. Set
   `transparent_retry_head_requests = true` to opt in.
-- Each transparent retry re-resolves the current provider/default route before sending, so PID route changes,
-  default-provider changes, and provider config reloads can affect later attempts within the same proxied request.
+- Each transparent retry re-resolves the current provider/default route before sending and reapplies request
+  rewrites, so PID route changes, default-provider changes, provider config reloads, and rewrite config reloads can
+  affect later attempts within the same proxied request.
 - `transparent_retry_backoff_step_ms` adds linear delay between those retries. A value of `250` waits 250 ms before
   retry 2, 500 ms before retry 3, 750 ms before retry 4, and so on.
 - PID routing lookup checks the client PID first; if no route exists it walks up the process tree
@@ -127,6 +130,46 @@ listen_addrs = ["127.0.0.1:8080", "127.0.0.1:8082"]
 
 Editing that list while the proxy is running adds new listeners and gracefully shuts down listeners that were
 removed from the config.
+
+## Request Rewrites
+
+The request rewrite layer is generic internally, but the only user-visible rewrite feature today is model mapping.
+It is disabled unless `[[rewrite.model_mappings]]` contains at least one entry:
+
+```toml
+[[rewrite.model_mappings]]
+provider = "provider_a"              # optional
+from_model = "gpt-5.5"
+from_reasoning_effort = "xhigh"      # optional
+to_model = "grok-4.5"
+to_reasoning_effort = "high"         # optional; omit to preserve the current effort field
+```
+
+Model matching is exact. `provider` limits a mapping to one configured provider. `from_reasoning_effort` limits a
+mapping to requests whose current effort value matches. If several entries match a request, the most specific
+mapping wins: provider-specific beats global, and effort-specific beats model-only. Ties keep config order.
+
+Model mappings apply to JSON `POST` request bodies whose routed path ends with one of these API shapes:
+- `responses`
+- `messages`
+- `chat/completions`
+
+The mapper rewrites top-level `model`. For effort matching and rewriting, it recognizes the request shapes seen in
+captured real exchanges:
+- OpenAI-style responses: `reasoning.effort`
+- Claude Code / Anthropic messages: `output_config.effort`; `thinking.type` is still recognized for older captured
+  shapes
+- Chat completions: `reasoning_effort`; if an existing `reasoning` object is present, that shape is preserved
+
+For Claude Code 2.1.137 with `--model sonnet`, `--effort low|medium|high|max` sends
+`output_config.effort = "low"|"medium"|"high"|"max"` and keeps `thinking.type = "adaptive"`. `--effort xhigh`
+is accepted by the CLI but sends `output_config.effort = "high"` for `claude-sonnet-4-6`. When a Messages effort
+rewrite is applied, the proxy also ensures `anthropic-beta` contains an effort beta marker, matching the captured
+Claude Code request header shape without depending on a specific dated beta value.
+
+Compressed request bodies are not rewritten unless their `Content-Encoding` is absent or `identity`. When a rewrite
+changes the JSON body, the proxy removes the downstream `Content-Length` header before forwarding so the upstream
+client can send the correct length for the rewritten body.
 
 ## Runtime Logging
 

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode},
     Router,
 };
 use bytes::{Bytes, BytesMut};
@@ -30,10 +30,13 @@ use crate::{
         SharedExchangeFileLogger,
     },
     log_capture::{Capture, CaptureConfig, CaptureSummary, SharedCapture},
+    rewrite::{apply_request_rewrites, request_rewrites_may_apply, RequestRewriteContext},
     runtime::RuntimeState,
 };
 
 const MAX_ANCESTOR_PID_DEPTH: usize = 64;
+const ANTHROPIC_BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
+const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -101,6 +104,11 @@ struct UpstreamSendRequest {
     base_headers: HeaderMap,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+}
+
+enum SingleAttemptRequestBody {
+    Stream(Body),
+    Buffered(Bytes),
 }
 
 struct AttemptResponseLog<'a> {
@@ -551,8 +559,42 @@ async fn send_upstream_request(
         exchange_logger,
     } = request;
     if !transparent_retries_enabled(cfg, &method) {
+        let mut initial_attempt = initial_attempt;
+        let request_body = if request_rewrites_may_apply(
+            cfg,
+            &RequestRewriteContext {
+                method: &method,
+                forwarded_path: &forwarded_path,
+                provider_name: &initial_attempt.provider_name,
+                headers: &initial_attempt.headers,
+            },
+        ) {
+            SingleAttemptRequestBody::Buffered(buffer_request_body_unlogged(body).await?)
+        } else {
+            SingleAttemptRequestBody::Stream(body)
+        };
         let attempt_started = Instant::now();
-        let upload_activity = cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()));
+        let upload_activity = match &request_body {
+            SingleAttemptRequestBody::Stream(_) => {
+                cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()))
+            }
+            SingleAttemptRequestBody::Buffered(_) => None,
+        };
+        let request_body = match request_body {
+            SingleAttemptRequestBody::Stream(body) => SingleAttemptRequestBody::Stream(body),
+            SingleAttemptRequestBody::Buffered(request_body) => {
+                let request_body = rewrite_request_body_for_attempt(
+                    cfg,
+                    &method,
+                    &forwarded_path,
+                    &mut initial_attempt,
+                    request_body,
+                    request_id,
+                    1,
+                );
+                SingleAttemptRequestBody::Buffered(request_body)
+            }
+        };
         begin_exchange_log_attempt(
             exchange_logger.clone(),
             request_id,
@@ -562,13 +604,19 @@ async fn send_upstream_request(
             None,
         )
         .await;
-        let (req_body, req_body_capture) = maybe_wrap_request_body_for_logging(
-            cfg,
-            body,
-            exchange_logger.clone(),
-            upload_activity.clone(),
-            request_id,
-        );
+        let (req_body, req_body_capture) = match request_body {
+            SingleAttemptRequestBody::Stream(body) => maybe_wrap_request_body_for_logging(
+                cfg,
+                body,
+                exchange_logger.clone(),
+                upload_activity.clone(),
+                request_id,
+            ),
+            SingleAttemptRequestBody::Buffered(request_body) => {
+                body_from_bytes_for_logging(cfg, request_body, exchange_logger.clone(), request_id)
+                    .await
+            }
+        };
         let out = state
             .runtime
             .http_client()
@@ -964,6 +1012,120 @@ fn response_body_for_log(
         .map(|body| String::from_utf8_lossy(&body).into_owned())
 }
 
+fn rewrite_request_body_for_attempt(
+    cfg: &crate::config::Config,
+    method: &http::Method,
+    forwarded_path: &str,
+    attempt: &mut PreparedUpstreamAttempt,
+    request_body: Bytes,
+    request_id: u64,
+    attempt_number: u32,
+) -> Bytes {
+    let out = apply_request_rewrites(
+        cfg,
+        &RequestRewriteContext {
+            method,
+            forwarded_path,
+            provider_name: &attempt.provider_name,
+            headers: &attempt.headers,
+        },
+        request_body,
+    );
+
+    if let Some(mapping) = out.applied_model_mapping {
+        if out.body_changed {
+            attempt.headers.remove(header::CONTENT_LENGTH);
+        }
+        if out.requires_anthropic_effort_beta {
+            ensure_anthropic_effort_beta(&mut attempt.headers);
+        }
+        info!(
+            request_id,
+            attempt = attempt_number,
+            route_pid = ?attempt.route_pid,
+            provider = %attempt.provider_name,
+            upstream_url = %attempt.url,
+            from_model = %mapping.from_model,
+            from_reasoning_effort = ?mapping.from_reasoning_effort,
+            to_model = %mapping.to_model,
+            to_reasoning_effort = ?mapping.to_reasoning_effort,
+            body_changed = out.body_changed,
+            "request rewrite model mapping applied"
+        );
+    }
+
+    out.body
+}
+
+fn ensure_anthropic_effort_beta(headers: &mut HeaderMap) {
+    if headers.get_all(&ANTHROPIC_BETA_HEADER).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|beta| beta.eq_ignore_ascii_case(ANTHROPIC_EFFORT_BETA))
+        })
+    }) {
+        return;
+    }
+
+    let Some(existing) = headers
+        .get(&ANTHROPIC_BETA_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static(ANTHROPIC_EFFORT_BETA),
+        );
+        return;
+    };
+
+    if let Ok(value) = HeaderValue::from_str(&format!("{existing},{ANTHROPIC_EFFORT_BETA}")) {
+        headers.insert(ANTHROPIC_BETA_HEADER, value);
+    } else {
+        headers.append(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static(ANTHROPIC_EFFORT_BETA),
+        );
+    }
+}
+
+async fn body_from_bytes_for_logging(
+    cfg: &crate::config::Config,
+    request_body: Bytes,
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    request_id: u64,
+) -> (reqwest::Body, Option<SharedCapture>) {
+    let cap = if cfg.logging.log_bodies {
+        Some(Arc::new(std::sync::Mutex::new(Capture::new(
+            CaptureConfig {
+                max_bytes: cfg.logging.max_body_log_bytes,
+            },
+        ))))
+    } else {
+        None
+    };
+    if let Some(cap) = &cap {
+        if let Ok(mut c) = cap.lock() {
+            c.push_chunk(&request_body);
+        }
+    }
+    with_exchange_logger_blocking(
+        exchange_logger,
+        request_id,
+        "append buffered request body",
+        {
+            let request_body = request_body.clone();
+            move |logger| logger.on_request_body_chunk(&request_body)
+        },
+    )
+    .await;
+
+    (reqwest::Body::from(request_body), cap)
+}
+
 fn maybe_wrap_request_body_for_logging(
     cfg: &crate::config::Config,
     body: Body,
@@ -1017,6 +1179,17 @@ fn maybe_wrap_request_body_for_logging(
         Box::pin(stream)
     };
     (reqwest::Body::wrap_stream(stream), cap)
+}
+
+async fn buffer_request_body_unlogged(body: Body) -> std::result::Result<Bytes, std::io::Error> {
+    let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
+    let mut buffered = BytesMut::new();
+
+    while let Some(chunk) = stream.try_next().await? {
+        buffered.extend_from_slice(&chunk);
+    }
+
+    Ok(buffered.freeze())
 }
 
 async fn buffer_request_body_for_retry(
@@ -1595,10 +1768,10 @@ where
     Fut: Future<Output = ()>,
 {
     for attempt in 0..=args.transparent_retry_count {
-        let current_attempt = if attempt == 0 {
+        let cfg = args.state.runtime.config().await;
+        let mut current_attempt = if attempt == 0 {
             args.initial_attempt.clone()
         } else {
-            let cfg = args.state.runtime.config().await;
             resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
                 state: &args.state,
                 cfg: &cfg,
@@ -1621,13 +1794,22 @@ where
 
         let attempt_started = Instant::now();
         let attempt_number = attempt.saturating_add(1);
+        let request_body = rewrite_request_body_for_attempt(
+            &cfg,
+            &args.request.method,
+            &args.request.forwarded_path,
+            &mut current_attempt,
+            args.request.request_body.clone(),
+            args.request_id,
+            attempt_number,
+        );
         begin_exchange_log_attempt(
             args.exchange_logger.clone(),
             args.request_id,
             attempt_number,
             &current_attempt,
             &args.request.method,
-            Some(args.request.request_body.clone()),
+            Some(request_body.clone()),
         )
         .await;
         let out = args
@@ -1636,7 +1818,7 @@ where
             .http_client()
             .request(args.request.method.clone(), current_attempt.url.clone())
             .headers(current_attempt.headers.clone())
-            .body(args.request.request_body.clone());
+            .body(request_body);
         let resp =
             send_with_optional_idle_timeout(args.request_id, args.idle_timeout, None, out.send())
                 .await;
@@ -1935,19 +2117,55 @@ mod tests {
     use url::Url;
 
     use crate::{
-        config::{BodyLogCompression, Config, LoggingConfig, Provider},
+        config::{
+            BodyLogCompression, Config, LoggingConfig, ModelMapping, Provider, RewriteConfig,
+        },
         runtime::RuntimeState,
     };
 
     use super::{
-        downstream_response_status, error_log_details, format_error_chain, handle_proxy_inner,
-        is_text_event_stream, join_paths, linear_retry_backoff_delay,
-        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
-        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
-        send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
-        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
-        RetrySendArgs,
+        downstream_response_status, ensure_anthropic_effort_beta, error_log_details,
+        format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
+        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
+        path_is_messages_count_tokens, resolve_upstream_attempt, responses_slow_down_error_code,
+        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep,
+        should_drop_responses_slow_down_errors, strip_listen_base_path, ProxyState,
+        ResolveUpstreamAttemptArgs, RetryRequestTemplate, RetrySendArgs, ANTHROPIC_BETA_HEADER,
     };
+
+    #[test]
+    fn ensure_anthropic_effort_beta_adds_and_deduplicates_header() {
+        let mut headers = HeaderMap::new();
+        ensure_anthropic_effort_beta(&mut headers);
+        assert!(headers
+            .get(ANTHROPIC_BETA_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("effort"));
+
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            "claude-code-20250219".parse().unwrap(),
+        );
+        ensure_anthropic_effort_beta(&mut headers);
+        let beta = headers
+            .get(ANTHROPIC_BETA_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("effort"));
+
+        ensure_anthropic_effort_beta(&mut headers);
+        let beta = headers
+            .get(ANTHROPIC_BETA_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("effort"));
+    }
 
     #[derive(Debug)]
     struct ChainedTestError {
@@ -2235,6 +2453,61 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct BodyCaptureServerState {
+        bodies: Arc<Mutex<Vec<Bytes>>>,
+        headers: Arc<Mutex<Vec<HeaderMap>>>,
+    }
+
+    async fn body_capture_server_handler(
+        State(state): State<BodyCaptureServerState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        state.headers.lock().unwrap().push(headers);
+        state.bodies.lock().unwrap().push(body);
+        (StatusCode::OK, "ok")
+    }
+
+    async fn spawn_body_capture_server(
+        path: &'static str,
+    ) -> (
+        Url,
+        Arc<Mutex<Vec<Bytes>>>,
+        Arc<Mutex<Vec<HeaderMap>>>,
+        oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let state = BodyCaptureServerState {
+            bodies: bodies.clone(),
+            headers: headers.clone(),
+        };
+        let app = Router::new()
+            .route(path, any(body_capture_server_handler))
+            .with_state(state);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (
+            Url::parse(&format!("http://{addr}/")).unwrap(),
+            bodies,
+            headers,
+            shutdown_tx,
+        )
+    }
+
     async fn compressed_response_handler() -> Response<Body> {
         let payload = br#"{"error":{"message":"decoded upstream response"},"type":"error"}"#;
         let compressed = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
@@ -2310,6 +2583,7 @@ mod tests {
             transparent_retry_backoff_step: Duration::ZERO,
             default_provider: default_provider.to_string(),
             providers,
+            rewrite: RewriteConfig::default(),
             logging: test_logging_config(),
         }
     }
@@ -2401,6 +2675,101 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].path(), "/messages/count_tokens");
         assert_eq!(captured[0].query(), Some("beta=true"));
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn rewrites_model_mapping_before_forwarding_request_body() {
+        let (url, bodies, headers, shutdown_tx) = spawn_body_capture_server("/responses").await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        cfg.rewrite.model_mappings.push(ModelMapping {
+            provider: Some("provider_a".to_string()),
+            from_model: "gpt-5.5".to_string(),
+            from_reasoning_effort: Some("xhigh".to_string()),
+            to_model: "grok-4.20-non-reasoning".to_string(),
+            to_reasoning_effort: Some("high".to_string()),
+        });
+        let state = test_proxy_state(cfg);
+        let original_body = Bytes::from_static(
+            br#"{"model":"gpt-5.5","reasoning":{"effort":"xhigh","summary":"auto"},"stream":true,"input":[]}"#,
+        );
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, original_body.len())
+            .body(Body::from(original_body))
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured_bodies = bodies.lock().unwrap();
+        assert_eq!(captured_bodies.len(), 1);
+        let captured: serde_json::Value = serde_json::from_slice(&captured_bodies[0]).unwrap();
+        assert_eq!(captured["model"], "grok-4.20-non-reasoning");
+        assert_eq!(captured["reasoning"]["effort"], "high");
+        assert_eq!(captured["reasoning"]["summary"], "auto");
+
+        let captured_headers = headers.lock().unwrap();
+        let content_length = captured_headers[0]
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("rewritten request has content-length");
+        assert_eq!(content_length, captured_bodies[0].len());
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_rewrite_candidate_is_forwarded_unchanged() {
+        let (url, bodies, _headers, shutdown_tx) = spawn_body_capture_server("/responses").await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                base_url: url,
+                api_key: "token-a".to_string(),
+                authorization_header: None,
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        cfg.rewrite.model_mappings.push(ModelMapping {
+            provider: Some("provider_a".to_string()),
+            from_model: "gpt-5.5".to_string(),
+            from_reasoning_effort: None,
+            to_model: "grok-4.20-non-reasoning".to_string(),
+            to_reasoning_effort: Some("high".to_string()),
+        });
+        let state = test_proxy_state(cfg);
+        let original_body = Bytes::from_static(br#"{"model":"gpt-5.5""#);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(original_body.clone()))
+            .unwrap();
+        let resp = handle_proxy_inner(state, "127.0.0.1:50022".parse().unwrap(), req)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let captured_bodies = bodies.lock().unwrap();
+        assert_eq!(captured_bodies.as_slice(), &[original_body]);
         let _ = shutdown_tx.send(());
     }
 

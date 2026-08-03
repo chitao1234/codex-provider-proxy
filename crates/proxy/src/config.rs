@@ -21,6 +21,7 @@ pub struct Config {
     pub transparent_retry_backoff_step: Duration,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
+    pub rewrite: RewriteConfig,
     pub logging: LoggingConfig,
 }
 
@@ -52,6 +53,26 @@ pub struct LoggingConfig {
     pub reconstruct_responses: bool,
     pub level: String,
     pub rule: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RewriteConfig {
+    pub model_mappings: Vec<ModelMapping>,
+}
+
+impl RewriteConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.model_mappings.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelMapping {
+    pub provider: Option<String>,
+    pub from_model: String,
+    pub from_reasoning_effort: Option<String>,
+    pub to_model: String,
+    pub to_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -117,6 +138,8 @@ struct ConfigFile {
     transparent_retry_backoff_step_ms: u64,
     default_provider: String,
     #[serde(default)]
+    rewrite: RewriteFile,
+    #[serde(default)]
     logging: LoggingFile,
     providers: HashMap<String, ProviderFile>,
 }
@@ -143,6 +166,24 @@ struct LoggingFile {
     level: String,
     #[serde(default)]
     rule: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RewriteFile {
+    #[serde(default)]
+    model_mappings: Vec<ModelMappingFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelMappingFile {
+    #[serde(default)]
+    provider: Option<String>,
+    from_model: String,
+    #[serde(default)]
+    from_reasoning_effort: Option<String>,
+    to_model: String,
+    #[serde(default)]
+    to_reasoning_effort: Option<String>,
 }
 
 fn default_max_body_log_bytes() -> usize {
@@ -239,6 +280,20 @@ fn normalize_listen_addrs(
     Ok(out)
 }
 
+fn required_non_empty_string(field: &str, value: String) -> Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(anyhow!("{field} cannot be empty"));
+    }
+    Ok(value)
+}
+
+fn optional_non_empty_string(field: &str, value: Option<String>) -> Result<Option<String>> {
+    value
+        .map(|value| required_non_empty_string(field, value).map(Some))
+        .unwrap_or(Ok(None))
+}
+
 #[derive(Debug, Deserialize)]
 struct ProviderFile {
     base_url: Url,
@@ -281,6 +336,7 @@ impl Config {
                 file.default_provider
             ));
         }
+        let rewrite = normalize_rewrite_config(file.rewrite, &providers)?;
 
         let exchange_log_dir = match file.logging.exchange_log_dir {
             Some(path) if path.trim().is_empty() => {
@@ -311,6 +367,7 @@ impl Config {
             ),
             default_provider: file.default_provider,
             providers,
+            rewrite,
             logging: LoggingConfig {
                 log_requests: file.logging.log_requests,
                 log_responses: file.logging.log_responses,
@@ -325,6 +382,48 @@ impl Config {
             },
         })
     }
+}
+
+fn normalize_rewrite_config(
+    rewrite: RewriteFile,
+    providers: &HashMap<String, Provider>,
+) -> Result<RewriteConfig> {
+    let mut model_mappings = Vec::with_capacity(rewrite.model_mappings.len());
+    for (index, mapping) in rewrite.model_mappings.into_iter().enumerate() {
+        let provider = optional_non_empty_string(
+            &format!("rewrite.model_mappings[{index}].provider"),
+            mapping.provider,
+        )?;
+        if let Some(provider) = &provider {
+            if !providers.contains_key(provider) {
+                return Err(anyhow!(
+                    "rewrite.model_mappings[{index}].provider {provider:?} not present in providers"
+                ));
+            }
+        }
+
+        model_mappings.push(ModelMapping {
+            provider,
+            from_model: required_non_empty_string(
+                &format!("rewrite.model_mappings[{index}].from_model"),
+                mapping.from_model,
+            )?,
+            from_reasoning_effort: optional_non_empty_string(
+                &format!("rewrite.model_mappings[{index}].from_reasoning_effort"),
+                mapping.from_reasoning_effort,
+            )?,
+            to_model: required_non_empty_string(
+                &format!("rewrite.model_mappings[{index}].to_model"),
+                mapping.to_model,
+            )?,
+            to_reasoning_effort: optional_non_empty_string(
+                &format!("rewrite.model_mappings[{index}].to_reasoning_effort"),
+                mapping.to_reasoning_effort,
+            )?,
+        });
+    }
+
+    Ok(RewriteConfig { model_mappings })
 }
 
 pub fn example_config_toml() -> &'static str {
@@ -484,6 +583,7 @@ mod tests {
         assert_eq!(cfg.transparent_retry_count, 0);
         assert!(!cfg.transparent_retry_head_requests);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
+        assert!(!cfg.rewrite.is_enabled());
     }
 
     #[test]
@@ -563,6 +663,84 @@ mod tests {
             cfg.transparent_retry_backoff_step,
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn parses_request_model_mapping_rewrite_config() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [[rewrite.model_mappings]]
+                provider = "provider_a"
+                from_model = " gpt-5.5 "
+                from_reasoning_effort = " xhigh "
+                to_model = "grok-4.5"
+                to_reasoning_effort = "high"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.rewrite.is_enabled());
+        assert_eq!(cfg.rewrite.model_mappings.len(), 1);
+        let mapping = &cfg.rewrite.model_mappings[0];
+        assert_eq!(mapping.provider.as_deref(), Some("provider_a"));
+        assert_eq!(mapping.from_model, "gpt-5.5");
+        assert_eq!(mapping.from_reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(mapping.to_model, "grok-4.5");
+        assert_eq!(mapping.to_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn rejects_request_model_mapping_for_unknown_provider() {
+        let err = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [[rewrite.model_mappings]]
+                provider = "missing"
+                from_model = "gpt-5.5"
+                to_model = "grok-4.5"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("rewrite.model_mappings[0].provider"));
+    }
+
+    #[test]
+    fn rejects_request_model_mapping_with_empty_values() {
+        let err = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [[rewrite.model_mappings]]
+                from_model = " "
+                to_model = "grok-4.5"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("rewrite.model_mappings[0].from_model"));
     }
 
     #[test]

@@ -36,6 +36,24 @@ transparent_retry_head_requests = false
 transparent_retry_backoff_step_ms = 0
 default_provider = "provider_a"
 
+# Optional request rewrite layer. It is disabled when no mapping entries are configured.
+# Model mappings apply to JSON POST requests whose routed path ends with `responses`, `messages`,
+# or `chat/completions`. Matching is exact. `provider` and `from_reasoning_effort` are optional;
+# provider-specific and effort-specific mappings take precedence over broader mappings.
+#
+# `to_reasoning_effort` is optional. When set, the proxy preserves the request family's effort shape:
+# - responses: `reasoning.effort`
+# - messages: `output_config.effort` (`thinking.type` is still recognized for older captured shapes)
+# - chat completions: `reasoning_effort` unless an existing `reasoning` object is present
+# Messages effort rewrites also ensure `anthropic-beta` contains an effort beta marker.
+#
+# [[rewrite.model_mappings]]
+# provider = "provider_a"
+# from_model = "gpt-5.5"
+# from_reasoning_effort = "xhigh"
+# to_model = "grok-4.5"
+# to_reasoning_effort = "high"
+
 [logging]
 level = "info"
 # Optional extra tracing filter directives appended after `level`.
