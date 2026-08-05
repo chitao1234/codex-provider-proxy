@@ -24,7 +24,7 @@ use tracing_subscriber::{reload, EnvFilter, Registry};
 use crate::{
     config::Config,
     proxy::{self, ProxyState},
-    rpc::{self, RpcState},
+    rpc,
     statistics::StatisticsManager,
 };
 
@@ -56,7 +56,10 @@ impl ConfigOverrides {
 }
 
 pub fn build_http_client(config: &Config) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().user_agent("codex-provider-proxy/0.1.2");
+    let mut builder = reqwest::Client::builder().user_agent(format!(
+        "codex-provider-proxy/{}",
+        env!("CARGO_PKG_VERSION")
+    ));
     if let Some(timeout) = config.upstream_connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
@@ -352,48 +355,21 @@ impl ServerManager {
     }
 
     fn load_config_from_disk(&self) -> Result<Config> {
-        let config_str = std::fs::read_to_string(&self.config_path)
-            .with_context(|| format!("read config {}", self.config_path.display()))?;
-        let mut config = Config::from_toml_str(&config_str)?;
+        let mut config = load_config(&self.config_path)?;
         self.overrides.apply(&mut config);
         Ok(config)
     }
 }
 
+pub fn load_config(path: &Path) -> Result<Config> {
+    let config_str =
+        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+    Config::from_toml_str(&config_str)
+}
+
 impl ListenerHandle {
     fn stop(self, kind: &'static str, configured_addr: SocketAddr) {
-        let local_addr = self.local_addr;
-        let _ = self.shutdown_tx.send(());
-        tokio::spawn(async move {
-            match self.task.await {
-                Ok(Ok(())) => {
-                    info!(
-                        configured = %configured_addr,
-                        listen = %local_addr,
-                        kind,
-                        "listener stopped"
-                    );
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        configured = %configured_addr,
-                        listen = %local_addr,
-                        kind,
-                        error = %err,
-                        "listener exited with error"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        configured = %configured_addr,
-                        listen = %local_addr,
-                        kind,
-                        error = %err,
-                        "listener task failed"
-                    );
-                }
-            }
-        });
+        tokio::spawn(self.stop_and_wait(kind, configured_addr));
     }
 
     async fn stop_and_wait(self, kind: &'static str, configured_addr: SocketAddr) {
@@ -495,24 +471,7 @@ fn spawn_proxy_listener(runtime: RuntimeState, bound: BoundListener) -> Listener
         listen_addr: local_addr,
         runtime,
     });
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .context("proxy server exited")
-    });
-
-    ListenerHandle {
-        local_addr,
-        shutdown_tx,
-        task,
-    }
+    spawn_listener(local_addr, listener, app, "proxy server exited")
 }
 
 fn spawn_rpc_listener(runtime: RuntimeState, bound: BoundListener) -> ListenerHandle {
@@ -521,7 +480,16 @@ fn spawn_rpc_listener(runtime: RuntimeState, bound: BoundListener) -> ListenerHa
         listener,
         ..
     } = bound;
-    let app = rpc::router(RpcState { runtime });
+    let app = rpc::router(runtime);
+    spawn_listener(local_addr, listener, app, "rpc server exited")
+}
+
+fn spawn_listener(
+    local_addr: SocketAddr,
+    listener: TcpListener,
+    app: axum::Router,
+    exit_context: &'static str,
+) -> ListenerHandle {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         axum::serve(
@@ -532,7 +500,7 @@ fn spawn_rpc_listener(runtime: RuntimeState, bound: BoundListener) -> ListenerHa
             let _ = shutdown_rx.await;
         })
         .await
-        .context("rpc server exited")
+        .context(exit_context)
     });
 
     ListenerHandle {
@@ -551,9 +519,6 @@ fn event_targets_config(event: &Event, config_path: &Path, target_name: Option<&
     }
 
     event.paths.iter().any(|path| {
-        path == config_path
-            || target_name
-                .map(|name| path.file_name().is_some_and(|file_name| file_name == name))
-                .unwrap_or(false)
+        path == config_path || target_name.is_some_and(|name| path.file_name() == Some(name))
     })
 }

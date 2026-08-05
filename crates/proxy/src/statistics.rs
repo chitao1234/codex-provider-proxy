@@ -210,41 +210,47 @@ impl StatisticsManager {
 }
 
 impl StatisticsTracker {
-    pub fn begin_attempt(&self, provider: &str, route_pid: Option<u32>) {
+    fn with_pending(&self, f: impl FnOnce(&mut PendingExchange)) {
         if let Ok(mut pending) = self.pending.lock() {
+            f(&mut pending);
+        }
+    }
+
+    pub fn begin_attempt(&self, provider: &str, route_pid: Option<u32>) {
+        self.with_pending(|pending| {
             pending.attempts = pending.attempts.saturating_add(1);
             pending.provider = provider.to_string();
             pending.route_pid = route_pid;
             pending.send_error = None;
-        }
+        });
     }
 
     pub fn capture_request_chunk(&self, chunk: &Bytes) {
-        if let Ok(mut pending) = self.pending.lock() {
+        self.with_pending(|pending| {
             pending
                 .request_body
                 .push(chunk, self.request_body_max_bytes);
-        }
+        });
     }
 
     pub fn capture_response_chunk(&self, chunk: &Bytes) {
-        if let Ok(mut pending) = self.pending.lock() {
+        self.with_pending(|pending| {
             pending
                 .response_body
                 .push(chunk, self.response_body_max_bytes);
-        }
+        });
     }
 
     pub fn record_attempt_send_error(&self, error: &str) {
-        if let Ok(mut pending) = self.pending.lock() {
+        self.with_pending(|pending| {
             pending.send_error = Some(error.to_string());
-        }
+        });
     }
 
     pub fn record_response_stream_error(&self, error: &str) {
-        if let Ok(mut pending) = self.pending.lock() {
+        self.with_pending(|pending| {
             pending.send_error = Some(format!("response stream: {error}"));
-        }
+        });
     }
 
     pub fn record_response(
@@ -254,13 +260,13 @@ impl StatisticsTracker {
         headers: &HeaderMap,
         upstream_latency_ms: u128,
     ) {
-        if let Ok(mut pending) = self.pending.lock() {
+        self.with_pending(|pending| {
             pending.upstream_status = Some(upstream_status.as_u16());
             pending.downstream_status = Some(downstream_status.as_u16());
             pending.upstream_latency_ms = Some(saturating_u64(upstream_latency_ms));
             pending.response_headers = headers.clone();
             pending.send_error = None;
-        }
+        });
     }
 
     pub fn finalize(&self) {
@@ -294,15 +300,15 @@ impl PendingExchange {
             &self.response_body.bytes,
         )
         .unwrap_or_else(|_| self.response_body.bytes.clone());
-        let response_usage = extract_usage_and_model(&response_bytes);
+        let (usage, model) = extract_usage_and_model(&response_bytes);
         let request_model = request_json
             .as_ref()
             .and_then(|value| value.get("model"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let model = request_model.or(response_usage.1);
-        let usage_found = response_usage.0.is_some();
-        let usage = response_usage.0.unwrap_or_default();
+        let model = request_model.or(model);
+        let usage_found = usage.is_some();
+        let usage = usage.unwrap_or_default();
         let success = self
             .upstream_status
             .is_some_and(|status| (200..300).contains(&status))
@@ -335,9 +341,7 @@ impl PendingExchange {
 
 impl BoundedCapture {
     fn push(&mut self, chunk: &Bytes, max_bytes: usize) {
-        self.total_bytes = self
-            .total_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         let remaining = max_bytes.saturating_sub(self.bytes.len());
         let write_len = remaining.min(chunk.len());
         self.bytes.extend_from_slice(&chunk[..write_len]);
@@ -507,11 +511,7 @@ impl StatisticsStore {
         Ok(StatisticsResponse {
             enabled: true,
             generated_unix_ms,
-            window: StatisticsWindow {
-                hours,
-                from_unix_ms,
-                to_unix_ms: generated_unix_ms,
-            },
+            window: statistics_window(hours, generated_unix_ms),
             summary,
             tokens,
             providers,
@@ -569,7 +569,7 @@ fn query_summary(connection: &Connection, from: Option<u64>) -> Result<Statistic
         request_bytes: nonnegative_u64(request_bytes),
         response_bytes: nonnegative_u64(response_bytes),
         attempts: nonnegative_u64(attempts),
-        average_attempts: average(nonnegative_u64(attempts), requests),
+        average_attempts: rate(nonnegative_u64(attempts), requests),
         upstream_latency_ms: query_latency(connection, "upstream_latency_ms", from)?,
         total_duration_ms: query_latency(connection, "total_duration_ms", from)?,
     })
@@ -821,17 +821,21 @@ fn value_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(Value::as_u64)
 }
 
+fn statistics_window(hours: Option<u32>, generated_unix_ms: u64) -> StatisticsWindow {
+    StatisticsWindow {
+        hours,
+        from_unix_ms: hours.map(|hours| {
+            generated_unix_ms.saturating_sub(u64::from(hours).saturating_mul(HOUR_MS))
+        }),
+        to_unix_ms: generated_unix_ms,
+    }
+}
+
 fn empty_response(enabled: bool, generated_unix_ms: u64, hours: Option<u32>) -> StatisticsResponse {
     StatisticsResponse {
         enabled,
         generated_unix_ms,
-        window: StatisticsWindow {
-            hours,
-            from_unix_ms: hours.map(|hours| {
-                generated_unix_ms.saturating_sub(u64::from(hours).saturating_mul(HOUR_MS))
-            }),
-            to_unix_ms: generated_unix_ms,
-        },
+        window: statistics_window(hours, generated_unix_ms),
         summary: StatisticsSummary::default(),
         tokens: TokenUsageSummary::default(),
         providers: Vec::new(),
@@ -849,8 +853,7 @@ fn empty_response(enabled: bool, generated_unix_ms: u64, hours: Option<u32>) -> 
 fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| saturating_u64(duration.as_millis()))
-        .unwrap_or(0)
+        .map_or(0, |duration| saturating_u64(duration.as_millis()))
 }
 
 fn saturating_u64(value: u128) -> u64 {
@@ -870,14 +873,6 @@ fn rate(numerator: u64, denominator: u64) -> f64 {
         0.0
     } else {
         numerator as f64 / denominator as f64
-    }
-}
-
-fn average(total: u64, count: u64) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        total as f64 / count as f64
     }
 }
 

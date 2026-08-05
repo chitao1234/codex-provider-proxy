@@ -14,12 +14,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pid_resolver::platform::default_pid_resolver;
 use runtime::{
-    build_http_client, spawn_config_watcher, ConfigOverrides, RuntimeState, ServerManager,
+    build_http_client, load_config, spawn_config_watcher, ConfigOverrides, RuntimeState,
+    ServerManager,
 };
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::config::{example_config_toml, Config};
+use crate::config::example_config_toml;
 use crate::statistics::StatisticsManager;
 
 #[derive(Debug, Parser)]
@@ -100,18 +101,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: &PathBuf) -> Result<Config> {
-    let config_str =
-        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-    Config::from_toml_str(&config_str)
-}
-
 fn absolute_config_path(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
+    Ok(if path.is_absolute() {
+        path
     } else {
-        Ok(std::env::current_dir()
+        std::env::current_dir()
             .context("read current dir")?
-            .join(path))
-    }
+            .join(path)
+    })
 }

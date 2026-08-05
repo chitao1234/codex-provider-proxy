@@ -17,12 +17,7 @@ use serde::Deserialize;
 
 use crate::{config::Config, runtime::RuntimeState};
 
-#[derive(Clone)]
-pub struct RpcState {
-    pub runtime: RuntimeState,
-}
-
-pub fn router(state: RpcState) -> Router {
+pub fn router(state: RuntimeState) -> Router {
     let protected_routes = Router::new()
         .route("/rpc/v1/routes", get(list_routes).post(set_route))
         .route("/rpc/v1/routes/clear", post(clear_routes))
@@ -86,12 +81,12 @@ fn ensure_auth(headers: &HeaderMap, cfg: &Config) -> Result<()> {
 }
 
 async fn authorize_rpc_request(
-    State(state): State<RpcState>,
+    State(state): State<RuntimeState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let cfg = state.runtime.config().await;
+    let cfg = state.config().await;
     if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
         return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
     }
@@ -103,9 +98,8 @@ async fn authorize_rpc_request(
     next.run(request).await
 }
 
-async fn list_routes(State(state): State<RpcState>) -> impl IntoResponse {
+async fn list_routes(State(state): State<RuntimeState>) -> impl IntoResponse {
     let mut routes: Vec<RouteEntry> = state
-        .runtime
         .pid_routes()
         .iter()
         .map(|e| RouteEntry {
@@ -118,34 +112,33 @@ async fn list_routes(State(state): State<RpcState>) -> impl IntoResponse {
 }
 
 async fn set_route(
-    State(state): State<RpcState>,
+    State(state): State<RuntimeState>,
     Extension(cfg): Extension<Arc<Config>>,
     Json(req): Json<SetRouteRequest>,
 ) -> impl IntoResponse {
     if !cfg.providers.contains_key(&req.provider) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("unknown provider: {}\n", req.provider),
-        )
-            .into_response();
+        return unknown_provider_response(&req.provider).into_response();
     }
 
-    state.runtime.pid_routes().insert(req.pid, req.provider);
+    state.pid_routes().insert(req.pid, req.provider);
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn delete_route(State(state): State<RpcState>, Path(pid): Path<u32>) -> impl IntoResponse {
-    let removed = state.runtime.pid_routes().remove(&pid).is_some();
+async fn delete_route(
+    State(state): State<RuntimeState>,
+    Path(pid): Path<u32>,
+) -> impl IntoResponse {
+    let removed = state.pid_routes().remove(&pid).is_some();
     Json(DeleteRouteResponse { removed }).into_response()
 }
 
-async fn clear_routes(State(state): State<RpcState>) -> impl IntoResponse {
-    state.runtime.pid_routes().clear();
+async fn clear_routes(State(state): State<RuntimeState>) -> impl IntoResponse {
+    state.pid_routes().clear();
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn list_providers(State(state): State<RpcState>) -> impl IntoResponse {
-    let routing = state.runtime.routing_snapshot().await;
+async fn list_providers(State(state): State<RuntimeState>) -> impl IntoResponse {
+    let routing = state.routing_snapshot().await;
     let mut providers: Vec<String> = routing.config.providers.keys().cloned().collect();
     providers.sort();
 
@@ -157,11 +150,11 @@ async fn list_providers(State(state): State<RpcState>) -> impl IntoResponse {
 }
 
 async fn statistics(
-    State(state): State<RpcState>,
+    State(state): State<RuntimeState>,
     Query(query): Query<StatisticsQuery>,
 ) -> impl IntoResponse {
     let hours = (query.hours != 0).then_some(query.hours);
-    match state.runtime.statistics().query(hours).await {
+    match state.statistics().query(hours).await {
         Ok(statistics) => Json(statistics).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -172,22 +165,21 @@ async fn statistics(
 }
 
 async fn set_default_provider(
-    State(state): State<RpcState>,
+    State(state): State<RuntimeState>,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    if !state
-        .runtime
-        .set_default_provider(req.provider.clone())
-        .await
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("unknown provider: {}\n", req.provider),
-        )
-            .into_response();
+    if !state.set_default_provider(req.provider.clone()).await {
+        return unknown_provider_response(&req.provider).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+fn unknown_provider_response(provider: &str) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("unknown provider: {provider}\n"),
+    )
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ fn read_decoded_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut reader = reader.take(MAX_DECODED_LOG_BODY_BYTES.saturating_add(1));
     reader.read_to_end(&mut decoded)?;
-    if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > MAX_DECODED_LOG_BODY_BYTES {
+    if decoded.len() as u64 > MAX_DECODED_LOG_BODY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

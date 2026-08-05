@@ -172,7 +172,7 @@ struct LoggingFile {
     exchange_log_dir: Option<String>,
     #[serde(default = "default_exchange_body_max_bytes")]
     exchange_body_max_bytes: u64,
-    #[serde(default = "default_exchange_body_compression")]
+    #[serde(default)]
     exchange_body_compression: BodyLogCompression,
     #[serde(default = "default_reconstruct_responses")]
     reconstruct_responses: bool,
@@ -240,10 +240,6 @@ fn default_exchange_body_max_bytes() -> u64 {
     0
 }
 
-fn default_exchange_body_compression() -> BodyLogCompression {
-    BodyLogCompression::default()
-}
-
 fn default_statistics_enabled() -> bool {
     true
 }
@@ -301,6 +297,14 @@ fn default_request_body_buffer_max_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn timeout_from_secs(secs: u64) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(secs))
+}
+
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
 fn normalize_base_path(value: &str) -> Result<String> {
     if value.is_empty() {
         return Ok("/".to_string());
@@ -347,9 +351,9 @@ fn required_non_empty_string(field: &str, value: String) -> Result<String> {
 }
 
 fn optional_non_empty_string(field: &str, value: Option<String>) -> Result<Option<String>> {
-    value
-        .map(|value| required_non_empty_string(field, value).map(Some))
-        .unwrap_or(Ok(None))
+    value.map_or(Ok(None), |value| {
+        required_non_empty_string(field, value).map(Some)
+    })
 }
 
 fn required_non_empty_strings(field: &str, values: Vec<String>) -> Result<Vec<String>> {
@@ -367,9 +371,9 @@ fn optional_non_empty_strings(
     field: &str,
     values: Option<Vec<String>>,
 ) -> Result<Option<Vec<String>>> {
-    values
-        .map(|values| required_non_empty_strings(field, values).map(Some))
-        .unwrap_or(Ok(None))
+    values.map_or(Ok(None), |values| {
+        required_non_empty_strings(field, values).map(Some)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,14 +389,8 @@ impl Config {
         let file: ConfigFile = toml::from_str(toml_str).context("parse config toml")?;
         let listen_addrs = normalize_listen_addrs(file.listen_addr, file.listen_addrs)?;
         let listen_base_path = normalize_base_path(&file.listen_base_path)?;
-        let upstream_connect_timeout = match file.upstream_connect_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
-        let upstream_idle_timeout = match file.upstream_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let upstream_connect_timeout = timeout_from_secs(file.upstream_connect_timeout_secs);
+        let upstream_idle_timeout = timeout_from_secs(file.upstream_idle_timeout_secs);
         let mut providers = HashMap::new();
         for (name, provider) in file.providers {
             if provider.base_url.cannot_be_a_base() {
@@ -423,10 +421,7 @@ impl Config {
             Some(path) => Some(PathBuf::from(path)),
             None => None,
         };
-        let exchange_body_max_bytes = match file.logging.exchange_body_max_bytes {
-            0 => None,
-            value => Some(value),
-        };
+        let exchange_body_max_bytes = nonzero_u64(file.logging.exchange_body_max_bytes);
         let statistics_database_path = file.statistics.database_path.trim();
         if statistics_database_path.is_empty() {
             return Err(anyhow!("statistics.database_path cannot be empty"));
