@@ -12,7 +12,7 @@ fn main() -> io::Result<()> {
             }
             "--sleep-ms" => {
                 if let Some(v) = args.next() {
-                    sleep_ms = v.parse().unwrap_or(sleep_ms);
+                    sleep_ms = v.parse().expect("--sleep-ms must be an integer");
                 }
             }
             _ => {}
@@ -24,7 +24,7 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     };
 
-    let _stream = TcpStream::connect(addr.as_str())?;
+    let _stream = TcpStream::connect(addr)?;
     thread::sleep(Duration::from_millis(sleep_ms));
     Ok(())
 }

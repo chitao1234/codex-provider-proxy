@@ -70,29 +70,23 @@ impl LinuxPidResolver {
         //
         // We want the PID of the *other end* (the peer/client), so we must look up the inode for the
         // client socket, which corresponds to (local=peer, remote=local).
-        let inode = match inode_for_connection(peer, local)? {
-            Some(inode) => inode,
-            None => {
-                debug!(
-                    local = %local,
-                    peer = %peer,
-                    "pid resolver: no inode found for connection in /proc/net/tcp*"
-                );
-                return Ok(None);
-            }
+        let Some(inode) = inode_for_connection(peer, local)? else {
+            debug!(
+                local = %local,
+                peer = %peer,
+                "pid resolver: no inode found for connection in /proc/net/tcp*"
+            );
+            return Ok(None);
         };
 
-        let pid = match pid_for_inode(inode)? {
-            Some(pid) => pid,
-            None => {
-                debug!(
-                    local = %local,
-                    peer = %peer,
-                    inode,
-                    "pid resolver: inode found but no owning pid discovered under /proc/*/fd"
-                );
-                return Ok(None);
-            }
+        let Some(pid) = pid_for_inode(inode)? else {
+            debug!(
+                local = %local,
+                peer = %peer,
+                inode,
+                "pid resolver: inode found but no owning pid discovered under /proc/*/fd"
+            );
+            return Ok(None);
         };
 
         self.conn_cache.insert(key, pid);
@@ -122,7 +116,7 @@ impl LinuxPidResolver {
             format!("parse parent pid (ppid) from /proc stat for pid {pid}: {stat:?}")
         })?;
 
-        let ppid = if ppid == 0 { None } else { Some(ppid) };
+        let ppid = (ppid != 0).then_some(ppid);
         self.ppid_cache.insert(pid, ppid);
         self.ppid_cache
             .prune_expired_if_over(MAX_PPID_CACHE_ENTRIES, self.cache_ttl);
@@ -137,15 +131,26 @@ fn parse_ppid_from_proc_stat(stat: &str) -> Option<u32> {
     // `comm` can contain spaces, so we locate the final `)` and split after it.
     let (_, after_comm) = stat.rsplit_once(')')?;
     let mut fields = after_comm.split_whitespace();
-    let _state = fields.next()?;
-    let ppid = fields.next()?;
-    ppid.parse::<u32>().ok()
+    let ppid = fields.nth(1)?;
+    ppid.parse().ok()
 }
 
 fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
     match (local.ip(), peer.ip()) {
-        (IpAddr::V4(_), IpAddr::V4(_)) => inode_for_connection_v4(local, peer),
-        (IpAddr::V6(_), IpAddr::V6(_)) => inode_for_connection_v6(local, peer),
+        (IpAddr::V4(local_ip), IpAddr::V4(peer_ip)) => inode_for_connection_family(
+            local,
+            peer,
+            "/proc/net/tcp",
+            encode_proc_net_tcp_v4(local_ip, local.port()),
+            encode_proc_net_tcp_v4(peer_ip, peer.port()),
+        ),
+        (IpAddr::V6(local_ip), IpAddr::V6(peer_ip)) => inode_for_connection_family(
+            local,
+            peer,
+            "/proc/net/tcp6",
+            encode_proc_net_tcp_v6(local_ip, local.port()),
+            encode_proc_net_tcp_v6(peer_ip, peer.port()),
+        ),
         _ => {
             debug!(
                 local = %local,
@@ -157,31 +162,16 @@ fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u6
     }
 }
 
-fn inode_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
-    let (IpAddr::V4(local_ip), IpAddr::V4(peer_ip)) = (local.ip(), peer.ip()) else {
-        return Ok(None);
-    };
-    let local_key = encode_proc_net_tcp_v4(local_ip, local.port());
-    let peer_key = encode_proc_net_tcp_v4(peer_ip, peer.port());
-
-    let tcp = fs::read_to_string("/proc/net/tcp").context("read /proc/net/tcp")?;
-    let (inode, scanned) = inode_from_proc_net(&tcp, &local_key, &peer_key, "/proc/net/tcp")?;
-
-    log_proc_net_lookup(local, peer, inode, scanned, "/proc/net/tcp");
-    Ok(inode)
-}
-
-fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
-    let (IpAddr::V6(local_ip), IpAddr::V6(peer_ip)) = (local.ip(), peer.ip()) else {
-        return Ok(None);
-    };
-    let local_key = encode_proc_net_tcp_v6(local_ip, local.port());
-    let peer_key = encode_proc_net_tcp_v6(peer_ip, peer.port());
-
-    let tcp6 = fs::read_to_string("/proc/net/tcp6").context("read /proc/net/tcp6")?;
-    let (inode, scanned) = inode_from_proc_net(&tcp6, &local_key, &peer_key, "/proc/net/tcp6")?;
-
-    log_proc_net_lookup(local, peer, inode, scanned, "/proc/net/tcp6");
+fn inode_for_connection_family(
+    local: SocketAddr,
+    peer: SocketAddr,
+    table_path: &'static str,
+    local_key: String,
+    peer_key: String,
+) -> Result<Option<u64>> {
+    let table = fs::read_to_string(table_path).with_context(|| format!("read {table_path}"))?;
+    let (inode, scanned) = inode_from_proc_net(&table, &local_key, &peer_key, table_path)?;
+    log_proc_net_lookup(local, peer, inode, scanned, table_path);
     Ok(inode)
 }
 
@@ -195,16 +185,9 @@ fn inode_from_proc_net(
     for line in contents.lines().skip(1) {
         scanned += 1;
         let mut parts = line.split_whitespace();
-        let _sl = parts.next();
-        let local_addr = parts.next();
+        let local_addr = parts.nth(1);
         let rem_addr = parts.next();
-        let _st = parts.next();
-        let _tx_rx = parts.next();
-        let _tr_tm = parts.next();
-        let _retrnsmt = parts.next();
-        let _uid = parts.next();
-        let _timeout = parts.next();
-        let inode = parts.next();
+        let inode = parts.nth(6);
 
         let (Some(local_addr), Some(rem_addr), Some(inode)) = (local_addr, rem_addr, inode) else {
             continue;
@@ -212,7 +195,7 @@ fn inode_from_proc_net(
 
         if local_addr == local_key && rem_addr == peer_key {
             let inode = inode
-                .parse::<u64>()
+                .parse()
                 .with_context(|| format!("parse inode from {source} line: {line}"))?;
             return Ok((Some(inode), scanned));
         }
@@ -261,16 +244,16 @@ fn encode_proc_net_tcp_v6(ip: Ipv6Addr, port: u16) -> String {
 
     // /proc/net/tcp6 prints the IPv6 address as 4 32-bit words, each in little-endian byte order.
     // Example: ::1 => ...01000000
-    let mut hex = String::with_capacity(32 + 1 + 4);
-    for word in bytes.chunks_exact(4) {
-        hex.push_str(&format!(
-            "{:02X}{:02X}{:02X}{:02X}",
-            word[3], word[2], word[1], word[0]
-        ));
-    }
-    hex.push(':');
-    hex.push_str(&format!("{:04X}", port));
-    hex
+    let address = bytes
+        .chunks_exact(4)
+        .map(|word| {
+            format!(
+                "{:02X}{:02X}{:02X}{:02X}",
+                word[3], word[2], word[1], word[0]
+            )
+        })
+        .collect::<String>();
+    format!("{address}:{port:04X}")
 }
 
 fn pid_for_inode(inode: u64) -> Result<Option<u32>> {

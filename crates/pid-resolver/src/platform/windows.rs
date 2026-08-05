@@ -81,7 +81,6 @@ impl WindowsPidResolver {
         }
 
         let ppid = process_parent_pid(pid).context("resolve parent pid via Toolhelp snapshot")?;
-        let ppid = if ppid == 0 { None } else { Some(ppid) };
         self.ppid_cache.insert(pid, ppid);
         self.ppid_cache
             .prune_expired_if_over(MAX_PPID_CACHE_ENTRIES, self.cache_ttl);
@@ -317,7 +316,7 @@ fn pid_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u
     Ok(None)
 }
 
-fn process_parent_pid(pid: u32) -> Result<u32> {
+fn process_parent_pid(pid: u32) -> Result<Option<u32>> {
     use std::mem::{size_of, zeroed};
 
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -346,7 +345,7 @@ fn process_parent_pid(pid: u32) -> Result<u32> {
 
     unsafe { CloseHandle(snapshot) };
 
-    Ok(found.unwrap_or(0))
+    Ok(found)
 }
 
 #[cfg(test)]
