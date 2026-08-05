@@ -1,12 +1,13 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use codex_provider_proxy_rpc_types::{
     DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, RouteEntry,
@@ -22,14 +23,21 @@ pub struct RpcState {
 }
 
 pub fn router(state: RpcState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    let protected_routes = Router::new()
         .route("/rpc/v1/routes", get(list_routes).post(set_route))
         .route("/rpc/v1/routes/clear", post(clear_routes))
         .route("/rpc/v1/routes/:pid", delete(delete_route))
         .route("/rpc/v1/providers", get(list_providers))
         .route("/rpc/v1/statistics", get(statistics))
         .route("/rpc/v1/default-provider", post(set_default_provider))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_rpc_request,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected_routes)
         .with_state(state)
 }
 
@@ -78,30 +86,24 @@ fn ensure_auth(headers: &HeaderMap, cfg: &Config) -> Result<()> {
 }
 
 async fn authorize_rpc_request(
-    state: &RpcState,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-) -> std::result::Result<std::sync::Arc<Config>, Response> {
-    let cfg = state.runtime.config().await;
-    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
-        return Err((StatusCode::FORBIDDEN, format!("{err}\n")).into_response());
-    }
-    if let Err(err) = ensure_auth(headers, &cfg) {
-        return Err((StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response());
-    }
-    Ok(cfg)
-}
-
-async fn list_routes(
     State(state): State<RpcState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let cfg = state.runtime.config().await;
+    if let Err(err) = ensure_peer_allowed(peer, cfg.rpc_listen_addr) {
+        return (StatusCode::FORBIDDEN, format!("{err}\n")).into_response();
+    }
+    if let Err(err) = ensure_auth(request.headers(), &cfg) {
+        return (StatusCode::UNAUTHORIZED, format!("{err}\n")).into_response();
+    }
 
+    request.extensions_mut().insert(cfg);
+    next.run(request).await
+}
+
+async fn list_routes(State(state): State<RpcState>) -> impl IntoResponse {
     let mut routes: Vec<RouteEntry> = state
         .runtime
         .pid_routes()
@@ -117,15 +119,9 @@ async fn list_routes(
 
 async fn set_route(
     State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(cfg): Extension<Arc<Config>>,
     Json(req): Json<SetRouteRequest>,
 ) -> impl IntoResponse {
-    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
     if !cfg.providers.contains_key(&req.provider) {
         return (
             StatusCode::BAD_REQUEST,
@@ -138,45 +134,17 @@ async fn set_route(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn delete_route(
-    State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(pid): Path<u32>,
-) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
+async fn delete_route(State(state): State<RpcState>, Path(pid): Path<u32>) -> impl IntoResponse {
     let removed = state.runtime.pid_routes().remove(&pid).is_some();
     Json(DeleteRouteResponse { removed }).into_response()
 }
 
-async fn clear_routes(
-    State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
+async fn clear_routes(State(state): State<RpcState>) -> impl IntoResponse {
     state.runtime.pid_routes().clear();
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn list_providers(
-    State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
+async fn list_providers(State(state): State<RpcState>) -> impl IntoResponse {
     let routing = state.runtime.routing_snapshot().await;
     let mut providers: Vec<String> = routing.config.providers.keys().cloned().collect();
     providers.sort();
@@ -190,15 +158,8 @@ async fn list_providers(
 
 async fn statistics(
     State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Query(query): Query<StatisticsQuery>,
 ) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
     let hours = (query.hours != 0).then_some(query.hours);
     match state.runtime.statistics().query(hours).await {
         Ok(statistics) => Json(statistics).into_response(),
@@ -212,15 +173,8 @@ async fn statistics(
 
 async fn set_default_provider(
     State(state): State<RpcState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
-        Ok(cfg) => cfg,
-        Err(response) => return response,
-    };
-
     if !state
         .runtime
         .set_default_provider(req.provider.clone())
