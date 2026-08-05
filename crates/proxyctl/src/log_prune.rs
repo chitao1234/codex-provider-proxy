@@ -200,17 +200,9 @@ fn is_exchange_artifact(file_name: &str, stem: &str) -> bool {
     let Some(suffix) = file_name.strip_prefix(stem) else {
         return false;
     };
-    if matches!(
-        suffix,
-        ".meta.json"
-            | ".request_headers.txt"
-            | ".request_body.bin"
-            | ".request_body.bin.zst"
-            | ".response_headers.txt"
-            | ".response_body.bin"
-            | ".response_body.bin.zst"
-            | ".response_reconstructed.txt"
-    ) {
+    if matches!(suffix, ".meta.json" | ".response_reconstructed.txt")
+        || suffix.strip_prefix('.').is_some_and(is_artifact_suffix)
+    {
         return true;
     }
 
@@ -222,15 +214,19 @@ fn is_exchange_artifact(file_name: &str, stem: &str) -> bool {
     };
     !attempt_number.is_empty()
         && attempt_number.bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(
-            artifact_suffix,
-            "request_headers.txt"
-                | "request_body.bin"
-                | "request_body.bin.zst"
-                | "response_headers.txt"
-                | "response_body.bin"
-                | "response_body.bin.zst"
-        )
+        && is_artifact_suffix(artifact_suffix)
+}
+
+fn is_artifact_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        "request_headers.txt"
+            | "request_body.bin"
+            | "request_body.bin.zst"
+            | "response_headers.txt"
+            | "response_body.bin"
+            | "response_body.bin.zst"
+    )
 }
 
 #[cfg(test)]

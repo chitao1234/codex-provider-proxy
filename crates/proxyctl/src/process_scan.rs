@@ -20,13 +20,18 @@ pub struct ProcessScanStats {
     pub unreadable_cwd: usize,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn mark_unreadable_cwd(stats: &mut ProcessScanStats) -> String {
+    stats.unreadable_cwd += 1;
+    "<unknown>".to_string()
+}
+
 #[cfg(target_os = "linux")]
 fn list_proc_pids() -> Result<Vec<u32>> {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").context("read /proc")? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entry) = entry else {
+            continue;
         };
         let file_name = entry.file_name();
         let s = file_name.to_string_lossy();
@@ -46,11 +51,7 @@ fn parse_cmdline_bytes(bytes: &[u8]) -> Option<String> {
         .map(|p| String::from_utf8_lossy(p).to_string())
         .collect();
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 #[cfg(target_os = "linux")]
@@ -92,10 +93,7 @@ pub fn find_processes_by_cmdline_regex(
 
         let cwd = read_proc_cwd(pid)
             .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| {
-                stats.unreadable_cwd += 1;
-                "<unknown>".to_string()
-            });
+            .unwrap_or_else(|| mark_unreadable_cwd(&mut stats));
 
         out.push(ProcessInfo { pid, cwd, cmdline });
     }
@@ -468,7 +466,6 @@ pub fn find_processes_by_cmdline_regex(
     let mut out = Vec::new();
     let mut stats = ProcessScanStats::default();
 
-    // Enumerate processes via Toolhelp (Win32 APIs).
     #[derive(Debug)]
     struct ProcStub {
         pid: u32,
@@ -509,13 +506,7 @@ pub fn find_processes_by_cmdline_regex(
                 query_process_command_line(handle).or_else(|| query_process_image_path(handle));
             unsafe { CloseHandle(handle) };
         }
-        let cmdline = cmdline.or_else(|| {
-            if p.exe_name.is_empty() {
-                None
-            } else {
-                Some(p.exe_name.clone())
-            }
-        });
+        let cmdline = cmdline.or_else(|| (!p.exe_name.is_empty()).then(|| p.exe_name.clone()));
         let Some(cmdline) = cmdline else {
             stats.unreadable_cmdline += 1;
             continue;
@@ -536,20 +527,11 @@ pub fn find_processes_by_cmdline_regex(
 
         let cwd = match cwd {
             Some(cwd) => cwd,
-            None => {
-                if p.pid == std::process::id() {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| {
-                            stats.unreadable_cwd += 1;
-                            "<unknown>".to_string()
-                        })
-                } else {
-                    stats.unreadable_cwd += 1;
-                    "<unknown>".to_string()
-                }
-            }
+            None if p.pid == std::process::id() => std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| mark_unreadable_cwd(&mut stats)),
+            None => mark_unreadable_cwd(&mut stats),
         };
 
         out.push(ProcessInfo {

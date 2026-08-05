@@ -185,7 +185,7 @@ pub fn run() -> Result<()> {
     meta_files.sort();
 
     let mut stats = AnalysisStats {
-        exchanges_total: u64::try_from(meta_files.len()).unwrap_or(u64::MAX),
+        exchanges_total: meta_files.len() as u64,
         ..AnalysisStats::default()
     };
 
@@ -248,7 +248,7 @@ fn analyze_exchange(
         .file_name()
         .and_then(|n| n.to_str())
         .and_then(|n| n.strip_suffix(".meta.json"))
-        .with_context(|| format!("extract stem from {}", meta_path.display()))?;
+        .expect("meta file names end with .meta.json");
 
     let request_body_path = resolve_logged_path(
         meta_path,
@@ -274,24 +274,14 @@ fn analyze_exchange(
                     if !response_body_path.exists() {
                         return None;
                     }
-                    match extract_completed_response_from_log(
+                    let response = parse_completed_response(
+                        stats,
                         &response_body_path,
                         &response_headers_path,
                         meta.body_compression.as_deref(),
-                    ) {
-                        Ok(response) => {
-                            response_for_usage = response.clone();
-                            response.and_then(|r| extract_model_from_response(&r))
-                        }
-                        Err(err) => {
-                            stats.usage_parse_errors = stats.usage_parse_errors.saturating_add(1);
-                            eprintln!(
-                                "warn: parse response body {}: {err}",
-                                response_body_path.display()
-                            );
-                            None
-                        }
-                    }
+                    );
+                    response_for_usage = response.clone();
+                    response.and_then(|r| extract_model_from_response(&r))
                 });
 
         if model
@@ -320,27 +310,14 @@ fn analyze_exchange(
         return Ok(());
     }
 
-    let response = match response_for_usage {
-        Some(response) => Some(response),
-        None => {
-            let parsed = extract_completed_response_from_log(
-                &response_body_path,
-                &response_headers_path,
-                meta.body_compression.as_deref(),
-            );
-            match parsed {
-                Ok(v) => v,
-                Err(err) => {
-                    stats.usage_parse_errors = stats.usage_parse_errors.saturating_add(1);
-                    eprintln!(
-                        "warn: parse response body {}: {err}",
-                        response_body_path.display()
-                    );
-                    None
-                }
-            }
-        }
-    };
+    let response = response_for_usage.or_else(|| {
+        parse_completed_response(
+            stats,
+            &response_body_path,
+            &response_headers_path,
+            meta.body_compression.as_deref(),
+        )
+    });
 
     let Some(response) = response else {
         return Ok(());
@@ -356,6 +333,29 @@ fn analyze_exchange(
     Ok(())
 }
 
+fn parse_completed_response(
+    stats: &mut AnalysisStats,
+    response_body_path: &Path,
+    response_headers_path: &Path,
+    body_compression: Option<&str>,
+) -> Option<Value> {
+    match extract_completed_response_from_log(
+        response_body_path,
+        response_headers_path,
+        body_compression,
+    ) {
+        Ok(response) => response,
+        Err(err) => {
+            stats.usage_parse_errors = stats.usage_parse_errors.saturating_add(1);
+            eprintln!(
+                "warn: parse response body {}: {err}",
+                response_body_path.display()
+            );
+            None
+        }
+    }
+}
+
 fn resolve_logged_path(meta_path: &Path, configured: &str, fallback_file: &str) -> PathBuf {
     let configured = configured.trim();
     if configured.is_empty() {
@@ -367,10 +367,7 @@ fn resolve_logged_path(meta_path: &Path, configured: &str, fallback_file: &str) 
         return direct;
     }
 
-    meta_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(direct)
+    meta_path.with_file_name(direct)
 }
 
 fn parse_latency_from_response_headers(path: &Path) -> Option<u128> {
@@ -535,7 +532,7 @@ fn read_limited<R: Read>(reader: R, subject: &str) -> io::Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut reader = reader.take(MAX_DECODED_RESPONSE_BODY_BYTES.saturating_add(1));
     reader.read_to_end(&mut decoded)?;
-    if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > MAX_DECODED_RESPONSE_BODY_BYTES {
+    if decoded.len() as u64 > MAX_DECODED_RESPONSE_BODY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{subject} exceeds the {MAX_DECODED_RESPONSE_BODY_BYTES}-byte analysis limit"),
@@ -574,7 +571,7 @@ fn extract_completed_response_from_sse(payload: &str) -> Option<Value> {
         }
     }
 
-    if current_event.is_some() || !data_lines.is_empty() {
+    if !data_lines.is_empty() {
         handle_sse_event(&current_event, &data_lines, &mut completed);
     }
     completed
@@ -681,25 +678,9 @@ fn print_report(filters: &AnalysisFilters, stats: &AnalysisStats) {
     println!("filters.to_unix_ms={}", option_u128(filters.to_unix_ms));
     println!(
         "filters.providers={}",
-        if filters.providers.is_empty() {
-            "(any)".to_string()
-        } else {
-            filters
-                .providers
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        }
+        display_filter_set(&filters.providers)
     );
-    println!(
-        "filters.models={}",
-        if filters.models.is_empty() {
-            "(any)".to_string()
-        } else {
-            filters.models.iter().cloned().collect::<Vec<_>>().join(",")
-        }
-    );
+    println!("filters.models={}", display_filter_set(&filters.models));
     println!();
 
     println!("exchanges_total={}", stats.exchanges_total);
@@ -751,6 +732,14 @@ fn print_report(filters: &AnalysisFilters, stats: &AnalysisStats) {
     print_latency_stats("latency.total_duration_ms", &stats.total_duration_ms);
 }
 
+fn display_filter_set(set: &BTreeSet<String>) -> String {
+    if set.is_empty() {
+        "(any)".to_string()
+    } else {
+        set.iter().map(String::as_str).collect::<Vec<_>>().join(",")
+    }
+}
+
 fn option_u128(value: Option<u128>) -> String {
     value
         .map(|v| v.to_string())
@@ -782,9 +771,7 @@ fn print_latency_stats(label: &str, values: &[u128]) {
 }
 
 fn percentile_nearest_rank(sorted: &[u128], q: f64) -> u128 {
-    if sorted.is_empty() {
-        return 0;
-    }
+    debug_assert!(!sorted.is_empty());
     let n = sorted.len();
     let rank = (q * n as f64).ceil() as usize;
     let idx = rank.saturating_sub(1).min(n - 1);

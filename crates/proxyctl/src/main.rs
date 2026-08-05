@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
 
-use codex_provider_proxyctl::process_scan;
+use codex_provider_proxyctl::{log_prune, process_scan};
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-provider-proxyctl")]
@@ -412,23 +412,18 @@ async fn main() -> Result<()> {
         } => {
             let re = Regex::new(&regex).context("compile regex")?;
             let (matches, stats) = process_scan::find_processes_by_cmdline_regex(&re, limit)?;
+            let scan_stats = format!(
+                "seen_pids={} unreadable_cmdline={} unreadable_cwd={}",
+                stats.pids_seen, stats.unreadable_cmdline, stats.unreadable_cwd
+            );
 
             if matches.is_empty() {
-                println!(
-                    "no matches (seen_pids={} unreadable_cmdline={} unreadable_cwd={})",
-                    stats.pids_seen, stats.unreadable_cmdline, stats.unreadable_cwd
-                );
+                println!("no matches ({scan_stats})");
                 return Ok(());
             }
 
             let providers = rpc.providers().await?;
-            println!(
-                "matched={} (seen_pids={} unreadable_cmdline={} unreadable_cwd={})",
-                matches.len(),
-                stats.pids_seen,
-                stats.unreadable_cmdline,
-                stats.unreadable_cwd
-            );
+            println!("matched={} ({scan_stats})", matches.len());
             print_providers(&providers);
 
             let Some(provider) = provider else {
@@ -479,7 +474,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("unknown provider: {provider}");
             }
 
-            let exec = command.first().context("missing command")?;
+            let exec = &command[0];
             let args = &command[1..];
             let parent_pid = std::process::id();
 
@@ -550,10 +545,8 @@ async fn main() -> Result<()> {
             yes,
             dry_run,
         } => {
-            let cutoff_unix_ms = codex_provider_proxyctl::log_prune::parse_cutoff_local_datetime(
-                &before_local_datetime,
-            )?;
-            let plan = codex_provider_proxyctl::log_prune::build_prune_plan(&dir, cutoff_unix_ms)?;
+            let cutoff_unix_ms = log_prune::parse_cutoff_local_datetime(&before_local_datetime)?;
+            let plan = log_prune::build_prune_plan(&dir, cutoff_unix_ms)?;
 
             println!("dir={}", dir.display());
             println!(
@@ -598,7 +591,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let out = codex_provider_proxyctl::log_prune::execute_prune(&plan)?;
+            let out = log_prune::execute_prune(&plan)?;
             println!(
                 "pruned_exchanges={} pruned_files={} pruned_bytes={}",
                 out.pruned_exchanges, out.pruned_files, out.pruned_bytes
