@@ -67,7 +67,16 @@ pub fn convert_messages_request(
 
     let system = SystemPrompt::parse(request.get("system"));
     let messages = expand_messages(request.get("messages"), caps)?;
-    let (tools, report) = convert_tools(request.get("tools"), caps)?;
+    let (tools, report) = convert_tools(request, caps)?;
+    if let Some(search_params) = &caps.search_request_params {
+        if !report.dropped_server_tools.is_empty() || !report.mapped_server_tools.is_empty() {
+            let query = last_user_query(request.get("messages"));
+            let rendered = render_search_tool_template(search_params, query.as_deref());
+            if let Value::Object(params) = rendered {
+                out.extend(params);
+            }
+        }
+    }
 
     let mut chat_messages: Vec<Value> =
         Vec::with_capacity(messages.len() + usize::from(!system.is_empty()));
@@ -514,11 +523,11 @@ fn expand_assistant_message(object: &Map<String, Value>) -> Result<Value, Conver
 
 /// Convert the Anthropic `tools` array to Chat function tools per the server-tool policy.
 fn convert_tools(
-    tools: Option<&Value>,
+    request: &Map<String, Value>,
     caps: &ModelCapabilities,
 ) -> Result<(Vec<Value>, RequestConversionReport), ConversionError> {
     let mut report = RequestConversionReport::default();
-    let Some(tools) = tools else {
+    let Some(tools) = request.get("tools") else {
         return Ok((Vec::new(), report));
     };
     let Some(tools) = tools.as_array() else {
@@ -562,6 +571,30 @@ fn convert_tools(
                         }
                     }
                 }
+                ServerToolPolicy::ProviderNative => {
+                    match server_tool_function_name(tool).as_deref() {
+                        Some("web_search") => {
+                            if let Some(template) = caps.search_tool_template.clone() {
+                                report.mapped_server_tools.push("web_search".to_string());
+                                // The upstream needs a real search query (glm requires it);
+                                // derive one from the last user message.
+                                let query = last_user_query(request.get("messages"));
+                                out.push(render_search_tool_template(&template, query.as_deref()));
+                            } else if caps.search_request_params.is_some() {
+                                // Search is enabled via top-level request parameters
+                                // (e.g. qwen enable_search); the tool itself is dropped.
+                                report.mapped_server_tools.push("web_search".to_string());
+                            } else {
+                                report.dropped_server_tools.push("web_search".to_string());
+                            }
+                        }
+                        _ => {
+                            // web_fetch and other server tools have no native chat form.
+                            let name = tool_name(object);
+                            report.dropped_server_tools.push(name);
+                        }
+                    }
+                }
                 ServerToolPolicy::Passthrough => out.push(tool.clone()),
             }
             continue;
@@ -594,6 +627,49 @@ fn tool_name(object: &Map<String, Value>) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// Render a native search tool template, substituting the `{search_query}` placeholder
+/// (when present) with a query derived from the conversation (the last user text).
+fn render_search_tool_template(template: &Value, query: Option<&str>) -> Value {
+    let Some(object) = template.as_object() else {
+        return template.clone();
+    };
+    let mut rendered = object.clone();
+    let replacement = query.filter(|q| !q.is_empty()).unwrap_or("search");
+    let substitute = |value: &mut Value| {
+        if let Value::String(text) = value {
+            if text.contains("{search_query}") {
+                *value = Value::String(text.replace("{search_query}", replacement));
+            }
+        }
+    };
+    for value in rendered.values_mut() {
+        substitute(value);
+        if let Value::Object(nested) = value {
+            for nested_value in nested.values_mut() {
+                substitute(nested_value);
+            }
+        }
+    }
+    Value::Object(rendered)
+}
+
+/// Extract a search query from the last user message (text blocks joined, trimmed).
+fn last_user_query(messages: Option<&Value>) -> Option<String> {
+    let messages = messages?.as_array()?;
+    for message in messages.iter().rev() {
+        let object = message.as_object()?;
+        if object.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let (text, _) = content_text_and_has_image(object.get("content")?);
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.chars().take(60).collect());
+        }
+    }
+    None
 }
 
 fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
@@ -1317,6 +1393,85 @@ mod tests {
             report.dropped_server_tools,
             vec!["web_search", "code_execution"]
         );
+    }
+
+    #[test]
+    fn maps_server_tools_to_provider_native_shape() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.search_tool_template = Some(json!({
+            "type": "web_search",
+            "web_search": {"search_result": true, "search_query": "{search_query}"}
+        }));
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20260209", "name": "web_search"},
+                {"type": "web_fetch_20260209", "name": "web_fetch"},
+                {"type": "code_execution_20260120", "name": "code_execution"}
+            ]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["web_search"]["search_result"], true);
+        // {search_query} is replaced with the last user message text so the provider
+        // actually performs a search (glm requires a real query).
+        assert_eq!(tools[0]["web_search"]["search_query"], "hi");
+        assert_eq!(report.mapped_server_tools, vec!["web_search"]);
+        assert_eq!(
+            report.dropped_server_tools,
+            vec!["web_fetch", "code_execution"]
+        );
+    }
+
+    #[test]
+    fn provider_native_with_request_params_enables_qwen_search() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.search_request_params = Some(json!({
+            "enable_search": true,
+            "search_options": {"forced_search": true}
+        }));
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "今天的 AI 新闻"}],
+            "tools": [
+                {"type": "web_search_20260209", "name": "web_search"},
+                {"type": "web_fetch_20260209", "name": "web_fetch"}
+            ]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        // Search is a top-level request parameter, not a tool.
+        assert_eq!(out["enable_search"], true);
+        assert_eq!(out["search_options"]["forced_search"], true);
+        assert!(out.get("tools").is_none());
+        assert_eq!(report.mapped_server_tools, vec!["web_search"]);
+        assert_eq!(report.dropped_server_tools, vec!["web_fetch"]);
+    }
+
+    #[test]
+    fn provider_native_without_template_drops_search_tools() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20260209", "name": "web_search"},
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}}
+            ]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert_eq!(report.dropped_server_tools, vec!["web_search"]);
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub enum ServerToolPolicy {
     MapToFunction,
     /// Keep the tool definition object unchanged (for upstreams that recognize the types).
     Passthrough,
+    /// Emit the provider's native search tool shape from `search_tool_template` when the
+    /// upstream has server-side search in chat completions (e.g. glm web_search object).
+    /// web_fetch and other server tools are dropped.
+    ProviderNative,
 }
 
 /// What `response_format` values the upstream accepts.
@@ -126,6 +130,17 @@ pub struct ModelCapabilities {
     /// `None` passes the downstream value through unchanged.
     #[serde(default)]
     pub max_tokens_cap: Option<u64>,
+    /// Native search tool template for `ServerToolPolicy::ProviderNative` (e.g.
+    /// `{"type":"web_search","web_search":{"search_result":true}}` for glm). The optional
+    /// `{search_query}` placeholder is replaced with the last user message.
+    #[serde(default)]
+    pub search_tool_template: Option<serde_json::Value>,
+    /// Native search request parameters for `ServerToolPolicy::ProviderNative`, merged into
+    /// the top-level request when the upstream enables search via parameters rather than a
+    /// tool (e.g. qwen's `{"enable_search": true, "search_options": {...}}`). The optional
+    /// `{search_query}` placeholder is replaced with the last user message.
+    #[serde(default)]
+    pub search_request_params: Option<serde_json::Value>,
 }
 
 impl Default for ModelCapabilities {
@@ -140,6 +155,8 @@ impl Default for ModelCapabilities {
             response_format: ResponseFormatCap::JsonObject,
             stream_include_usage: true,
             max_tokens_cap: None,
+            search_tool_template: None,
+            search_request_params: None,
         }
     }
 }
