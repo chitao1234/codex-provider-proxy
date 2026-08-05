@@ -83,23 +83,14 @@ pub struct ExchangeFileLogger {
     stem: String,
     metadata_path: PathBuf,
     metadata: ExchangeMetadata,
-    request_body_path: PathBuf,
-    response_body_path: PathBuf,
-    request_body_writer: Option<BodyLogWriter>,
-    response_body_writer: Option<BodyLogWriter>,
+    request_body: BodyLogSink,
+    response_body: BodyLogSink,
     response_headers_path: PathBuf,
     response_content_encodings: Vec<String>,
     response_content_encoding_error: Option<String>,
     reconstructed_path: PathBuf,
     should_reconstruct: bool,
-    body_max_bytes: Option<u64>,
     body_compression: BodyLogCompression,
-    request_body_bytes: u64,
-    response_body_bytes: u64,
-    request_body_logged_bytes: u64,
-    response_body_logged_bytes: u64,
-    request_body_truncated: bool,
-    response_body_truncated: bool,
     active_attempt: Option<ActiveAttemptLog>,
 }
 
@@ -185,23 +176,24 @@ impl ExchangeFileLogger {
             stem,
             metadata_path,
             metadata,
-            request_body_path: request_body_path.clone(),
-            response_body_path: response_body_path.clone(),
-            request_body_writer: Some(create_body_writer(&request_body_path, body_compression)?),
-            response_body_writer: Some(create_body_writer(&response_body_path, body_compression)?),
+            request_body: BodyLogSink::new(
+                request_body_path,
+                body_compression,
+                body_max_bytes,
+                "request body",
+            )?,
+            response_body: BodyLogSink::new(
+                response_body_path,
+                body_compression,
+                body_max_bytes,
+                "response body",
+            )?,
             response_headers_path,
             response_content_encodings: Vec::new(),
             response_content_encoding_error: None,
             reconstructed_path,
             should_reconstruct,
-            body_max_bytes,
             body_compression,
-            request_body_bytes: 0,
-            response_body_bytes: 0,
-            request_body_logged_bytes: 0,
-            response_body_logged_bytes: 0,
-            request_body_truncated: false,
-            response_body_truncated: false,
             active_attempt: None,
         })
     }
@@ -255,34 +247,22 @@ impl ExchangeFileLogger {
             );
         }
 
-        let request_body_writer =
-            match create_body_writer(&request_body_path, self.body_compression) {
-                Ok(writer) => Some(writer),
-                Err(err) => {
-                    warn!(
-                        request_id = self.request_id,
-                        attempt = attempt_number,
-                        path = %request_body_path.display(),
-                        error = %err,
-                        "failed to create attempt request body log"
-                    );
-                    None
-                }
-            };
-        let response_body_writer =
-            match create_body_writer(&response_body_path, self.body_compression) {
-                Ok(writer) => Some(writer),
-                Err(err) => {
-                    warn!(
-                        request_id = self.request_id,
-                        attempt = attempt_number,
-                        path = %response_body_path.display(),
-                        error = %err,
-                        "failed to create attempt response body log"
-                    );
-                    None
-                }
-            };
+        let request_body_sink = BodyLogSink::new_best_effort(
+            self.request_id,
+            attempt_number,
+            request_body_path.clone(),
+            self.body_compression,
+            self.request_body.max_bytes,
+            "attempt request body",
+        );
+        let response_body_sink = BodyLogSink::new_best_effort(
+            self.request_id,
+            attempt_number,
+            response_body_path.clone(),
+            self.body_compression,
+            self.response_body.max_bytes,
+            "attempt response body",
+        );
 
         self.metadata.route_pid = route.route_pid;
         self.metadata.provider = route.provider_name.to_string();
@@ -311,16 +291,8 @@ impl ExchangeFileLogger {
 
         self.active_attempt = Some(ActiveAttemptLog {
             attempt_number,
-            request_body_path,
-            response_body_path,
-            request_body_writer,
-            response_body_writer,
-            request_body_bytes: 0,
-            response_body_bytes: 0,
-            request_body_logged_bytes: 0,
-            response_body_logged_bytes: 0,
-            request_body_truncated: false,
-            response_body_truncated: false,
+            request_body: request_body_sink,
+            response_body: response_body_sink,
         });
 
         if let Some(request_body) = request_body {
@@ -331,52 +303,12 @@ impl ExchangeFileLogger {
     }
 
     pub fn on_request_body_chunk(&mut self, chunk: &Bytes) {
-        self.request_body_bytes = self
-            .request_body_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let (write_len, truncated) = limited_chunk_len(
-            self.body_max_bytes,
-            self.request_body_logged_bytes,
-            chunk.len(),
-        );
-        self.request_body_truncated |= truncated;
-        self.request_body_logged_bytes = self
-            .request_body_logged_bytes
-            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
-
-        let to_write = &chunk[..write_len];
-        write_chunk_best_effort(
-            self.request_id,
-            &self.request_body_path,
-            &mut self.request_body_writer,
-            to_write,
-            "request body",
-        );
+        self.request_body.append(self.request_id, chunk);
         self.on_active_attempt_request_body_chunk(chunk);
     }
 
     pub fn on_response_body_chunk(&mut self, chunk: &Bytes) {
-        self.response_body_bytes = self
-            .response_body_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let (write_len, truncated) = limited_chunk_len(
-            self.body_max_bytes,
-            self.response_body_logged_bytes,
-            chunk.len(),
-        );
-        self.response_body_truncated |= truncated;
-        self.response_body_logged_bytes = self
-            .response_body_logged_bytes
-            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
-
-        let to_write = &chunk[..write_len];
-        write_chunk_best_effort(
-            self.request_id,
-            &self.response_body_path,
-            &mut self.response_body_writer,
-            to_write,
-            "response body",
-        );
+        self.response_body.append(self.request_id, chunk);
         self.on_active_attempt_response_body_chunk(chunk);
     }
 
@@ -566,25 +498,17 @@ impl ExchangeFileLogger {
         if let Some(active_attempt) = self.active_attempt.take() {
             self.finish_attempt_body_writers(active_attempt);
         }
-        flush_best_effort(
-            self.request_id,
-            &self.request_body_path,
-            &mut self.request_body_writer,
-            "request body",
-        );
-        flush_best_effort(
-            self.request_id,
-            &self.response_body_path,
-            &mut self.response_body_writer,
-            "response body",
-        );
+        self.request_body.finish(self.request_id);
+        self.response_body.finish(self.request_id);
 
-        self.metadata.request_body_bytes = self.request_body_bytes;
-        self.metadata.response_body_bytes = self.response_body_bytes;
-        self.metadata.request_body_logged_bytes = self.request_body_logged_bytes;
-        self.metadata.response_body_logged_bytes = self.response_body_logged_bytes;
-        self.metadata.request_body_truncated = self.request_body_truncated;
-        self.metadata.response_body_truncated = self.response_body_truncated;
+        let request_body = self.request_body.snapshot();
+        let response_body = self.response_body.snapshot();
+        self.metadata.request_body_bytes = request_body.bytes;
+        self.metadata.response_body_bytes = response_body.bytes;
+        self.metadata.request_body_logged_bytes = request_body.logged_bytes;
+        self.metadata.response_body_logged_bytes = response_body.logged_bytes;
+        self.metadata.request_body_truncated = request_body.truncated;
+        self.metadata.response_body_truncated = response_body.truncated;
         self.metadata.completed_unix_ms = Some(now_unix_ms());
         self.metadata.total_duration_ms = Some(
             self.metadata
@@ -593,9 +517,9 @@ impl ExchangeFileLogger {
                 .saturating_sub(self.metadata.started_unix_ms),
         );
         if let Some(final_attempt) = self.metadata.attempts.iter_mut().rev().find(|a| a.is_final) {
-            final_attempt.response_body_bytes = Some(self.response_body_bytes);
-            final_attempt.response_body_logged_bytes = Some(self.response_body_logged_bytes);
-            final_attempt.response_body_truncated = Some(self.response_body_truncated);
+            final_attempt.response_body_bytes = Some(response_body.bytes);
+            final_attempt.response_body_logged_bytes = Some(response_body.logged_bytes);
+            final_attempt.response_body_truncated = Some(response_body.truncated);
         }
 
         if self.should_reconstruct {
@@ -608,7 +532,7 @@ impl ExchangeFileLogger {
                 self.metadata.reconstruction_error = Some(truncate_meta_error(&err.to_string()));
                 warn!(
                     request_id = self.request_id,
-                    response_body = %self.response_body_path.display(),
+                    response_body = %self.response_body.path.display(),
                     reconstructed = %self.reconstructed_path.display(),
                     error = %err,
                     "response reconstruction failed; proxy response was unaffected"
@@ -633,52 +557,14 @@ impl ExchangeFileLogger {
         let Some(active_attempt) = self.active_attempt.as_mut() else {
             return;
         };
-        active_attempt.request_body_bytes = active_attempt
-            .request_body_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let (write_len, truncated) = limited_chunk_len(
-            self.body_max_bytes,
-            active_attempt.request_body_logged_bytes,
-            chunk.len(),
-        );
-        active_attempt.request_body_truncated |= truncated;
-        active_attempt.request_body_logged_bytes = active_attempt
-            .request_body_logged_bytes
-            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
-
-        write_chunk_best_effort(
-            self.request_id,
-            &active_attempt.request_body_path,
-            &mut active_attempt.request_body_writer,
-            &chunk[..write_len],
-            "attempt request body",
-        );
+        active_attempt.request_body.append(self.request_id, chunk);
     }
 
     fn on_active_attempt_response_body_chunk(&mut self, chunk: &Bytes) {
         let Some(active_attempt) = self.active_attempt.as_mut() else {
             return;
         };
-        active_attempt.response_body_bytes = active_attempt
-            .response_body_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let (write_len, truncated) = limited_chunk_len(
-            self.body_max_bytes,
-            active_attempt.response_body_logged_bytes,
-            chunk.len(),
-        );
-        active_attempt.response_body_truncated |= truncated;
-        active_attempt.response_body_logged_bytes = active_attempt
-            .response_body_logged_bytes
-            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
-
-        write_chunk_best_effort(
-            self.request_id,
-            &active_attempt.response_body_path,
-            &mut active_attempt.response_body_writer,
-            &chunk[..write_len],
-            "attempt response body",
-        );
+        active_attempt.response_body.append(self.request_id, chunk);
     }
 
     fn finish_active_attempt_if_matching(&mut self, attempt_number: u32) {
@@ -694,36 +580,27 @@ impl ExchangeFileLogger {
     }
 
     fn finish_attempt_body_writers(&mut self, mut active_attempt: ActiveAttemptLog) {
-        flush_best_effort(
-            self.request_id,
-            &active_attempt.request_body_path,
-            &mut active_attempt.request_body_writer,
-            "attempt request body",
-        );
-        flush_best_effort(
-            self.request_id,
-            &active_attempt.response_body_path,
-            &mut active_attempt.response_body_writer,
-            "attempt response body",
-        );
+        active_attempt.request_body.finish(self.request_id);
+        active_attempt.response_body.finish(self.request_id);
+        let request_body = active_attempt.request_body.snapshot();
+        let response_body = active_attempt.response_body.snapshot();
 
         if let Some(attempt_meta) = self.attempt_mut(active_attempt.attempt_number) {
-            attempt_meta.request_body_bytes = Some(active_attempt.request_body_bytes);
-            attempt_meta.request_body_logged_bytes = Some(active_attempt.request_body_logged_bytes);
-            attempt_meta.request_body_truncated = Some(active_attempt.request_body_truncated);
-            attempt_meta.response_body_bytes = Some(active_attempt.response_body_bytes);
-            attempt_meta.response_body_logged_bytes =
-                Some(active_attempt.response_body_logged_bytes);
-            attempt_meta.response_body_truncated = Some(active_attempt.response_body_truncated);
+            attempt_meta.request_body_bytes = Some(request_body.bytes);
+            attempt_meta.request_body_logged_bytes = Some(request_body.logged_bytes);
+            attempt_meta.request_body_truncated = Some(request_body.truncated);
+            attempt_meta.response_body_bytes = Some(response_body.bytes);
+            attempt_meta.response_body_logged_bytes = Some(response_body.logged_bytes);
+            attempt_meta.response_body_truncated = Some(response_body.truncated);
         }
     }
 
     fn reconstruct_and_write(&self) -> std::io::Result<()> {
-        let raw = read_logged_body_file(&self.response_body_path, self.body_compression)?;
+        let raw = read_logged_body_file(&self.response_body.path, self.body_compression)?;
         if raw.is_empty() {
             return Ok(());
         }
-        if self.response_body_truncated && !self.response_content_encodings.is_empty() {
+        if self.response_body.truncated && !self.response_content_encodings.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "cannot decode a truncated content-encoded response body",
@@ -841,16 +718,132 @@ struct ExchangeAttemptMetadata {
 
 struct ActiveAttemptLog {
     attempt_number: u32,
-    request_body_path: PathBuf,
-    response_body_path: PathBuf,
-    request_body_writer: Option<BodyLogWriter>,
-    response_body_writer: Option<BodyLogWriter>,
-    request_body_bytes: u64,
-    response_body_bytes: u64,
-    request_body_logged_bytes: u64,
-    response_body_logged_bytes: u64,
-    request_body_truncated: bool,
-    response_body_truncated: bool,
+    request_body: BodyLogSink,
+    response_body: BodyLogSink,
+}
+
+#[derive(Clone, Copy)]
+struct BodyLogSnapshot {
+    bytes: u64,
+    logged_bytes: u64,
+    truncated: bool,
+}
+
+struct BodyLogSink {
+    path: PathBuf,
+    writer: Option<BodyLogWriter>,
+    max_bytes: Option<u64>,
+    bytes: u64,
+    logged_bytes: u64,
+    truncated: bool,
+    kind: &'static str,
+}
+
+impl BodyLogSink {
+    fn new(
+        path: PathBuf,
+        compression: BodyLogCompression,
+        max_bytes: Option<u64>,
+        kind: &'static str,
+    ) -> std::io::Result<Self> {
+        let writer = create_body_writer(&path, compression)?;
+        Ok(Self {
+            path,
+            writer: Some(writer),
+            max_bytes,
+            bytes: 0,
+            logged_bytes: 0,
+            truncated: false,
+            kind,
+        })
+    }
+
+    fn new_best_effort(
+        request_id: u64,
+        attempt_number: u32,
+        path: PathBuf,
+        compression: BodyLogCompression,
+        max_bytes: Option<u64>,
+        kind: &'static str,
+    ) -> Self {
+        match Self::new(path.clone(), compression, max_bytes, kind) {
+            Ok(sink) => sink,
+            Err(err) => {
+                warn!(
+                    request_id,
+                    attempt = attempt_number,
+                    path = %path.display(),
+                    error = %err,
+                    kind,
+                    "failed to create exchange body log"
+                );
+                Self {
+                    path,
+                    writer: None,
+                    max_bytes,
+                    bytes: 0,
+                    logged_bytes: 0,
+                    truncated: false,
+                    kind,
+                }
+            }
+        }
+    }
+
+    fn append(&mut self, request_id: u64, chunk: &Bytes) {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let (write_len, truncated) =
+            limited_chunk_len(self.max_bytes, self.logged_bytes, chunk.len());
+        self.truncated |= truncated;
+        self.logged_bytes = self
+            .logged_bytes
+            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+
+        if write_len == 0 {
+            return;
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if let Err(err) = writer
+            .write_all(&chunk[..write_len])
+            .and_then(|_| writer.flush())
+        {
+            warn!(
+                request_id,
+                path = %self.path.display(),
+                kind = self.kind,
+                error = %err,
+                "failed to append or flush exchange log chunk"
+            );
+            self.writer = None;
+        }
+    }
+
+    fn finish(&mut self, request_id: u64) {
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        if let Err(err) = writer.finish() {
+            warn!(
+                request_id,
+                path = %self.path.display(),
+                kind = self.kind,
+                error = %err,
+                "failed to flush exchange log file"
+            );
+        }
+    }
+
+    fn snapshot(&self) -> BodyLogSnapshot {
+        BodyLogSnapshot {
+            bytes: self.bytes,
+            logged_bytes: self.logged_bytes,
+            truncated: self.truncated,
+        }
+    }
 }
 
 enum BodyLogWriter {
@@ -983,54 +976,6 @@ fn read_logged_body_file(path: &Path, compression: BodyLogCompression) -> std::i
             let file = File::open(path)?;
             zstd::stream::decode_all(file)
         }
-    }
-}
-
-fn write_chunk_best_effort(
-    request_id: u64,
-    path: &Path,
-    writer: &mut Option<BodyLogWriter>,
-    chunk: &[u8],
-    kind: &'static str,
-) {
-    if chunk.is_empty() {
-        return;
-    }
-    let Some(writer_inner) = writer.as_mut() else {
-        return;
-    };
-    if let Err(err) = writer_inner
-        .write_all(chunk)
-        .and_then(|_| writer_inner.flush())
-    {
-        warn!(
-            request_id,
-            path = %path.display(),
-            kind,
-            error = %err,
-            "failed to append or flush exchange log chunk"
-        );
-        *writer = None;
-    }
-}
-
-fn flush_best_effort(
-    request_id: u64,
-    path: &Path,
-    writer: &mut Option<BodyLogWriter>,
-    kind: &'static str,
-) {
-    let Some(writer_inner) = writer.take() else {
-        return;
-    };
-    if let Err(err) = writer_inner.finish() {
-        warn!(
-            request_id,
-            path = %path.display(),
-            kind,
-            error = %err,
-            "failed to flush exchange log file"
-        );
     }
 }
 
@@ -1801,7 +1746,7 @@ mod tests {
             payload.as_slice()
         );
         assert_eq!(
-            super::read_logged_body_file(&logger.response_body_path, BodyLogCompression::Zstd)
+            super::read_logged_body_file(&logger.response_body.path, BodyLogCompression::Zstd)
                 .unwrap(),
             compressed_payload
         );
@@ -1816,18 +1761,45 @@ mod tests {
             std::process::id(),
             super::now_unix_ms()
         ));
-        let mut writer = Some(super::create_body_writer(&path, BodyLogCompression::None).unwrap());
-
-        super::write_chunk_best_effort(
-            78,
-            &path,
-            &mut writer,
-            b"visible immediately",
+        let mut sink = super::BodyLogSink::new(
+            path.clone(),
+            BodyLogCompression::None,
+            None,
             "response body",
-        );
+        )
+        .unwrap();
+        sink.append(78, &Bytes::from_static(b"visible immediately"));
 
         assert_eq!(std::fs::read(&path).unwrap(), b"visible immediately");
-        writer.take().unwrap().finish().unwrap();
+        sink.finish(78);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn body_log_sink_tracks_total_logged_and_truncated_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-provider-proxy-body-limit-{}-{}.bin",
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        let mut sink = super::BodyLogSink::new(
+            path.clone(),
+            BodyLogCompression::None,
+            Some(5),
+            "response body",
+        )
+        .unwrap();
+
+        sink.append(79, &Bytes::from_static(b"abc"));
+        sink.append(79, &Bytes::from_static(b"defgh"));
+        sink.finish(79);
+
+        let snapshot = sink.snapshot();
+        assert_eq!(snapshot.bytes, 8);
+        assert_eq!(snapshot.logged_bytes, 5);
+        assert!(snapshot.truncated);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcde");
 
         let _ = std::fs::remove_file(path);
     }
