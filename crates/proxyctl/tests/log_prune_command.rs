@@ -13,10 +13,10 @@ fn prune_logs_requires_yes_for_destructive_action() {
     let dir = create_temp_dir("proxyctl-prune-requires-yes");
     let (old_meta, old_body, _new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command_with_input(
+    let out = run_prune_command(
         &dir,
         &["--before-local-datetime", CUTOFF_LOCAL_DATETIME],
-        "\n",
+        Some("\n"),
     );
 
     assert!(
@@ -48,6 +48,7 @@ fn prune_logs_dry_run_does_not_delete_files() {
             CUTOFF_LOCAL_DATETIME,
             "--dry-run",
         ],
+        None,
     );
 
     assert!(
@@ -75,6 +76,7 @@ fn prune_logs_with_yes_deletes_only_older_files() {
     let out = run_prune_command(
         &dir,
         &["--before-local-datetime", CUTOFF_LOCAL_DATETIME, "-y"],
+        None,
     );
 
     assert!(
@@ -103,6 +105,7 @@ fn prune_logs_with_yes_retains_orphan_exchange_artifacts() {
     let out = run_prune_command(
         &dir,
         &["--before-local-datetime", CUTOFF_LOCAL_DATETIME, "-y"],
+        None,
     );
 
     assert!(
@@ -123,10 +126,10 @@ fn prune_logs_without_yes_can_delete_after_interactive_confirmation() {
     let dir = create_temp_dir("proxyctl-prune-interactive-confirm");
     let (old_meta, old_body, new_meta) = seed_log_files(&dir);
 
-    let out = run_prune_command_with_input(
+    let out = run_prune_command(
         &dir,
         &["--before-local-datetime", CUTOFF_LOCAL_DATETIME],
-        "yes\n",
+        Some("yes\n"),
     );
 
     assert!(
@@ -142,23 +145,10 @@ fn prune_logs_without_yes_can_delete_after_interactive_confirmation() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-fn run_prune_command(log_dir: &Path, extra_args: &[&str]) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_codex-provider-proxyctl");
-    let dir_arg = log_dir.to_string_lossy().to_string();
-
-    let mut cmd = Command::new(bin);
-    cmd.current_dir(log_dir)
-        .arg("prune-logs")
-        .arg("--dir")
-        .arg(dir_arg)
-        .args(extra_args);
-    cmd.output().expect("run codex-provider-proxyctl")
-}
-
-fn run_prune_command_with_input(
+fn run_prune_command(
     log_dir: &Path,
     extra_args: &[&str],
-    input: &str,
+    input: Option<&str>,
 ) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_codex-provider-proxyctl");
     let dir_arg = log_dir.to_string_lossy().to_string();
@@ -174,7 +164,7 @@ fn run_prune_command_with_input(
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn codex-provider-proxyctl");
-    {
+    if let Some(input) = input {
         let stdin = child.stdin.as_mut().expect("child stdin");
         stdin.write_all(input.as_bytes()).expect("write stdin");
     }
