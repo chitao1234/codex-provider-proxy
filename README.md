@@ -194,6 +194,56 @@ Compressed request bodies are not rewritten unless their `Content-Encoding` is a
 changes the JSON body, the proxy removes the downstream `Content-Length` header before forwarding so the upstream
 client can send the correct length for the rewritten body.
 
+## API Format Conversion (Messages ⇄ Chat Completions)
+
+Providers can opt into converting **Anthropic Messages requests (Claude Code) to upstream OpenAI
+Chat Completions** and converting responses back:
+
+```toml
+[providers.chat_provider]
+base_url = "https://api.deepseek.com/"
+api_key = "replace-me"
+upstream_api = "openai_chat_completions"        # upstream dialect; default "passthrough"
+accept_downstream_apis = ["anthropic_messages"] # convert Messages POST /v1/messages → POST /chat/completions
+
+[providers.chat_provider.capabilities]           # provider-level conversion defaults
+max_tokens_field = "max_tokens"                  # or "max_completion_tokens"
+thinking_param = "top_level"                     # DeepSeek-style thinking: {type}; "none" for OpenAI/Grok
+reasoning_effort = { enabled = true, levels = ["low", "high", "max"], default = "high" }
+server_tools = "drop"                            # how Anthropic server tools (web_search_*) are handled
+
+[providers.chat_provider.models."deepseek-v4-pro"]  # per-model overrides, matched after model_mappings
+image_input = false
+```
+
+Conversion behavior (see `docs/messages-to-chat-completions-conversion.md` for the full design):
+
+- Request: `system` merges into a leading `system` message (billing attribution and empty blocks
+  dropped); `tool_result` blocks become `role: "tool"` messages emitted before the enclosing user
+  turn; assistant turns merge text/thinking/tool_use into one message with `content: ""` when
+  empty; mid-conversation `role: "system"` messages become `<system-reminder>` user messages;
+  `stop_sequences` → `stop`, `tool_choice` `any` → `required`, `output_config.effort` → clamped
+  `reasoning_effort`; streamed requests add `stream_options.include_usage`.
+- Tools: custom tools map to `function` tools (with `properties` ensured and `$schema` stripped).
+  Anthropic server tools (`web_search_20260209`, `web_fetch_20260209`, `code_execution_*`, ...)
+  are handled per `server_tools`: `drop` (default; safe when the upstream has no search),
+  `map_to_function` (web_search/web_fetch become query/url function tools), or `passthrough`.
+- Response (non-streaming): Chat JSON → Messages JSON with `msg_`-prefixed id, thinking blocks
+  from `reasoning_content`, `tool_use` blocks from `tool_calls`, usage renamed
+  (`prompt_tokens` → `input_tokens`, `cached_tokens` → `cache_read_input_tokens`,
+  `reasoning_tokens` → `output_tokens_details.thinking_tokens`).
+- Response (streaming): Chat SSE chunks → Messages SSE events
+  (`message_start` → `content_block_start`/`delta`/`stop` → `message_delta` → `message_stop`),
+  tolerating DeepSeek-style chunks (`content: null`, `usage: null`, final `choices: []` usage
+  chunk) and streams that end without `[DONE]`.
+- Errors: upstream non-2xx JSON errors become Anthropic-style `{"type":"error","error":{...}}`
+  with the status preserved; requests the converter cannot represent (e.g. image input when
+  `image_input = false`) return HTTP 400 with an Anthropic error envelope.
+
+Providers without `upstream_api`/`accept_downstream_apis` proxy transparently, unchanged.
+Converted exchanges still record the upstream bytes in exchange logs and statistics; token
+usage extraction already understands Chat Completions shapes.
+
 ## Persistent Statistics
 
 Statistics are enabled by default and stored in SQLite, independently of tracing and exchange-body logging:

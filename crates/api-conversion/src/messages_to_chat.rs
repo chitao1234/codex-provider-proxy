@@ -4,20 +4,19 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::chat::{
-    ChatUsage, delta_string, extract_usage, first_choice, first_choice_delta,
-    first_choice_finish_reason, first_choice_message, is_usage_only_chunk, upstream_id,
-    upstream_model,
+    delta_string, extract_usage, first_choice, first_choice_delta, first_choice_finish_reason,
+    first_choice_message, is_usage_only_chunk, upstream_id, upstream_model, ChatUsage,
 };
 use crate::dialect::{
     MaxTokensField, ModelCapabilities, ResponseFormatCap, ServerToolPolicy, ThinkingParam,
 };
 use crate::error::ConversionError;
 use crate::messages::{
-    ContentBlock, SystemPrompt, classify_block, content_text_and_has_image, is_server_tool,
-    server_tool_function_name, tool_result_to_string,
+    classify_block, content_text_and_has_image, is_server_tool, server_tool_function_name,
+    tool_result_to_string, ContentBlock, SystemPrompt,
 };
 use crate::sse::encode_sse_event;
 
@@ -36,19 +35,26 @@ pub fn convert_messages_request(
     caps: &ModelCapabilities,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
     let Some(request) = body.as_object() else {
-        return Err(ConversionError::invalid("request body is not a JSON object"));
+        return Err(ConversionError::invalid(
+            "request body is not a JSON object",
+        ));
     };
 
     let mut out = Map::new();
     copy_string(request, &mut out, "model", "model");
-    copy_u64(request, &mut out, "max_tokens", max_tokens_field(caps.max_tokens_field));
+    copy_u64(
+        request,
+        &mut out,
+        "max_tokens",
+        max_tokens_field(caps.max_tokens_field),
+    );
     copy_bool(request, &mut out, "stream", "stream");
-    let stream = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if stream && caps.stream_include_usage {
-        out.insert(
-            "stream_options".to_string(),
-            json!({"include_usage": true}),
-        );
+        out.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
     copy_value(request, &mut out, "temperature", "temperature");
     copy_user(request, &mut out);
@@ -62,7 +68,8 @@ pub fn convert_messages_request(
     let messages = expand_messages(request.get("messages"), caps)?;
     let (tools, report) = convert_tools(request.get("tools"), caps)?;
 
-    let mut chat_messages: Vec<Value> = Vec::with_capacity(messages.len() + usize::from(!system.is_empty()));
+    let mut chat_messages: Vec<Value> =
+        Vec::with_capacity(messages.len() + usize::from(!system.is_empty()));
     if !system.is_empty() {
         chat_messages.push(json!({"role": "system", "content": system.joined()}));
     }
@@ -133,7 +140,11 @@ fn convert_stop_sequences(request: &Map<String, Value>, out: &mut Map<String, Va
         many => {
             out.insert(
                 "stop".to_string(),
-                Value::Array(many.iter().map(|s| Value::String((*s).to_string())).collect()),
+                Value::Array(
+                    many.iter()
+                        .map(|s| Value::String((*s).to_string()))
+                        .collect(),
+                ),
             );
         }
     }
@@ -175,7 +186,10 @@ fn convert_effort_and_thinking(
             .or(config.default.as_deref())
             .and_then(|effort| caps.clamp_effort(effort));
         if let Some(level) = level {
-            out.insert("reasoning_effort".to_string(), Value::String(level.to_string()));
+            out.insert(
+                "reasoning_effort".to_string(),
+                Value::String(level.to_string()),
+            );
         }
     }
     Ok(())
@@ -214,7 +228,12 @@ fn convert_parallel_tool_use(
     let downstream_value = request
         .get("parallel_tool_use")
         .and_then(Value::as_bool)
-        .or_else(|| request.get("disable_parallel_tool_use").and_then(Value::as_bool).map(|disabled| !disabled));
+        .or_else(|| {
+            request
+                .get("disable_parallel_tool_use")
+                .and_then(Value::as_bool)
+                .map(|disabled| !disabled)
+        });
     if let Some(parallel) = downstream_value {
         out.insert("parallel_tool_calls".to_string(), Value::Bool(parallel));
     }
@@ -244,7 +263,10 @@ fn convert_response_format(
                 );
             }
             ResponseFormatCap::JsonObject => {
-                out.insert("response_format".to_string(), json!({"type": "json_object"}));
+                out.insert(
+                    "response_format".to_string(),
+                    json!({"type": "json_object"}),
+                );
             }
             ResponseFormatCap::Text => {
                 return Err(ConversionError::unsupported(
@@ -285,7 +307,10 @@ fn expand_messages(
         let Some(object) = message.as_object() else {
             continue;
         };
-        let role = object.get("role").and_then(Value::as_str).unwrap_or_default();
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match role {
             "system" => {
                 let text = object
@@ -309,7 +334,11 @@ fn expand_messages(
                 let mut non_tool_blocks = Vec::new();
                 for block in blocks {
                     match classify_block(block) {
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
                             let Some(tool_use_id) = tool_use_id.filter(|id| !id.is_empty()) else {
                                 continue;
                             };
@@ -337,7 +366,10 @@ fn expand_messages(
     Ok(out)
 }
 
-fn expand_user_content(blocks: &[Value], caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+fn expand_user_content(
+    blocks: &[Value],
+    caps: &ModelCapabilities,
+) -> Result<Value, ConversionError> {
     let mut text_parts = Vec::new();
     let mut images: Vec<Value> = Vec::new();
     for block in blocks {
@@ -372,7 +404,10 @@ fn convert_image_block(block: &Value, caps: &ModelCapabilities) -> Result<Value,
         ));
     }
     let source = block.get("source");
-    let url = match source.and_then(|source| source.get("type")).and_then(Value::as_str) {
+    let url = match source
+        .and_then(|source| source.get("type"))
+        .and_then(Value::as_str)
+    {
         Some("base64") => {
             let media_type = source
                 .and_then(|source| source.get("media_type"))
@@ -449,10 +484,7 @@ fn expand_assistant_message(object: &Map<String, Value>) -> Result<Value, Conver
     let mut out = Map::new();
     out.insert("role".to_string(), json!("assistant"));
     // OpenAI requires content to exist; empty string when the turn has only tool calls.
-    out.insert(
-        "content".to_string(),
-        json!(text_parts.join("\n\n")),
-    );
+    out.insert("content".to_string(), json!(text_parts.join("\n\n")));
     if !reasoning_parts.is_empty() {
         out.insert(
             "reasoning_content".to_string(),
@@ -520,7 +552,10 @@ fn convert_tools(
             continue;
         }
 
-        let name = object.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if name.is_empty() {
             continue;
         }
@@ -610,7 +645,9 @@ pub fn convert_chat_response(body: &Value) -> Result<Value, ConversionError> {
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
-            let Some(call) = call.as_object() else { continue };
+            let Some(call) = call.as_object() else {
+                continue;
+            };
             let function = call.get("function").and_then(Value::as_object);
             let name = function
                 .and_then(|function| function.get("name"))
@@ -788,10 +825,7 @@ impl ChatStreamConverter {
             self.process_delta(delta, out);
         }
         if let Some(finish_reason) = first_choice_finish_reason(&chunk) {
-            self.stop_reason = Some(map_finish_reason(
-                Some(finish_reason),
-                self.saw_tool_call(),
-            ));
+            self.stop_reason = Some(map_finish_reason(Some(finish_reason), self.saw_tool_call()));
             self.close_blocks(out);
         }
         let usage = extract_usage(&chunk);
@@ -822,9 +856,7 @@ impl ChatStreamConverter {
     }
 
     fn saw_tool_call(&self) -> bool {
-        self.tools
-            .values()
-            .any(|tool| tool.block_index.is_some())
+        self.tools.values().any(|tool| tool.block_index.is_some())
     }
 
     fn begin(&mut self, chunk: &Value, out: &mut Vec<Bytes>) {
@@ -978,7 +1010,9 @@ impl ChatStreamConverter {
             if let Some(arguments) = new_arguments {
                 accumulator.arguments.push_str(&arguments);
             }
-            accumulator.block_index.is_none() && accumulator.id.is_some() && accumulator.name.is_some()
+            accumulator.block_index.is_none()
+                && accumulator.id.is_some()
+                && accumulator.name.is_some()
         };
 
         if announce {
@@ -992,7 +1026,10 @@ impl ChatStreamConverter {
             self.close_text(out);
             self.close_thinking(out);
             let index = self.allocate_block_index();
-            self.tools.get_mut(&upstream_index).expect("inserted above").block_index = Some(index);
+            self.tools
+                .get_mut(&upstream_index)
+                .expect("inserted above")
+                .block_index = Some(index);
             out.push(encode_sse_event(
                 "content_block_start",
                 &json!({
@@ -1027,7 +1064,10 @@ impl ChatStreamConverter {
         let mut indices: Vec<(usize, String)> = self
             .tools
             .values()
-            .filter_map(|tool| tool.block_index.map(|index| (index, tool.arguments.clone())))
+            .filter_map(|tool| {
+                tool.block_index
+                    .map(|index| (index, tool.arguments.clone()))
+            })
             .collect();
         indices.sort_by_key(|(index, _)| *index);
         for (index, arguments) in indices {
@@ -1074,7 +1114,10 @@ impl ChatStreamConverter {
             return;
         }
         self.message_stop_sent = true;
-        out.push(encode_sse_event("message_stop", &json!({"type": "message_stop"})));
+        out.push(encode_sse_event(
+            "message_stop",
+            &json!({"type": "message_stop"}),
+        ));
     }
 
     fn allocate_block_index(&mut self) -> usize {
@@ -1171,8 +1214,14 @@ mod tests {
         assert_eq!(messages[1]["content"], "");
         assert_eq!(messages[1]["reasoning_content"], "let me call the tool");
         assert_eq!(messages[1]["tool_calls"][0]["id"], "toolu_1");
-        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "get_weather");
-        assert_eq!(messages[1]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "toolu_1");
         assert_eq!(messages[2]["content"], "sunny");
@@ -1194,7 +1243,10 @@ mod tests {
         let (out, _) = convert_messages_request(&body, &caps()).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages[1]["role"], "user");
-        assert!(messages[1]["content"].as_str().unwrap().contains("<system-reminder>"));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
     }
 
     #[test]
@@ -1215,8 +1267,13 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "Read");
         assert!(tools[0]["function"]["parameters"].get("$schema").is_none());
-        assert!(tools[0]["function"]["parameters"].get("properties").is_some());
-        assert_eq!(report.dropped_server_tools, vec!["web_search", "code_execution"]);
+        assert!(tools[0]["function"]["parameters"]
+            .get("properties")
+            .is_some());
+        assert_eq!(
+            report.dropped_server_tools,
+            vec!["web_search", "code_execution"]
+        );
     }
 
     #[test]
@@ -1249,10 +1306,14 @@ mod tests {
             (json!({"type": "auto"}), json!("auto")),
             (json!({"type": "any"}), json!("required")),
             (json!({"type": "none"}), json!("none")),
-            (json!({"type": "tool", "name": "f"}), json!({"type": "function", "function": {"name": "f"}})),
+            (
+                json!({"type": "tool", "name": "f"}),
+                json!({"type": "function", "function": {"name": "f"}}),
+            ),
         ];
         for (choice, expected) in cases {
-            let body = json!({"model": "m", "max_tokens": 1, "messages": [], "tool_choice": choice});
+            let body =
+                json!({"model": "m", "max_tokens": 1, "messages": [], "tool_choice": choice});
             let (out, _) = convert_messages_request(&body, &caps()).unwrap();
             assert_eq!(out["tool_choice"], expected);
         }
@@ -1322,7 +1383,10 @@ mod tests {
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "what is this");
         assert_eq!(content[1]["type"], "image_url");
-        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
     }
 
     #[test]
@@ -1347,7 +1411,10 @@ mod tests {
         assert_eq!(out["type"], "message");
         assert_eq!(out["stop_reason"], "tool_use");
         assert_eq!(out["content"][0]["type"], "thinking");
-        assert_eq!(out["content"][0]["signature"], "msg_ff11019d-aa8d-4251-8ff0-d7644de0987e");
+        assert_eq!(
+            out["content"][0]["signature"],
+            "msg_ff11019d-aa8d-4251-8ff0-d7644de0987e"
+        );
         assert_eq!(out["content"][1]["type"], "text");
         assert_eq!(out["content"][2]["type"], "tool_use");
         assert_eq!(out["content"][2]["input"]["city"], "Paris");
@@ -1413,7 +1480,12 @@ mod tests {
     fn finish_without_done_emits_terminators() {
         let mut converter = ChatStreamConverter::new();
         let mut out = Vec::new();
-        converter.on_chunk(r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#, &mut out).unwrap();
+        converter
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+                &mut out,
+            )
+            .unwrap();
         converter.finish(&mut out);
         let text = String::from_utf8_lossy(&out.concat()).into_owned();
         assert!(text.contains("event: message_delta"));

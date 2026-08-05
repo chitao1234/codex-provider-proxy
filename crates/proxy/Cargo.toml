@@ -9,6 +9,7 @@ axum.workspace = true
 brotli.workspace = true
 bytes.workspace = true
 clap.workspace = true
+codex-provider-proxy-api-conversion = { path = "../api-conversion" }
 codex-provider-proxy-rpc-types = { path = "../rpc-types" }
 dashmap.workspace = true
 futures-util.workspace = true

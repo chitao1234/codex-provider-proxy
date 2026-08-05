@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// A request that cannot be represented for the selected upstream conversion.
 ///
@@ -159,10 +159,7 @@ mod tests {
         assert_eq!(body["error"]["type"], "authentication_error");
         assert_eq!(body["error"]["message"], "auth_failed");
 
-        let body = convert_chat_error_body(
-            http::StatusCode::BAD_GATEWAY,
-            &json!({"error": {}}),
-        );
+        let body = convert_chat_error_body(http::StatusCode::BAD_GATEWAY, &json!({"error": {}}));
         assert_eq!(body["error"]["type"], "api_error");
     }
 }

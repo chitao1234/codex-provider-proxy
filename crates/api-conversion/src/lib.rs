@@ -15,6 +15,9 @@ pub mod messages;
 pub mod messages_to_chat;
 pub mod sse;
 
-pub use dialect::{DownstreamApi, MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap, ServerToolPolicy, ThinkingParam, UpstreamApi};
+pub use dialect::{
+    DownstreamApi, MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
+    ServerToolPolicy, ThinkingParam, UpstreamApi,
+};
 pub use error::ConversionError;
-pub use messages_to_chat::{ChatStreamConverter, convert_chat_response, convert_messages_request};
+pub use messages_to_chat::{convert_chat_response, convert_messages_request, ChatStreamConverter};

@@ -334,6 +334,7 @@ dependencies = [
  "brotli",
  "bytes",
  "clap",
+ "codex-provider-proxy-api-conversion",
  "codex-provider-proxy-rpc-types",
  "dashmap",
  "flate2",
@@ -353,6 +354,16 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "codex-provider-proxy-api-conversion"
+version = "0.1.2"
+dependencies = [
+ "bytes",
+ "http",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

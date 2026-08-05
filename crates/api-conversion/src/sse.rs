@@ -26,13 +26,23 @@ pub fn data_payload(line: &str) -> Option<&str> {
     }
 }
 
+/// Extract the first `data:` payload from a complete SSE event that may span multiple lines
+/// (`event: X\ndata: {...}\n\n`). OpenAI-compatible upstreams emit a single data line per event.
+pub fn first_data_payload(event: &[u8]) -> Option<&str> {
+    let event = std::str::from_utf8(event).ok()?;
+    event.lines().find_map(data_payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn encodes_sse_event_with_trailing_blank_line() {
-        let event = encode_sse_event("message_start", &serde_json::json!({"type": "message_start"}));
+        let event = encode_sse_event(
+            "message_start",
+            &serde_json::json!({"type": "message_start"}),
+        );
         assert_eq!(
             event,
             Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
@@ -47,5 +57,14 @@ mod tests {
         assert_eq!(data_payload("event: message_start"), None);
         assert_eq!(data_payload(": keep-alive"), None);
         assert_eq!(data_payload("data:"), None);
+    }
+
+    #[test]
+    fn extracts_first_data_payload_from_multiline_event() {
+        let event = b"event: message_start\ndata: {\"a\":1}\n\n";
+        assert_eq!(first_data_payload(event), Some("{\"a\":1}"));
+        let event = b": keep-alive\n\n";
+        assert_eq!(first_data_payload(event), None);
+        assert_eq!(first_data_payload(b"\xff\xfe garbage"), None);
     }
 }

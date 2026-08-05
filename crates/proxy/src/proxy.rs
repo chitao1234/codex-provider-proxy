@@ -162,6 +162,28 @@ pub async fn handle_proxy(
 fn proxy_error_response(err: anyhow::Error) -> Response<Body> {
     let err_chain = format!("{err:#}");
     warn!(error = %err_chain, "proxy error");
+    if let Some(rejected) = err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<crate::api_conversion::RequestConversionRejected>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .and_then(|source| {
+                        source.downcast_ref::<crate::api_conversion::RequestConversionRejected>()
+                    })
+            })
+    }) {
+        let mut response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(rejected.error_body.to_string()))
+            .expect("static response construction cannot fail");
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
     if let Some(body_too_large) = err.chain().find_map(|cause| {
         cause.downcast_ref::<RequestBodyTooLarge>().or_else(|| {
             cause
@@ -323,6 +345,12 @@ async fn handle_proxy_inner(
         };
     let status = resp.status();
     let downstream_status = downstream_response_status(&cfg, status);
+    let conversion_applies = crate::api_conversion::response_conversion_enabled(
+        &cfg,
+        &parts.method,
+        &final_attempt.provider_name,
+        forwarded_path,
+    );
     let resp_headers = resp.headers().clone();
 
     if cfg.logging.log_responses {
@@ -421,7 +449,27 @@ async fn handle_proxy_inner(
         }
     }
 
-    let out_headers = filtered_response_headers(&resp_headers);
+    if !status.is_success() && conversion_applies {
+        return convert_upstream_error_response(
+            &cfg,
+            status,
+            downstream_status,
+            resp,
+            &resp_headers,
+        )
+        .await;
+    }
+
+    let mut out_headers = filtered_response_headers(&resp_headers);
+    if conversion_applies {
+        crate::api_conversion::strip_converted_response_headers(&mut out_headers);
+        if !is_text_event_stream(&out_headers) {
+            out_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+    }
 
     let (resp_stream, resp_capture) = response_stream_and_capture(
         &cfg,
@@ -439,6 +487,20 @@ async fn handle_proxy_inner(
         &final_attempt.provider_name,
         resp_stream,
     );
+    let resp_stream = if conversion_applies {
+        if is_text_event_stream(&resp_headers) {
+            Box::pin(crate::api_conversion::ChatToMessagesStream::new(
+                resp_stream,
+            )) as BoxRespStream
+        } else {
+            Box::pin(crate::api_conversion::NonStreamingConversionStream::new(
+                resp_stream,
+                cfg.request_body_buffer_max_bytes,
+            )) as BoxRespStream
+        }
+    } else {
+        resp_stream
+    };
     let statistics_for_stream = statistics.clone();
     let resp_stream = Box::pin(resp_stream.inspect_err(move |err| {
         if let Some(statistics) = &statistics_for_stream {
@@ -504,6 +566,50 @@ fn text_response(status: StatusCode, body: Body) -> Response<Body> {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+/// Convert a non-2xx upstream response of a converted request into the Anthropic error
+/// envelope when the body is JSON; otherwise pass the body through with filtered headers.
+async fn convert_upstream_error_response(
+    cfg: &Config,
+    upstream_status: StatusCode,
+    downstream_status: StatusCode,
+    resp: reqwest::Response,
+    upstream_headers: &HeaderMap,
+) -> Result<Response<Body>> {
+    let body = buffer_response_body_for_conversion(resp, cfg.request_body_buffer_max_bytes).await?;
+    let Ok(json) = serde_json::from_slice::<Value>(&body) else {
+        let mut response = Response::builder()
+            .status(downstream_status)
+            .body(Body::from(body))?;
+        *response.headers_mut() = filtered_response_headers(upstream_headers);
+        return Ok(response);
+    };
+    let converted = crate::api_conversion::convert_error_body(upstream_status, &json);
+    let mut response = Response::builder()
+        .status(downstream_status)
+        .body(Body::from(converted.to_string()))?;
+    let mut headers = filtered_response_headers(upstream_headers);
+    crate::api_conversion::strip_converted_response_headers(&mut headers);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+async fn buffer_response_body_for_conversion(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<Bytes, std::io::Error> {
+    let mut stream = TryStreamExt::map_err(resp.bytes_stream(), map_body_err);
+    let mut buffered = BytesMut::new();
+    while let Some(chunk) = stream.try_next().await? {
+        ensure_request_body_fits(buffered.len(), chunk.len(), max_bytes)?;
+        buffered.extend_from_slice(&chunk);
+    }
+    Ok(buffered.freeze())
 }
 
 fn not_found_response() -> Result<Response<Body>> {
@@ -600,7 +706,9 @@ fn prepare_upstream_attempt(
     incoming_query: Option<&str>,
     base_headers: &HeaderMap,
 ) -> Result<PreparedUpstreamAttempt> {
-    let url = build_outgoing_url(&route.provider, forwarded_path, incoming_query)?;
+    let upstream_path =
+        crate::api_conversion::conversion_upstream_path(&route.provider, forwarded_path);
+    let url = build_outgoing_url(&route.provider, upstream_path, incoming_query)?;
     let mut headers = base_headers.clone();
     headers.insert(
         header::AUTHORIZATION,
@@ -665,6 +773,12 @@ async fn send_upstream_request(
     } = request;
     if !transparent_retries_enabled(cfg, &method) {
         let mut initial_attempt = initial_attempt;
+        let conversion_may_apply = crate::api_conversion::request_conversion_enabled(
+            cfg,
+            &method,
+            &initial_attempt.provider_name,
+            &forwarded_path,
+        );
         let request_body = if request_rewrites_may_apply(
             cfg,
             &RequestRewriteContext {
@@ -673,8 +787,9 @@ async fn send_upstream_request(
                 provider_name: &initial_attempt.provider_name,
                 headers: &initial_attempt.headers,
             },
-        ) {
-            SingleAttemptRequestBody::Buffered(rewrite_request_body_for_attempt(
+        ) || conversion_may_apply
+        {
+            SingleAttemptRequestBody::Buffered(prepare_request_body_for_attempt(
                 cfg,
                 &method,
                 &forwarded_path,
@@ -682,7 +797,7 @@ async fn send_upstream_request(
                 buffer_request_body_unlogged(body, cfg.request_body_buffer_max_bytes).await?,
                 request_id,
                 1,
-            ))
+            )?)
         } else {
             SingleAttemptRequestBody::Stream(body)
         };
@@ -1183,6 +1298,73 @@ fn rewrite_request_body_for_attempt(
     out.body
 }
 
+/// Model-mapping rewrite followed by API format conversion when the provider converts
+/// Anthropic Messages traffic.
+fn prepare_request_body_for_attempt(
+    cfg: &crate::config::Config,
+    method: &http::Method,
+    forwarded_path: &str,
+    attempt: &mut PreparedUpstreamAttempt,
+    request_body: Bytes,
+    request_id: u64,
+    attempt_number: u32,
+) -> std::result::Result<Bytes, std::io::Error> {
+    let body = rewrite_request_body_for_attempt(
+        cfg,
+        method,
+        forwarded_path,
+        attempt,
+        request_body,
+        request_id,
+        attempt_number,
+    );
+    maybe_convert_request_body(
+        cfg,
+        method,
+        forwarded_path,
+        attempt,
+        body,
+        request_id,
+        attempt_number,
+    )
+}
+
+fn maybe_convert_request_body(
+    cfg: &crate::config::Config,
+    method: &http::Method,
+    forwarded_path: &str,
+    attempt: &mut PreparedUpstreamAttempt,
+    body: Bytes,
+    request_id: u64,
+    attempt_number: u32,
+) -> std::result::Result<Bytes, std::io::Error> {
+    if !crate::api_conversion::request_conversion_enabled(
+        cfg,
+        method,
+        &attempt.provider_name,
+        forwarded_path,
+    ) {
+        return Ok(body);
+    }
+    let converted = crate::api_conversion::convert_request_body(cfg, &attempt.provider_name, body)
+        .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
+    attempt.headers.remove(header::CONTENT_LENGTH);
+    attempt.headers.remove(ANTHROPIC_BETA_HEADER);
+    attempt.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    info!(
+        request_id,
+        attempt = attempt_number,
+        route_pid = ?attempt.route_pid,
+        provider = %attempt.provider_name,
+        upstream_url = %attempt.url,
+        "request converted from messages to chat completions"
+    );
+    Ok(converted)
+}
+
 fn apply_anthropic_beta_updates(headers: &mut HeaderMap, updates: &[AnthropicBetaUpdate]) {
     for update in updates {
         match *update {
@@ -1646,7 +1828,7 @@ fn responses_slow_down_error_code(event_bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn find_sse_event_boundary(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_sse_event_boundary(buf: &[u8]) -> Option<usize> {
     let mut idx = 0usize;
     while idx < buf.len() {
         match buf[idx] {
@@ -2091,7 +2273,7 @@ where
 
         let attempt_started = Instant::now();
         let attempt_number = attempt.saturating_add(1);
-        let request_body = rewrite_request_body_for_attempt(
+        let request_body = prepare_request_body_for_attempt(
             &cfg,
             &args.request.method,
             &args.request.forwarded_path,
@@ -2099,7 +2281,7 @@ where
             args.request.request_body.clone(),
             args.request_id,
             attempt_number,
-        );
+        )?;
         begin_exchange_log_attempt(
             args.exchange_logger.clone(),
             args.statistics.clone(),
@@ -2406,6 +2588,7 @@ mod tests {
     use bytes::BytesMut;
     use futures_util::{stream, StreamExt};
     use pid_resolver::platform::default_pid_resolver;
+    use serde_json::json;
     use tokio::sync::oneshot;
     use tracing_subscriber::EnvFilter;
     use url::Url;
@@ -2950,6 +3133,7 @@ mod tests {
             base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
             api_key: format!("token-{name}"),
             authorization_header: None,
+            ..Provider::default()
         }
     }
 
@@ -3052,6 +3236,7 @@ mod tests {
                 base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3080,6 +3265,7 @@ mod tests {
                 base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let cfg = test_config("provider_a", providers);
@@ -3108,6 +3294,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3143,6 +3330,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3198,6 +3386,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3255,6 +3444,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3296,6 +3486,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3328,6 +3519,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3361,6 +3553,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3435,6 +3628,7 @@ mod tests {
                     base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                     api_key: "token-a".to_string(),
                     authorization_header: None,
+                    ..Provider::default()
                 },
             )]),
         );
@@ -3505,6 +3699,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3531,6 +3726,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3562,6 +3758,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3598,6 +3795,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3624,6 +3822,7 @@ mod tests {
                 base_url: unused_loopback_url(),
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         providers.insert(
@@ -3632,6 +3831,7 @@ mod tests {
                 base_url: success_url,
                 api_key: "token-b".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3679,6 +3879,7 @@ mod tests {
                 base_url: unused_loopback_url(),
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3719,6 +3920,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -3818,6 +4020,7 @@ mod tests {
                 base_url: url,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let state = test_proxy_state(test_config("provider_a", providers));
@@ -3861,6 +4064,7 @@ mod tests {
                 base_url: url_a,
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         providers.insert(
@@ -3869,6 +4073,7 @@ mod tests {
                 base_url: url_b,
                 api_key: "token-b".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
 
@@ -3973,6 +4178,7 @@ mod tests {
                 base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                 api_key: "token-a".to_string(),
                 authorization_header: None,
+                ..Provider::default()
             },
         );
         let mut cfg = test_config("provider_a", providers);
@@ -4032,6 +4238,7 @@ mod tests {
                         base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                         api_key: "token-a".to_string(),
                         authorization_header: None,
+                        ..Provider::default()
                     },
                 )]),
             ),
@@ -4091,6 +4298,7 @@ mod tests {
                         base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                         api_key: "token-a".to_string(),
                         authorization_header: None,
+                        ..Provider::default()
                     },
                 )]),
             ),
@@ -4144,6 +4352,7 @@ mod tests {
                         base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
                         api_key: "token-a".to_string(),
                         authorization_header: None,
+                        ..Provider::default()
                     },
                 )]),
             ),
@@ -4161,5 +4370,364 @@ mod tests {
         }
 
         assert_eq!(String::from_utf8(delivered.to_vec()).unwrap(), payload);
+    }
+
+    // --- API conversion integration ---
+
+    #[derive(Clone)]
+    struct ScriptedServerState {
+        bodies: Arc<Mutex<Vec<Bytes>>>,
+        headers: Arc<Mutex<Vec<HeaderMap>>>,
+        response: Arc<Mutex<Option<axum::http::Response<Body>>>>,
+    }
+
+    async fn scripted_server_handler(
+        State(state): State<ScriptedServerState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::http::Response<Body> {
+        state.bodies.lock().unwrap().push(body);
+        state.headers.lock().unwrap().push(headers);
+        let response = state.response.lock().unwrap().take().unwrap_or_else(|| {
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from("ok"))
+                .unwrap()
+        });
+        response
+    }
+
+    async fn spawn_scripted_server(
+        path: &'static str,
+    ) -> (
+        Url,
+        Arc<Mutex<Vec<Bytes>>>,
+        Arc<Mutex<Vec<HeaderMap>>>,
+        Arc<Mutex<Option<axum::http::Response<Body>>>>,
+        oneshot::Sender<()>,
+    ) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let response = Arc::new(Mutex::new(None));
+        let state = ScriptedServerState {
+            bodies: bodies.clone(),
+            headers: headers.clone(),
+            response: response.clone(),
+        };
+        let app = Router::new()
+            .route(path, any(scripted_server_handler))
+            .with_state(state);
+        let (url, shutdown_tx) = spawn_test_server(app).await;
+        (url, bodies, headers, response, shutdown_tx)
+    }
+
+    fn converting_provider(base_url: Url) -> Provider {
+        Provider {
+            base_url,
+            api_key: "token-a".to_string(),
+            authorization_header: None,
+            upstream_api:
+                codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
+            accept_downstream_apis: vec![
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
+            ],
+            ..Provider::default()
+        }
+    }
+
+    fn messages_request(body: serde_json::Value) -> Request<Body> {
+        let body = serde_json::to_vec(&body).unwrap();
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages?beta=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn convert_non_streaming_body_parses_chat_json() {
+        let body = Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}");
+        let out = crate::api_conversion::convert_non_streaming_body(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["type"], "message");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_conversion_stream_adapts_body() {
+        let inner = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}")),
+        ]);
+        let mut stream =
+            crate::api_conversion::NonStreamingConversionStream::new(inner, 1024 * 1024);
+        let mut delivered = BytesMut::new();
+        while let Some(item) = stream.next().await {
+            delivered.extend_from_slice(&item.unwrap());
+        }
+        let out: serde_json::Value = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["content"][0]["text"], "x");
+    }
+
+    #[tokio::test]
+    async fn converts_messages_request_to_chat_completions_end_to_end() {
+        let (url, bodies, headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"id": "r1", "object": "chat.completion", "model": "deepseek-v4-pro", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), converting_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "stream": false,
+            "thinking": {"type": "adaptive"},
+            "system": "You are helpful",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let captured_bodies = bodies.lock().unwrap();
+        assert_eq!(captured_bodies.len(), 1);
+        let captured: serde_json::Value = serde_json::from_slice(&captured_bodies[0]).unwrap();
+        assert_eq!(captured["model"], "deepseek-v4-pro");
+        assert_eq!(captured["max_tokens"], 100);
+        assert_eq!(captured["messages"][0]["role"], "system");
+        assert_eq!(captured["messages"][0]["content"], "You are helpful");
+        assert_eq!(captured["messages"][1]["role"], "user");
+        assert_eq!(captured["messages"][1]["content"], "hi");
+        assert_eq!(captured["thinking"]["type"], "enabled");
+
+        let captured_headers = headers.lock().unwrap();
+        assert!(captured_headers[0].get("anthropic-beta").is_none());
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn passthrough_provider_keeps_messages_path_upstream() {
+        let (url, bodies, _headers, shutdown_tx) = spawn_body_capture_server("/messages").await;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "provider_a".to_string(),
+            Provider {
+                upstream_api:
+                    codex_provider_proxy_api_conversion::dialect::UpstreamApi::Passthrough,
+                ..converting_provider(url)
+            },
+        );
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(
+            json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn converts_non_streaming_chat_response_to_messages() {
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "abc123",
+                        "object": "chat.completion",
+                        "model": "deepseek-v4-pro",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello!",
+                                "reasoning_content": "thinking here"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 2}, "completion_tokens_details": {"reasoning_tokens": 3}}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), converting_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(
+            json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::CONTENT_LENGTH).is_none());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["id"], "msg_abc123");
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["stop_reason"], "end_turn");
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][0]["thinking"], "thinking here");
+        assert_eq!(out["content"][1]["type"], "text");
+        assert_eq!(out["content"][1]["text"], "Hello!");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["output_tokens"], 5);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 2);
+        assert_eq!(out["usage"]["output_tokens_details"]["thinking_tokens"], 3);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn converts_streaming_chat_response_to_messages_sse() {
+        let sse_body = concat!(
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"We\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\",\"reasoning_content\":null},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":9}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(sse_body))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), converting_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(
+            json!({"model": "m", "max_tokens": 1, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("\"id\":\"msg_x\""));
+        assert!(text.contains("\"type\":\"thinking_delta\""));
+        assert!(text.contains("\"thinking\":\"We\""));
+        assert!(text.contains("\"type\":\"text_delta\""));
+        assert!(text.contains("\"text\":\"Hi\""));
+        assert!(text.contains("\"stop_reason\":\"end_turn\""));
+        assert!(text.contains("event: message_stop"));
+        assert_eq!(text.matches("event: message_stop").count(), 1);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn converts_upstream_error_to_anthropic_error_envelope() {
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"error": {"message": "unknown tool type", "type": "invalid_request_error", "param": "tools[0].type"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), converting_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(
+            json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        assert_eq!(out["error"]["message"], "unknown tool type");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn rejects_unconvertible_request_with_anthropic_400() {
+        let (url, _bodies, _headers, _response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), converting_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        // Image input is unsupported by default capabilities.
+        let req = messages_request(json!({
+            "model": "m",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aaa"}}]}]
+        }));
+        let resp = proxy_error_response(
+            handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+                .await
+                .expect_err("unconvertible request should fail"),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        assert!(out["error"]["message"].as_str().unwrap().contains("image"));
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn provider_converts_messages_requires_both_config() {
+        let provider = converting_provider(Url::parse("https://example.com/").unwrap());
+        assert!(crate::api_conversion::provider_converts_messages(&provider));
+        let passthrough = Provider {
+            upstream_api: codex_provider_proxy_api_conversion::dialect::UpstreamApi::Passthrough,
+            ..provider.clone()
+        };
+        assert!(!crate::api_conversion::provider_converts_messages(
+            &passthrough
+        ));
     }
 }

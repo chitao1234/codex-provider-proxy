@@ -98,3 +98,40 @@ base_url = "https://api.other.example/"
 api_key = "replace-me"
 # You can override the full Authorization header value if you don't want Bearer auth:
 # authorization_header = "Api-Key replace-me"
+
+# Optional API format conversion (per provider). Providers without these fields proxy
+# transparently, exactly as before.
+#
+# `upstream_api` declares the dialect the provider speaks. Supported: "passthrough"
+# (default) and "openai_chat_completions".
+#
+# `accept_downstream_apis` lists downstream dialects to convert FROM. Supported:
+# "anthropic_messages" (Claude Code's Messages API). When set, POST /v1/messages requests
+# are converted to POST /chat/completions, and responses are converted back.
+#
+# `capabilities` sets provider-level conversion defaults; `models."<model>"` overrides them
+# per upstream model name (matched after [[rewrite.model_mappings]] rewrites). Available
+# knobs and defaults:
+#   max_tokens_field = "max_tokens"        # or "max_completion_tokens" (OpenAI official)
+#   thinking_param = "top_level"           # "top_level" (DeepSeek) or "none" (OpenAI/Grok)
+#   reasoning_effort = { enabled = true, levels = ["low","medium","high","xhigh","max"], default = null }
+#   server_tools = "drop"                  # "drop" | "map_to_function" | "passthrough"
+#   image_input = false
+#   parallel_tool_calls = true
+#   response_format = "json_object"        # "text" | "json_object" | "json_schema"
+#   stream_include_usage = true
+#
+# [providers.chat_provider]
+# base_url = "https://api.deepseek.com/"
+# api_key = "replace-me"
+# upstream_api = "openai_chat_completions"
+# accept_downstream_apis = ["anthropic_messages"]
+#
+# [providers.chat_provider.capabilities]
+# max_tokens_field = "max_tokens"
+# thinking_param = "top_level"
+# reasoning_effort = { enabled = true, levels = ["low", "high", "max"], default = "high" }
+# server_tools = "drop"
+#
+# [providers.chat_provider.models."deepseek-v4-pro"]
+# image_input = false

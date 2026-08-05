@@ -190,7 +190,10 @@ impl ModelCapabilities {
 }
 
 /// Whether a provider converts downstream Anthropic Messages requests to its upstream API.
-pub fn converts_messages_to_upstream(upstream_api: UpstreamApi, accepted: &[DownstreamApi]) -> bool {
+pub fn converts_messages_to_upstream(
+    upstream_api: UpstreamApi,
+    accepted: &[DownstreamApi],
+) -> bool {
     upstream_api != UpstreamApi::Passthrough && accepted.contains(&DownstreamApi::AnthropicMessages)
 }
 
@@ -244,9 +247,11 @@ mod tests {
                 ..ModelCapabilities::default()
             },
         )]);
-        let caps = ModelCapabilities::resolve("deepseek-v4-pro", Some(&provider_default), &overrides);
+        let caps =
+            ModelCapabilities::resolve("deepseek-v4-pro", Some(&provider_default), &overrides);
         assert!(!caps.image_input);
-        let other = ModelCapabilities::resolve("deepseek-v4-flash", Some(&provider_default), &overrides);
+        let other =
+            ModelCapabilities::resolve("deepseek-v4-flash", Some(&provider_default), &overrides);
         assert!(other.image_input);
         let unknown = ModelCapabilities::resolve("unknown-model", None, &overrides);
         assert!(!unknown.image_input);
@@ -258,7 +263,13 @@ mod tests {
             UpstreamApi::OpenAiChatCompletions,
             &[DownstreamApi::AnthropicMessages]
         ));
-        assert!(!converts_messages_to_upstream(UpstreamApi::Passthrough, &[DownstreamApi::AnthropicMessages]));
-        assert!(!converts_messages_to_upstream(UpstreamApi::OpenAiChatCompletions, &[]));
+        assert!(!converts_messages_to_upstream(
+            UpstreamApi::Passthrough,
+            &[DownstreamApi::AnthropicMessages]
+        ));
+        assert!(!converts_messages_to_upstream(
+            UpstreamApi::OpenAiChatCompletions,
+            &[]
+        ));
     }
 }

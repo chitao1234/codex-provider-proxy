@@ -66,7 +66,10 @@ pub fn classify_block(block: &Value) -> ContentBlock<'_> {
         Some("redacted_thinking") => ContentBlock::RedactedThinking,
         Some("tool_use") => ContentBlock::ToolUse {
             id: object.get("id").and_then(Value::as_str).unwrap_or_default(),
-            name: object.get("name").and_then(Value::as_str).unwrap_or_default(),
+            name: object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             input: object.get("input"),
         },
         Some("tool_result") => ContentBlock::ToolResult {
@@ -288,25 +291,50 @@ mod tests {
         assert!(matches!(classified[0], ContentBlock::Text("hello")));
         assert!(matches!(classified[1], ContentBlock::Thinking("hmm")));
         assert!(matches!(classified[2], ContentBlock::RedactedThinking));
-        assert!(matches!(classified[3], ContentBlock::ToolUse { id: "toolu_1", name: "Bash", .. }));
-        assert!(matches!(classified[4], ContentBlock::ToolResult { tool_use_id: Some("toolu_1"), .. }));
+        assert!(matches!(
+            classified[3],
+            ContentBlock::ToolUse {
+                id: "toolu_1",
+                name: "Bash",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classified[4],
+            ContentBlock::ToolResult {
+                tool_use_id: Some("toolu_1"),
+                ..
+            }
+        ));
         assert!(matches!(classified[5], ContentBlock::Image));
         assert!(matches!(classified[6], ContentBlock::ServerToolUse));
     }
 
     #[test]
     fn detects_server_tools() {
-        assert!(is_server_tool(&json!({"type": "web_search_20260209", "name": "web_search"})));
-        assert!(is_server_tool(&json!({"type": "code_execution_20260120", "name": "code_execution"})));
-        assert!(is_server_tool(&json!({"name": "bash", "description": "d", "input_schema": {}})));
-        assert!(!is_server_tool(&json!({"name": "Read", "description": "d", "input_schema": {}})));
-        assert!(!is_server_tool(&json!({"type": "custom", "name": "my_tool", "input_schema": {}})));
+        assert!(is_server_tool(
+            &json!({"type": "web_search_20260209", "name": "web_search"})
+        ));
+        assert!(is_server_tool(
+            &json!({"type": "code_execution_20260120", "name": "code_execution"})
+        ));
+        assert!(is_server_tool(
+            &json!({"name": "bash", "description": "d", "input_schema": {}})
+        ));
+        assert!(!is_server_tool(
+            &json!({"name": "Read", "description": "d", "input_schema": {}})
+        ));
+        assert!(!is_server_tool(
+            &json!({"type": "custom", "name": "my_tool", "input_schema": {}})
+        ));
     }
 
     #[test]
     fn maps_server_tool_to_function_name() {
         assert_eq!(
-            server_tool_function_name(&json!({"type": "web_search_20260209", "name": "web_search"})),
+            server_tool_function_name(
+                &json!({"type": "web_search_20260209", "name": "web_search"})
+            ),
             Some("web_search".to_string())
         );
         assert_eq!(
@@ -334,7 +362,10 @@ mod tests {
             tool_result_to_string(Some(&content), false),
             "stdout line\n\n[image omitted: upstream does not support image input]\n\ndone"
         );
-        assert_eq!(tool_result_to_string(Some(&content), true), "stdout line\n\n[image content]\n\ndone");
+        assert_eq!(
+            tool_result_to_string(Some(&content), true),
+            "stdout line\n\n[image content]\n\ndone"
+        );
         assert_eq!(tool_result_to_string(None, false), "");
     }
 }

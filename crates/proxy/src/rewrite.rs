@@ -473,6 +473,7 @@ mod tests {
                     base_url: Url::parse("https://api.example.com/").unwrap(),
                     api_key: "replace-me".to_string(),
                     authorization_header: None,
+                    ..Provider::default()
                 },
             )]),
             rewrite: RewriteConfig { model_mappings },

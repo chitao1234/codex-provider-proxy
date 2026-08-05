@@ -28,7 +28,11 @@ pub fn extract_usage(body: &Value) -> ChatUsage {
             .and_then(|usage| usage.get(field))
             .and_then(Value::as_u64)
     };
-    let details = |container: &str| usage.and_then(|usage| usage.get(container)).and_then(Value::as_object);
+    let details = |container: &str| {
+        usage
+            .and_then(|usage| usage.get(container))
+            .and_then(Value::as_object)
+    };
     let detail_field = |details: Option<&serde_json::Map<String, Value>>, field: &str| {
         details
             .and_then(|details| details.get(field))
@@ -132,7 +136,9 @@ mod tests {
 
     #[test]
     fn identifies_usage_only_chunk_and_deltas() {
-        assert!(is_usage_only_chunk(&json!({"choices": [], "usage": {"prompt_tokens": 1}})));
+        assert!(is_usage_only_chunk(
+            &json!({"choices": [], "usage": {"prompt_tokens": 1}})
+        ));
         assert!(!is_usage_only_chunk(&json!({"choices": [{"index": 0}]})));
         let delta = json!({"content": null, "reasoning_content": "We"});
         assert_eq!(delta_string(&delta, "content"), None);

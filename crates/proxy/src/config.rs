@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
+use codex_provider_proxy_api_conversion::dialect::{DownstreamApi, ModelCapabilities, UpstreamApi};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -32,6 +33,14 @@ pub struct Provider {
     pub base_url: Url,
     pub api_key: String,
     pub authorization_header: Option<String>,
+    /// Upstream API dialect. Passthrough by default (existing configs unchanged).
+    pub upstream_api: UpstreamApi,
+    /// Downstream dialects this provider converts from. Empty = no conversion.
+    pub accept_downstream_apis: Vec<DownstreamApi>,
+    /// Provider-level default per-model capabilities for conversion.
+    pub default_capabilities: Option<ModelCapabilities>,
+    /// Per-model capability overrides keyed by upstream model name.
+    pub model_capabilities: HashMap<String, ModelCapabilities>,
 }
 
 impl Provider {
@@ -40,6 +49,20 @@ impl Provider {
             return v.clone();
         }
         format!("Bearer {}", self.api_key)
+    }
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            base_url: Url::parse("https://api.example.com/").expect("static URL is valid"),
+            api_key: String::new(),
+            authorization_header: None,
+            upstream_api: UpstreamApi::Passthrough,
+            accept_downstream_apis: Vec::new(),
+            default_capabilities: None,
+            model_capabilities: HashMap::new(),
+        }
     }
 }
 
@@ -382,6 +405,14 @@ struct ProviderFile {
     api_key: String,
     #[serde(default)]
     authorization_header: Option<String>,
+    #[serde(default)]
+    upstream_api: UpstreamApi,
+    #[serde(default)]
+    accept_downstream_apis: Vec<DownstreamApi>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    models: HashMap<String, ModelCapabilities>,
 }
 
 impl Config {
@@ -402,6 +433,10 @@ impl Config {
                     base_url: provider.base_url,
                     api_key: provider.api_key,
                     authorization_header: provider.authorization_header,
+                    upstream_api: provider.upstream_api,
+                    accept_downstream_apis: provider.accept_downstream_apis,
+                    default_capabilities: provider.capabilities,
+                    model_capabilities: provider.models,
                 },
             );
         }
