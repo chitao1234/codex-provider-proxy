@@ -5,6 +5,7 @@ members = [
   "crates/proxy",
   "crates/rpc-types",
   "crates/proxyctl",
+  "crates/api-conversion",
 ]
 
 [workspace.package]

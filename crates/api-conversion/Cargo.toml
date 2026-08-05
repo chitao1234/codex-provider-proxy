@@ -1,0 +1,10 @@
+[package]
+name = "codex-provider-proxy-api-conversion"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
