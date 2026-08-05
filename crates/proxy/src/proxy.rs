@@ -88,11 +88,14 @@ struct RetrySendArgs {
     statistics: Option<StatisticsTracker>,
     request: RetryRequestTemplate,
     initial_attempt: PreparedUpstreamAttempt,
+    initial_config: Arc<Config>,
+    initial_http_client: reqwest::Client,
 }
 
 struct ResolveUpstreamAttemptArgs<'a> {
     state: &'a ProxyState,
     cfg: &'a Config,
+    default_provider: &'a str,
     pid: Option<u32>,
     peer: SocketAddr,
     request_id: u64,
@@ -111,6 +114,7 @@ struct UpstreamSendRequest {
     incoming_query: Option<String>,
     base_headers: HeaderMap,
     body: Body,
+    http_client: reqwest::Client,
     exchange_logger: Option<SharedExchangeFileLogger>,
     statistics: Option<StatisticsTracker>,
 }
@@ -158,7 +162,8 @@ async fn handle_proxy_inner(
 ) -> Result<Response<Body>> {
     let request_id = state.runtime.next_request_id();
     let started = Instant::now();
-    let cfg = state.runtime.config().await;
+    let routing = state.runtime.routing_snapshot().await;
+    let cfg = routing.config.clone();
     let (parts, body) = req.into_parts();
 
     let forwarded_path = match strip_listen_base_path(&cfg.listen_base_path, parts.uri.path()) {
@@ -183,6 +188,7 @@ async fn handle_proxy_inner(
     let initial_attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
         state: &state,
         cfg: &cfg,
+        default_provider: &routing.default_provider,
         pid,
         peer,
         request_id,
@@ -241,6 +247,7 @@ async fn handle_proxy_inner(
             incoming_query: parts.uri.query().map(str::to_owned),
             base_headers,
             body,
+            http_client: routing.http_client.clone(),
             exchange_logger: exchange_logger.clone(),
             statistics: statistics.clone(),
         },
@@ -508,15 +515,15 @@ async fn resolve_request_pid(state: &ProxyState, peer: SocketAddr, request_id: u
 async fn resolve_provider_for_pid(
     state: &ProxyState,
     cfg: &Config,
+    default_provider: &str,
     pid: Option<u32>,
     peer: SocketAddr,
     request_id: u64,
 ) -> Result<ResolvedProviderRoute> {
-    let default_provider = state.runtime.default_provider().await;
     let (provider_name, route_pid) = match pid {
         Some(pid) => match find_provider_for_pid_or_ancestors(state, pid).await {
             Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
-            Ok(None) => (default_provider.clone(), None),
+            Ok(None) => (default_provider.to_owned(), None),
             Err(err) => {
                 warn!(
                     request_id,
@@ -525,10 +532,10 @@ async fn resolve_provider_for_pid(
                     error = %err,
                     "ancestor pid route lookup failed; falling back to default provider"
                 );
-                (default_provider.clone(), None)
+                (default_provider.to_owned(), None)
             }
         },
-        None => (default_provider.clone(), None),
+        None => (default_provider.to_owned(), None),
     };
 
     let provider = cfg
@@ -567,9 +574,15 @@ fn prepare_upstream_attempt(
 async fn resolve_upstream_attempt(
     args: ResolveUpstreamAttemptArgs<'_>,
 ) -> Result<PreparedUpstreamAttempt> {
-    let route =
-        resolve_provider_for_pid(args.state, args.cfg, args.pid, args.peer, args.request_id)
-            .await?;
+    let route = resolve_provider_for_pid(
+        args.state,
+        args.cfg,
+        args.default_provider,
+        args.pid,
+        args.peer,
+        args.request_id,
+    )
+    .await?;
     prepare_upstream_attempt(
         route,
         args.forwarded_path,
@@ -580,7 +593,7 @@ async fn resolve_upstream_attempt(
 
 async fn send_upstream_request(
     state: &ProxyState,
-    cfg: &Config,
+    cfg: &Arc<Config>,
     request: UpstreamSendRequest,
 ) -> std::result::Result<
     (
@@ -602,6 +615,7 @@ async fn send_upstream_request(
         incoming_query,
         base_headers,
         body,
+        http_client,
         exchange_logger,
         statistics,
     } = request;
@@ -672,9 +686,7 @@ async fn send_upstream_request(
                 .await
             }
         };
-        let out = state
-            .runtime
-            .http_client()
+        let out = http_client
             .request(method, initial_attempt.url.clone())
             .headers(initial_attempt.headers.clone())
             .body(req_body);
@@ -737,6 +749,8 @@ async fn send_upstream_request(
                     request_body,
                 },
                 initial_attempt,
+                initial_config: cfg.clone(),
+                initial_http_client: http_client,
             })
             .await?;
         Ok((
@@ -1041,7 +1055,7 @@ fn downstream_response_status(
     }
 }
 
-fn is_hop_by_hop(name: &header::HeaderName) -> bool {
+fn is_hop_by_hop(name: &HeaderName) -> bool {
     // Minimal hop-by-hop list for a reverse proxy:
     // https://www.rfc-editor.org/rfc/rfc7230#section-6.1
     matches!(
@@ -1936,13 +1950,27 @@ where
     Fut: Future<Output = ()>,
 {
     for attempt in 0..=args.transparent_retry_count {
-        let cfg = args.state.runtime.config().await;
+        let routing = if attempt == 0 {
+            None
+        } else {
+            Some(args.state.runtime.routing_snapshot().await)
+        };
+        let (cfg, http_client) = if let Some(routing) = &routing {
+            (routing.config.clone(), routing.http_client.clone())
+        } else {
+            (
+                args.initial_config.clone(),
+                args.initial_http_client.clone(),
+            )
+        };
         let mut current_attempt = if attempt == 0 {
             args.initial_attempt.clone()
         } else {
+            let routing = routing.as_ref().expect("retry routing snapshot");
             resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
                 state: &args.state,
                 cfg: &cfg,
+                default_provider: &routing.default_provider,
                 pid: args.pid,
                 peer: args.peer,
                 request_id: args.request_id,
@@ -1981,10 +2009,7 @@ where
             Some(request_body.clone()),
         )
         .await;
-        let out = args
-            .state
-            .runtime
-            .http_client()
+        let out = http_client
             .request(args.request.method.clone(), current_attempt.url.clone())
             .headers(current_attempt.headers.clone())
             .body(request_body);
@@ -2805,6 +2830,104 @@ mod tests {
         }
     }
 
+    fn test_provider(name: &str) -> Provider {
+        Provider {
+            base_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+            api_key: format!("token-{name}"),
+            authorization_header: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_snapshot_keeps_default_provider_in_current_config() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let providers = HashMap::from([
+            ("provider_a".to_string(), test_provider("a")),
+            ("provider_b".to_string(), test_provider("b")),
+        ]);
+        let config = test_config("provider_a", providers);
+        let (filter_layer, filter_reload) =
+            tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
+        let subscriber = tracing_subscriber::registry().with(filter_layer);
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let runtime = RuntimeState::new(
+            Arc::new(config.clone()),
+            default_pid_resolver(),
+            reqwest::Client::new(),
+            filter_reload,
+            StatisticsManager::new(&config.statistics).unwrap(),
+        );
+        let state = ProxyState {
+            listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            runtime,
+        };
+
+        assert!(
+            state
+                .runtime
+                .set_default_provider("provider_b".to_string())
+                .await
+        );
+        let overridden = state.runtime.routing_snapshot().await;
+        assert_eq!(overridden.default_provider, "provider_b");
+        assert!(overridden
+            .config
+            .providers
+            .contains_key(&overridden.default_provider));
+
+        assert!(
+            !state
+                .runtime
+                .set_default_provider("missing".to_string())
+                .await
+        );
+        assert_eq!(
+            state.runtime.routing_snapshot().await.default_provider,
+            "provider_b"
+        );
+
+        let reloaded = test_config(
+            "provider_c",
+            HashMap::from([("provider_c".to_string(), test_provider("c"))]),
+        );
+        state
+            .runtime
+            .apply_config(Arc::new(reloaded))
+            .await
+            .unwrap();
+
+        let snapshot = state.runtime.routing_snapshot().await;
+        assert_eq!(snapshot.default_provider, "provider_c");
+        assert!(snapshot
+            .config
+            .providers
+            .contains_key(&snapshot.default_provider));
+        assert!(!snapshot.config.providers.contains_key("provider_b"));
+
+        let mut rejected = test_config(
+            "provider_d",
+            HashMap::from([("provider_d".to_string(), test_provider("d"))]),
+        );
+        rejected.logging.rule = Some("[".to_string());
+        state
+            .runtime
+            .apply_config(Arc::new(rejected))
+            .await
+            .expect_err("invalid logging filter should reject config");
+
+        let snapshot_after_rejection = state.runtime.routing_snapshot().await;
+        assert_eq!(snapshot_after_rejection.default_provider, "provider_c");
+        assert!(snapshot_after_rejection
+            .config
+            .providers
+            .contains_key("provider_c"));
+        assert!(!snapshot_after_rejection
+            .config
+            .providers
+            .contains_key("provider_d"));
+    }
+
     #[tokio::test]
     async fn blocks_messages_count_tokens_by_default() {
         let mut providers = HashMap::new();
@@ -3219,10 +3342,11 @@ mod tests {
         transparent_retry_count: u32,
         transparent_retry_backoff_step: Duration,
     ) -> RetrySendArgs {
-        let cfg = state.runtime.config().await;
+        let routing = state.runtime.routing_snapshot().await;
         let initial_attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
             state: &state,
-            cfg: &cfg,
+            cfg: &routing.config,
+            default_provider: &routing.default_provider,
             pid,
             peer,
             request_id,
@@ -3250,6 +3374,8 @@ mod tests {
                 request_body: Bytes::from_static(b"retry-body"),
             },
             initial_attempt,
+            initial_config: routing.config.clone(),
+            initial_http_client: routing.http_client.clone(),
         }
     }
 

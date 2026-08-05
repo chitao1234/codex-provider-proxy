@@ -172,17 +172,17 @@ async fn list_providers(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
         Ok(cfg) => cfg,
         Err(response) => return response,
     };
 
-    let mut providers: Vec<String> = cfg.providers.keys().cloned().collect();
+    let routing = state.runtime.routing_snapshot().await;
+    let mut providers: Vec<String> = routing.config.providers.keys().cloned().collect();
     providers.sort();
 
-    let default_provider = state.runtime.default_provider().await;
     Json(ProvidersResponse {
-        default_provider,
+        default_provider: routing.default_provider,
         providers,
     })
     .into_response()
@@ -216,12 +216,16 @@ async fn set_default_provider(
     headers: HeaderMap,
     Json(req): Json<SetDefaultProviderRequest>,
 ) -> impl IntoResponse {
-    let cfg = match authorize_rpc_request(&state, peer, &headers).await {
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
         Ok(cfg) => cfg,
         Err(response) => return response,
     };
 
-    if !cfg.providers.contains_key(&req.provider) {
+    if !state
+        .runtime
+        .set_default_provider(req.provider.clone())
+        .await
+    {
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown provider: {}\n", req.provider),
@@ -229,7 +233,6 @@ async fn set_default_provider(
             .into_response();
     }
 
-    state.runtime.set_default_provider(req.provider).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

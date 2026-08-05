@@ -35,6 +35,8 @@ struct ManagerState {
     store: Option<Arc<StatisticsStore>>,
 }
 
+pub(crate) struct PreparedStatisticsConfig(Option<ManagerState>);
+
 pub struct StatisticsRequestContext<'a> {
     pub peer: SocketAddr,
     pub pid: Option<u32>,
@@ -127,13 +129,13 @@ impl StatisticsManager {
         })
     }
 
-    pub fn reconfigure(&self, config: &StatisticsConfig) -> Result<()> {
-        let mut state = self
-            .inner
-            .write()
-            .expect("statistics manager lock poisoned");
+    pub(crate) fn prepare_reconfigure(
+        &self,
+        config: &StatisticsConfig,
+    ) -> Result<PreparedStatisticsConfig> {
+        let state = self.inner.read().expect("statistics manager lock poisoned");
         if state.config == *config {
-            return Ok(());
+            return Ok(PreparedStatisticsConfig(None));
         }
         let store = if config.enabled
             && state.config.database_path == config.database_path
@@ -143,9 +145,20 @@ impl StatisticsManager {
         } else {
             open_store_if_enabled(config)?
         };
-        state.config = config.clone();
-        state.store = store;
-        Ok(())
+        Ok(PreparedStatisticsConfig(Some(ManagerState {
+            config: config.clone(),
+            store,
+        })))
+    }
+
+    pub(crate) fn apply_reconfigure(&self, prepared: PreparedStatisticsConfig) {
+        let Some(next_state) = prepared.0 else {
+            return;
+        };
+        *self
+            .inner
+            .write()
+            .expect("statistics manager lock poisoned") = next_state;
     }
 
     pub fn begin_request(

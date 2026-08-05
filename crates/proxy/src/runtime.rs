@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock as StdRwLock,
+        Arc,
     },
 };
 
@@ -69,16 +69,32 @@ pub struct RuntimeState {
 }
 
 struct RuntimeInner {
-    config: RwLock<Arc<Config>>,
-    default_provider: RwLock<String>,
+    routing: RwLock<RoutingSnapshot>,
     pid_routes: Arc<DashMap<u32, String>>,
     pid_resolver: Arc<dyn PidResolver>,
-    http_client: StdRwLock<reqwest::Client>,
     request_seq: AtomicU64,
     log_reload: LogReloadHandle,
     statistics: StatisticsManager,
 }
 
+#[derive(Clone)]
+pub(crate) struct RoutingSnapshot {
+    pub config: Arc<Config>,
+    pub default_provider: String,
+    pub http_client: reqwest::Client,
+}
+
+impl RoutingSnapshot {
+    fn new(config: Arc<Config>, http_client: reqwest::Client) -> Self {
+        Self {
+            default_provider: config.default_provider.clone(),
+            config,
+            http_client,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ApplyConfigSummary {
     pub removed_pid_routes: usize,
 }
@@ -93,11 +109,9 @@ impl RuntimeState {
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeInner {
-                default_provider: RwLock::new(config.default_provider.clone()),
-                config: RwLock::new(config),
+                routing: RwLock::new(RoutingSnapshot::new(config, http_client)),
                 pid_routes: Arc::new(DashMap::new()),
                 pid_resolver,
-                http_client: StdRwLock::new(http_client),
                 request_seq: AtomicU64::new(1),
                 log_reload,
                 statistics,
@@ -106,15 +120,20 @@ impl RuntimeState {
     }
 
     pub async fn config(&self) -> Arc<Config> {
-        self.inner.config.read().await.clone()
+        self.inner.routing.read().await.config.clone()
     }
 
-    pub async fn default_provider(&self) -> String {
-        self.inner.default_provider.read().await.clone()
+    pub(crate) async fn routing_snapshot(&self) -> RoutingSnapshot {
+        self.inner.routing.read().await.clone()
     }
 
-    pub async fn set_default_provider(&self, provider: String) {
-        *self.inner.default_provider.write().await = provider;
+    pub async fn set_default_provider(&self, provider: String) -> bool {
+        let mut routing = self.inner.routing.write().await;
+        if !routing.config.providers.contains_key(&provider) {
+            return false;
+        }
+        routing.default_provider = provider;
+        true
     }
 
     pub fn pid_routes(&self) -> Arc<DashMap<u32, String>> {
@@ -123,14 +142,6 @@ impl RuntimeState {
 
     pub fn pid_resolver(&self) -> Arc<dyn PidResolver> {
         self.inner.pid_resolver.clone()
-    }
-
-    pub fn http_client(&self) -> reqwest::Client {
-        self.inner
-            .http_client
-            .read()
-            .expect("http client lock poisoned")
-            .clone()
     }
 
     pub fn next_request_id(&self) -> u64 {
@@ -143,19 +154,21 @@ impl RuntimeState {
 
     pub async fn apply_config(&self, config: Arc<Config>) -> Result<ApplyConfigSummary> {
         let filter = config.logging.env_filter()?;
-        self.inner
+        let prepared_statistics = self
+            .inner
             .statistics
-            .reconfigure(&config.statistics)
+            .prepare_reconfigure(&config.statistics)
             .context("reconfigure statistics database")?;
-        let should_rebuild_http_client = {
-            let current = self.inner.config.read().await;
-            current.upstream_connect_timeout != config.upstream_connect_timeout
-        };
-        let rebuilt_http_client = if should_rebuild_http_client {
-            Some(build_http_client(&config)?)
-        } else {
-            None
-        };
+        let current_routing = self.routing_snapshot().await;
+        let http_client =
+            if current_routing.config.upstream_connect_timeout != config.upstream_connect_timeout {
+                build_http_client(&config)?
+            } else {
+                current_routing.http_client
+            };
+        let connect_timeout_changed =
+            current_routing.config.upstream_connect_timeout != config.upstream_connect_timeout;
+        let next_routing = RoutingSnapshot::new(config.clone(), http_client);
 
         self.inner
             .log_reload
@@ -170,26 +183,14 @@ impl RuntimeState {
             .map(|entry| *entry.key())
             .collect();
 
-        {
-            let mut cfg = self.inner.config.write().await;
-            *cfg = config.clone();
-        }
-        if let Some(http_client) = rebuilt_http_client {
-            *self
-                .inner
-                .http_client
-                .write()
-                .expect("http client lock poisoned") = http_client;
+        self.inner.statistics.apply_reconfigure(prepared_statistics);
+        *self.inner.routing.write().await = next_routing;
+        if connect_timeout_changed {
             info!(
                 upstream_connect_timeout_secs = ?config.upstream_connect_timeout.map(|d| d.as_secs()),
                 "upstream HTTP client rebuilt"
             );
         }
-        {
-            let mut default_provider = self.inner.default_provider.write().await;
-            *default_provider = config.default_provider.clone();
-        }
-
         for pid in &removed_pids {
             self.inner.pid_routes.remove(pid);
         }
