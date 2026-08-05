@@ -1,6 +1,6 @@
 use std::{
     fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
@@ -158,60 +158,41 @@ fn inode_for_connection(local: SocketAddr, peer: SocketAddr) -> Result<Option<u6
 }
 
 fn inode_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
-    let local_key = encode_proc_net_tcp_v4(local.ip(), local.port());
-    let peer_key = encode_proc_net_tcp_v4(peer.ip(), peer.port());
+    let (IpAddr::V4(local_ip), IpAddr::V4(peer_ip)) = (local.ip(), peer.ip()) else {
+        return Ok(None);
+    };
+    let local_key = encode_proc_net_tcp_v4(local_ip, local.port());
+    let peer_key = encode_proc_net_tcp_v4(peer_ip, peer.port());
 
     let tcp = fs::read_to_string("/proc/net/tcp").context("read /proc/net/tcp")?;
-    let mut scanned = 0usize;
-    for line in tcp.lines().skip(1) {
-        scanned += 1;
-        let mut parts = line.split_whitespace();
-        let _sl = parts.next();
-        let local_addr = parts.next();
-        let rem_addr = parts.next();
-        let _st = parts.next();
-        let _tx_rx = parts.next();
-        let _tr_tm = parts.next();
-        let _retrnsmt = parts.next();
-        let _uid = parts.next();
-        let _timeout = parts.next();
-        let inode = parts.next();
+    let (inode, scanned) = inode_from_proc_net(&tcp, &local_key, &peer_key, "/proc/net/tcp")?;
 
-        let (Some(local_addr), Some(rem_addr), Some(inode)) = (local_addr, rem_addr, inode) else {
-            continue;
-        };
-
-        if local_addr == local_key && rem_addr == peer_key {
-            let inode = inode
-                .parse::<u64>()
-                .with_context(|| format!("parse inode from /proc/net/tcp line: {line}"))?;
-            debug!(
-                local = %local,
-                peer = %peer,
-                inode,
-                scanned_lines = scanned,
-                "pid resolver: matched connection in /proc/net/tcp"
-            );
-            return Ok(Some(inode));
-        }
-    }
-
-    debug!(
-        local = %local,
-        peer = %peer,
-        scanned_lines = scanned,
-        "pid resolver: no matching connection found in /proc/net/tcp"
-    );
-    Ok(None)
+    log_proc_net_lookup(local, peer, inode, scanned, "/proc/net/tcp");
+    Ok(inode)
 }
 
 fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u64>> {
-    let local_key = encode_proc_net_tcp_v6(local.ip(), local.port());
-    let peer_key = encode_proc_net_tcp_v6(peer.ip(), peer.port());
+    let (IpAddr::V6(local_ip), IpAddr::V6(peer_ip)) = (local.ip(), peer.ip()) else {
+        return Ok(None);
+    };
+    let local_key = encode_proc_net_tcp_v6(local_ip, local.port());
+    let peer_key = encode_proc_net_tcp_v6(peer_ip, peer.port());
 
     let tcp6 = fs::read_to_string("/proc/net/tcp6").context("read /proc/net/tcp6")?;
+    let (inode, scanned) = inode_from_proc_net(&tcp6, &local_key, &peer_key, "/proc/net/tcp6")?;
+
+    log_proc_net_lookup(local, peer, inode, scanned, "/proc/net/tcp6");
+    Ok(inode)
+}
+
+fn inode_from_proc_net(
+    contents: &str,
+    local_key: &str,
+    peer_key: &str,
+    source: &str,
+) -> Result<(Option<u64>, usize)> {
     let mut scanned = 0usize;
-    for line in tcp6.lines().skip(1) {
+    for line in contents.lines().skip(1) {
         scanned += 1;
         let mut parts = line.split_whitespace();
         let _sl = parts.next();
@@ -232,32 +213,42 @@ fn inode_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option
         if local_addr == local_key && rem_addr == peer_key {
             let inode = inode
                 .parse::<u64>()
-                .with_context(|| format!("parse inode from /proc/net/tcp6 line: {line}"))?;
-            debug!(
-                local = %local,
-                peer = %peer,
-                inode,
-                scanned_lines = scanned,
-                "pid resolver: matched connection in /proc/net/tcp6"
-            );
-            return Ok(Some(inode));
+                .with_context(|| format!("parse inode from {source} line: {line}"))?;
+            return Ok((Some(inode), scanned));
         }
     }
 
-    debug!(
-        local = %local,
-        peer = %peer,
-        scanned_lines = scanned,
-        "pid resolver: no matching connection found in /proc/net/tcp6"
-    );
-    Ok(None)
+    Ok((None, scanned))
 }
 
-fn encode_proc_net_tcp_v4(ip: IpAddr, port: u16) -> String {
-    let ip = match ip {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-    };
+fn log_proc_net_lookup(
+    local: SocketAddr,
+    peer: SocketAddr,
+    inode: Option<u64>,
+    scanned_lines: usize,
+    source: &'static str,
+) {
+    if let Some(inode) = inode {
+        debug!(
+            local = %local,
+            peer = %peer,
+            inode,
+            scanned_lines,
+            source,
+            "pid resolver: matched connection in proc net table"
+        );
+    } else {
+        debug!(
+            local = %local,
+            peer = %peer,
+            scanned_lines,
+            source,
+            "pid resolver: no matching connection found in proc net table"
+        );
+    }
+}
+
+fn encode_proc_net_tcp_v4(ip: Ipv4Addr, port: u16) -> String {
     let octets = ip.octets();
     format!(
         "{:02X}{:02X}{:02X}{:02X}:{:04X}",
@@ -265,16 +256,8 @@ fn encode_proc_net_tcp_v4(ip: IpAddr, port: u16) -> String {
     )
 }
 
-fn encode_proc_net_tcp_v6(ip: IpAddr, port: u16) -> String {
-    let bytes = match ip {
-        IpAddr::V6(v6) => v6.octets(),
-        IpAddr::V4(v4) => {
-            // IPv4 isn't expected here, but keep this deterministic.
-            let mut b = [0u8; 16];
-            b[12..16].copy_from_slice(&v4.octets());
-            b
-        }
-    };
+fn encode_proc_net_tcp_v6(ip: Ipv6Addr, port: u16) -> String {
+    let bytes = ip.octets();
 
     // /proc/net/tcp6 prints the IPv6 address as 4 32-bit words, each in little-endian byte order.
     // Example: ::1 => ...01000000
@@ -351,18 +334,62 @@ fn parse_socket_inode(link_target: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
 
     #[test]
     fn encodes_ipv4_as_proc_net_tcp_key() {
-        let key = encode_proc_net_tcp_v4(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let key = encode_proc_net_tcp_v4(Ipv4Addr::new(127, 0, 0, 1), 8080);
         assert_eq!(key, "0100007F:1F90");
     }
 
     #[test]
     fn encodes_ipv6_as_proc_net_tcp6_key() {
-        let key = encode_proc_net_tcp_v6(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
+        let key = encode_proc_net_tcp_v6(Ipv6Addr::LOCALHOST, 8080);
         assert_eq!(key, "00000000000000000000000001000000:1F90");
+    }
+
+    #[test]
+    fn finds_inode_in_proc_net_table() {
+        let contents = concat!(
+            "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
+            "   0: 0100007F:1F90 0100007F:C350 01 0:0 00:0 0 1000 0 12345\n",
+        );
+
+        let (inode, scanned) =
+            inode_from_proc_net(contents, "0100007F:1F90", "0100007F:C350", "/proc/net/tcp")
+                .expect("parse proc net table");
+
+        assert_eq!(inode, Some(12345));
+        assert_eq!(scanned, 1);
+    }
+
+    #[test]
+    fn ignores_malformed_and_nonmatching_proc_net_rows() {
+        let contents = concat!(
+            "header\n",
+            "malformed\n",
+            "0: 0100007F:1111 0100007F:2222 01 0:0 00:0 0 1000 0 12345\n",
+        );
+
+        let (inode, scanned) =
+            inode_from_proc_net(contents, "0100007F:1F90", "0100007F:C350", "/proc/net/tcp")
+                .expect("parse proc net table");
+
+        assert_eq!(inode, None);
+        assert_eq!(scanned, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_inode_on_matching_proc_net_row() {
+        let contents = concat!(
+            "header\n",
+            "0: 0100007F:1F90 0100007F:C350 01 0:0 00:0 0 1000 0 invalid\n",
+        );
+
+        let error =
+            inode_from_proc_net(contents, "0100007F:1F90", "0100007F:C350", "/proc/net/tcp")
+                .expect_err("invalid inode should fail");
+
+        assert!(error.to_string().contains("parse inode from /proc/net/tcp"));
     }
 
     #[test]
