@@ -234,11 +234,31 @@ struct RewriteFile {
     model_mappings: Vec<ModelMappingFile>,
 }
 
+/// A config value that may be a single string or an array of strings.
+///
+/// Accepts both `from_model = "gpt-5.5"` (legacy single-value form) and
+/// `from_model = ["gpt-5.5", "gpt-5.4"]`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrManyStrings {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrManyStrings {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelMappingFile {
     #[serde(default)]
-    provider: Option<Vec<String>>,
-    from_model: Vec<String>,
+    provider: Option<OneOrManyStrings>,
+    from_model: OneOrManyStrings,
     #[serde(default)]
     from_reasoning_effort: Option<String>,
     #[serde(default)]
@@ -526,7 +546,7 @@ fn normalize_rewrite_config(
     for (index, mapping) in rewrite.model_mappings.into_iter().enumerate() {
         let provider = optional_non_empty_strings(
             &format!("rewrite.model_mappings[{index}].provider"),
-            mapping.provider,
+            mapping.provider.map(OneOrManyStrings::into_vec),
         )?;
         if let Some(provider_names) = &provider {
             for provider in provider_names {
@@ -557,7 +577,7 @@ fn normalize_rewrite_config(
             provider,
             from_model: required_non_empty_strings(
                 &format!("rewrite.model_mappings[{index}].from_model"),
-                mapping.from_model,
+                mapping.from_model.into_vec(),
             )?,
             from_reasoning_effort: optional_non_empty_string(
                 &format!("rewrite.model_mappings[{index}].from_reasoning_effort"),

@@ -749,7 +749,11 @@ fn map_finish_reason(finish_reason: Option<&str>, saw_tool_call: bool) -> &'stat
 struct ToolAccumulator {
     id: Option<String>,
     name: Option<String>,
+    /// Full accumulated arguments JSON.
     arguments: String,
+    /// Arguments already emitted as `input_json_delta` (clients append each delta, so we
+    /// must send increments, never the cumulative value).
+    emitted_arguments_len: usize,
     /// Downstream content-block index once the tool_use block has been announced.
     block_index: Option<usize>,
 }
@@ -1040,18 +1044,27 @@ impl ChatStreamConverter {
             ));
         }
 
-        let (block_index, arguments) = {
-            let accumulator = &self.tools[&upstream_index];
-            (accumulator.block_index, accumulator.arguments.clone())
+        // Emit only the arguments increment since the last emission: Anthropic clients
+        // (e.g. the SDK MessageStream) append each `partial_json` to the running buffer.
+        let (block_index, increment) = {
+            let accumulator = &mut self.tools.get_mut(&upstream_index).expect("inserted above");
+            if accumulator.block_index.is_none() {
+                (None, None)
+            } else {
+                let start = accumulator.emitted_arguments_len;
+                let increment = accumulator.arguments[start..].to_string();
+                accumulator.emitted_arguments_len = accumulator.arguments.len();
+                (accumulator.block_index, Some(increment))
+            }
         };
-        if let (Some(index), arguments) = (block_index, arguments) {
-            if !arguments.is_empty() {
+        if let (Some(index), Some(increment)) = (block_index, increment) {
+            if !increment.is_empty() {
                 out.push(encode_sse_event(
                     "content_block_delta",
                     &json!({
                         "type": "content_block_delta",
                         "index": index,
-                        "delta": {"type": "input_json_delta", "partial_json": arguments}
+                        "delta": {"type": "input_json_delta", "partial_json": increment}
                     }),
                 ));
             }
@@ -1065,8 +1078,10 @@ impl ChatStreamConverter {
             .tools
             .values()
             .filter_map(|tool| {
-                tool.block_index
-                    .map(|index| (index, tool.arguments.clone()))
+                tool.block_index.map(|index| {
+                    let start = tool.emitted_arguments_len;
+                    (index, tool.arguments[start..].to_string())
+                })
             })
             .collect();
         indices.sort_by_key(|(index, _)| *index);
@@ -1472,7 +1487,12 @@ mod tests {
         assert!(text.contains("\"type\":\"tool_use\""));
         assert!(text.contains("\"name\":\"get_weather\""));
         assert!(text.contains("\"stop_reason\":\"tool_use\""));
-        assert!(text.contains("\"partial_json\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
+        // partial_json carries increments: each chunk's arguments slice is sent separately,
+        // and the client appends them (Anthropic SDK MessageStream does `buf += partial_json`).
+        assert!(text.contains("\"partial_json\":\"{\\\"city\\\": \\\"Pa\""));
+        assert!(text.contains("\"partial_json\":\"ris\\\"}\""));
+        // No cumulative value is ever sent.
+        assert!(!text.contains("\"partial_json\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
         assert_eq!(text.matches("event: message_stop").count(), 1);
     }
 
