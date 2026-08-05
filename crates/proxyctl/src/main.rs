@@ -11,7 +11,7 @@ use codex_provider_proxy_rpc_types::{
     SetRouteRequest, StatisticsBreakdown, StatisticsResponse,
 };
 use regex::Regex;
-use reqwest::{Method, RequestBuilder};
+use reqwest::{Method, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
@@ -194,18 +194,27 @@ impl RpcClient {
         }
     }
 
+    async fn send_checked(
+        &self,
+        request: RequestBuilder,
+        context: &'static str,
+    ) -> Result<Response> {
+        request
+            .send()
+            .await
+            .with_context(|| format!("send {context} request"))?
+            .error_for_status()
+            .with_context(|| format!("{context} returned error status"))
+    }
+
     async fn send_no_content(
         &self,
         method: Method,
         path: &str,
         context: &'static str,
     ) -> Result<()> {
-        self.request(method, path)
-            .send()
-            .await
-            .with_context(|| format!("send {context} request"))?
-            .error_for_status()
-            .with_context(|| format!("{context} returned error status"))?;
+        self.send_checked(self.request(method, path), context)
+            .await?;
         Ok(())
     }
 
@@ -216,13 +225,8 @@ impl RpcClient {
         body: &B,
         context: &'static str,
     ) -> Result<()> {
-        self.request(method, path)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("send {context} request"))?
-            .error_for_status()
-            .with_context(|| format!("{context} returned error status"))?;
+        self.send_checked(self.request(method, path).json(body), context)
+            .await?;
         Ok(())
     }
 
@@ -232,12 +236,8 @@ impl RpcClient {
         path: &str,
         context: &'static str,
     ) -> Result<T> {
-        self.request(method, path)
-            .send()
-            .await
-            .with_context(|| format!("send {context} request"))?
-            .error_for_status()
-            .with_context(|| format!("{context} returned error status"))?
+        self.send_checked(self.request(method, path), context)
+            .await?
             .json()
             .await
             .with_context(|| format!("decode {context} response"))
@@ -329,6 +329,33 @@ async fn cleanup_route_best_effort(rpc: &RpcClient, pid: u32, context: &str) {
     }
 }
 
+fn print_providers(providers: &ProvidersResponse) {
+    println!("default={}", providers.default_provider);
+    for provider in &providers.providers {
+        println!("provider={provider}");
+    }
+}
+
+fn provider_exists(providers: &ProvidersResponse, provider: &str) -> bool {
+    providers.providers.iter().any(|known| known == provider)
+}
+
+fn print_process(process: &process_scan::ProcessInfo) {
+    println!("pid={}", process.pid);
+    println!("cwd={}", process.cwd);
+    println!("cmdline={}", process.cmdline);
+}
+
+async fn apply_route(rpc: &RpcClient, pid: u32, provider: &str, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("dry-run: would set pid={pid} provider={provider}");
+    } else {
+        rpc.set_route(pid, provider.to_string()).await?;
+        println!("ok");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -367,10 +394,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Providers => {
             let out = rpc.providers().await?;
-            println!("default={}", out.default_provider);
-            for p in out.providers {
-                println!("provider={}", p);
-            }
+            print_providers(&out);
         }
         Cmd::Stats { hours, json } => {
             let out = rpc.statistics(hours).await?;
@@ -405,16 +429,11 @@ async fn main() -> Result<()> {
                 stats.unreadable_cmdline,
                 stats.unreadable_cwd
             );
-            println!("default={}", providers.default_provider);
-            for p in &providers.providers {
-                println!("provider={}", p);
-            }
+            print_providers(&providers);
 
             let Some(provider) = provider else {
                 for m in matches {
-                    println!("pid={}", m.pid);
-                    println!("cwd={}", m.cwd);
-                    println!("cmdline={}", m.cmdline);
+                    print_process(&m);
 
                     loop {
                         let input = prompt_line("provider (empty=skip, q=quit, ?=providers): ")?;
@@ -425,23 +444,15 @@ async fn main() -> Result<()> {
                             return Ok(());
                         }
                         if input == "?" {
-                            println!("default={}", providers.default_provider);
-                            for p in &providers.providers {
-                                println!("provider={}", p);
-                            }
+                            print_providers(&providers);
                             continue;
                         }
-                        if !providers.providers.iter().any(|p| p == &input) {
+                        if !provider_exists(&providers, &input) {
                             eprintln!("unknown provider: {input}");
                             continue;
                         }
 
-                        if dry_run {
-                            println!("dry-run: would set pid={} provider={}", m.pid, input);
-                        } else {
-                            rpc.set_route(m.pid, input).await?;
-                            println!("ok");
-                        }
+                        apply_route(&rpc, m.pid, &input, dry_run).await?;
                         break;
                     }
                 }
@@ -449,20 +460,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             };
 
-            if !providers.providers.iter().any(|p| p == &provider) {
+            if !provider_exists(&providers, &provider) {
                 anyhow::bail!("unknown provider: {provider}");
             }
 
             for m in matches {
-                println!("pid={}", m.pid);
-                println!("cwd={}", m.cwd);
-                println!("cmdline={}", m.cmdline);
-                if dry_run {
-                    println!("dry-run: would set pid={} provider={}", m.pid, provider);
-                } else {
-                    rpc.set_route(m.pid, provider.clone()).await?;
-                    println!("ok");
-                }
+                print_process(&m);
+                apply_route(&rpc, m.pid, &provider, dry_run).await?;
             }
         }
         Cmd::Exec {
@@ -471,7 +475,7 @@ async fn main() -> Result<()> {
             command,
         } => {
             let providers = rpc.providers().await?;
-            if !providers.providers.iter().any(|p| p == &provider) {
+            if !provider_exists(&providers, &provider) {
                 anyhow::bail!("unknown provider: {provider}");
             }
 

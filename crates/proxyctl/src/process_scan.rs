@@ -16,7 +16,6 @@ pub struct ProcessInfo {
 #[derive(Debug, Default, Clone)]
 pub struct ProcessScanStats {
     pub pids_seen: usize,
-    pub matched: usize,
     pub unreadable_cmdline: usize,
     pub unreadable_cwd: usize,
 }
@@ -41,10 +40,6 @@ fn list_proc_pids() -> Result<Vec<u32>> {
 
 #[cfg(target_os = "linux")]
 fn parse_cmdline_bytes(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        return None;
-    }
-
     let parts: Vec<String> = bytes
         .split(|b| *b == b'\0')
         .filter(|p| !p.is_empty())
@@ -59,33 +54,17 @@ fn parse_cmdline_bytes(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_cmdline(pid: u32) -> Result<Option<String>> {
+fn read_proc_cmdline(pid: u32) -> Option<String> {
     let path = format!("/proc/{pid}/cmdline");
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(err).with_context(|| format!("read {path}"));
-        }
-    };
-    Ok(parse_cmdline_bytes(&bytes))
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| parse_cmdline_bytes(&bytes))
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_cwd(pid: u32) -> Result<Option<PathBuf>> {
+fn read_proc_cwd(pid: u32) -> Option<PathBuf> {
     let path = format!("/proc/{pid}/cwd");
-    let p = match std::fs::read_link(&path) {
-        Ok(p) => p,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(err).with_context(|| format!("readlink {path}"));
-        }
-    };
-    Ok(Some(p))
+    std::fs::read_link(path).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -98,42 +77,27 @@ pub fn find_processes_by_cmdline_regex(
 
     for pid in list_proc_pids()? {
         stats.pids_seen += 1;
-        if let Some(limit) = limit {
-            if out.len() >= limit {
-                break;
-            }
+        if limit.is_some_and(|limit| out.len() >= limit) {
+            break;
         }
 
-        let cmdline = match read_proc_cmdline(pid) {
-            Ok(Some(cmdline)) => cmdline,
-            Ok(None) => {
-                stats.unreadable_cmdline += 1;
-                continue;
-            }
-            Err(_) => {
-                stats.unreadable_cmdline += 1;
-                continue;
-            }
+        let Some(cmdline) = read_proc_cmdline(pid) else {
+            stats.unreadable_cmdline += 1;
+            continue;
         };
 
         if !re.is_match(&cmdline) {
             continue;
         }
 
-        let cwd = match read_proc_cwd(pid) {
-            Ok(Some(p)) => p.to_string_lossy().to_string(),
-            Ok(None) => {
+        let cwd = read_proc_cwd(pid)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| {
                 stats.unreadable_cwd += 1;
                 "<unknown>".to_string()
-            }
-            Err(_) => {
-                stats.unreadable_cwd += 1;
-                "<unknown>".to_string()
-            }
-        };
+            });
 
         out.push(ProcessInfo { pid, cwd, cmdline });
-        stats.matched += 1;
     }
 
     Ok((out, stats))
@@ -534,10 +498,8 @@ pub fn find_processes_by_cmdline_regex(
 
     for p in stubs {
         stats.pids_seen += 1;
-        if let Some(limit) = limit {
-            if out.len() >= limit {
-                break;
-            }
+        if limit.is_some_and(|limit| out.len() >= limit) {
+            break;
         }
 
         let mut cmdline = None;
@@ -595,7 +557,6 @@ pub fn find_processes_by_cmdline_regex(
             cwd,
             cmdline,
         });
-        stats.matched += 1;
     }
 
     Ok((out, stats))
