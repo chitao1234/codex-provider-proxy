@@ -143,6 +143,11 @@ pub struct ModelCapabilities {
     /// `{search_query}` placeholder is replaced with the last user message.
     #[serde(default)]
     pub search_request_params: Option<serde_json::Value>,
+    /// Native web-fetch request parameters for `ServerToolPolicy::ProviderNative`, merged into
+    /// the top-level request when a web_fetch server tool is present (e.g. qwen's
+    /// `agent_max` search strategy that lets the model scrape URLs).
+    #[serde(default)]
+    pub fetch_request_params: Option<serde_json::Value>,
 }
 
 impl Default for ModelCapabilities {
@@ -159,6 +164,7 @@ impl Default for ModelCapabilities {
             max_tokens_cap: None,
             search_tool_template: None,
             search_request_params: None,
+            fetch_request_params: None,
         }
     }
 }

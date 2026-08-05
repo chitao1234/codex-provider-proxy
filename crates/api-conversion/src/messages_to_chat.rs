@@ -69,9 +69,26 @@ pub fn convert_messages_request(
     let messages = expand_messages(request.get("messages"), caps)?;
     let (tools, report) = convert_tools(request, caps)?;
     if let Some(search_params) = &caps.search_request_params {
-        if !report.dropped_server_tools.is_empty() || !report.mapped_server_tools.is_empty() {
+        if report
+            .mapped_server_tools
+            .iter()
+            .any(|tool| tool == "web_search")
+        {
             let query = last_user_query(request.get("messages"));
             let rendered = render_search_tool_template(search_params, query.as_deref());
+            if let Value::Object(params) = rendered {
+                out.extend(params);
+            }
+        }
+    }
+    if let Some(fetch_params) = &caps.fetch_request_params {
+        if report
+            .mapped_server_tools
+            .iter()
+            .any(|tool| tool == "web_fetch")
+        {
+            let query = last_user_query(request.get("messages"));
+            let rendered = render_search_tool_template(fetch_params, query.as_deref());
             if let Value::Object(params) = rendered {
                 out.extend(params);
             }
@@ -596,8 +613,17 @@ fn convert_tools(
                                 report.dropped_server_tools.push("web_search".to_string());
                             }
                         }
+                        Some("web_fetch") => {
+                            if caps.fetch_request_params.is_some() {
+                                // Web fetch is enabled via top-level request parameters
+                                // (e.g. qwen agent_max); the tool itself is dropped.
+                                report.mapped_server_tools.push("web_fetch".to_string());
+                            } else {
+                                report.dropped_server_tools.push("web_fetch".to_string());
+                            }
+                        }
                         _ => {
-                            // web_fetch and other server tools have no native chat form.
+                            // code_execution and other server tools have no native chat form.
                             let name = tool_name(object);
                             report.dropped_server_tools.push(name);
                         }
@@ -1434,6 +1460,35 @@ mod tests {
             report.dropped_server_tools,
             vec!["web_fetch", "code_execution"]
         );
+    }
+
+    #[test]
+    fn provider_native_fetch_params_enable_qwen_web_extractor() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.fetch_request_params = Some(json!({
+            "enable_search": true,
+            "search_options": {"search_strategy": "agent_max"},
+            "enable_thinking": true
+        }));
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "总结 https://example.com/a 的内容"}],
+            "tools": [
+                {"type": "web_fetch_20260209", "name": "web_fetch"},
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}}
+            ]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        // agent_max lets the model scrape URLs from the prompt.
+        assert_eq!(out["enable_search"], true);
+        assert_eq!(out["search_options"]["search_strategy"], "agent_max");
+        assert_eq!(out["enable_thinking"], true);
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert_eq!(report.mapped_server_tools, vec!["web_fetch"]);
     }
 
     #[test]
