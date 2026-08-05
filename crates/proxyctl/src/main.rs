@@ -11,7 +11,10 @@ use codex_provider_proxy_rpc_types::{
     SetRouteRequest, StatisticsBreakdown, StatisticsResponse,
 };
 use regex::Regex;
+use reqwest::{Method, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::Serialize;
 
 use codex_provider_proxyctl::process_scan;
 
@@ -166,57 +169,132 @@ fn default_rpc_url() -> String {
 
 const DEFAULT_MATCH_REGEX: &str = "codex";
 
-async fn rpc_list_providers(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    token: Option<&String>,
-) -> Result<ProvidersResponse> {
-    let url = format!("{}/rpc/v1/providers", rpc_url.trim_end_matches('/'));
-    let mut req = client.get(url);
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().await.context("send providers request")?;
-    let resp = resp
-        .error_for_status()
-        .context("providers returned error status")?;
-    resp.json().await.context("decode response")
+struct RpcClient {
+    client: reqwest::Client,
+    base_url: String,
+    token: Option<String>,
 }
 
-async fn rpc_set_route(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    token: Option<&String>,
-    pid: u32,
-    provider: String,
-) -> Result<()> {
-    let url = format!("{}/rpc/v1/routes", rpc_url.trim_end_matches('/'));
-    let mut req = client.post(url).json(&SetRouteRequest { pid, provider });
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
+impl RpcClient {
+    fn new(base_url: String, token: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token,
+        }
     }
-    let resp = req.send().await.context("send set request")?;
-    resp.error_for_status_ref()
-        .context("set route returned error status")?;
-    Ok(())
-}
 
-async fn rpc_delete_route(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    token: Option<&String>,
-    pid: u32,
-) -> Result<DeleteRouteResponse> {
-    let url = format!("{}/rpc/v1/routes/{}", rpc_url.trim_end_matches('/'), pid);
-    let mut req = client.delete(url);
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
+    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+        let request = self
+            .client
+            .request(method, format!("{}{}", self.base_url, path));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
-    let resp = req.send().await.context("send delete request")?;
-    let resp = resp
-        .error_for_status()
-        .context("delete route returned error status")?;
-    resp.json().await.context("decode response")
+
+    async fn send_no_content(
+        &self,
+        method: Method,
+        path: &str,
+        context: &'static str,
+    ) -> Result<()> {
+        self.request(method, path)
+            .send()
+            .await
+            .with_context(|| format!("send {context} request"))?
+            .error_for_status()
+            .with_context(|| format!("{context} returned error status"))?;
+        Ok(())
+    }
+
+    async fn send_json_body<B: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+        context: &'static str,
+    ) -> Result<()> {
+        self.request(method, path)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("send {context} request"))?
+            .error_for_status()
+            .with_context(|| format!("{context} returned error status"))?;
+        Ok(())
+    }
+
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        context: &'static str,
+    ) -> Result<T> {
+        self.request(method, path)
+            .send()
+            .await
+            .with_context(|| format!("send {context} request"))?
+            .error_for_status()
+            .with_context(|| format!("{context} returned error status"))?
+            .json()
+            .await
+            .with_context(|| format!("decode {context} response"))
+    }
+
+    async fn providers(&self) -> Result<ProvidersResponse> {
+        self.send_json(Method::GET, "/rpc/v1/providers", "providers")
+            .await
+    }
+
+    async fn set_route(&self, pid: u32, provider: String) -> Result<()> {
+        self.send_json_body(
+            Method::POST,
+            "/rpc/v1/routes",
+            &SetRouteRequest { pid, provider },
+            "set route",
+        )
+        .await
+    }
+
+    async fn set_default_provider(&self, provider: String) -> Result<()> {
+        self.send_json_body(
+            Method::POST,
+            "/rpc/v1/default-provider",
+            &SetDefaultProviderRequest { provider },
+            "set default provider",
+        )
+        .await
+    }
+
+    async fn delete_route(&self, pid: u32) -> Result<DeleteRouteResponse> {
+        self.send_json(
+            Method::DELETE,
+            &format!("/rpc/v1/routes/{pid}"),
+            "delete route",
+        )
+        .await
+    }
+
+    async fn clear_routes(&self) -> Result<()> {
+        self.send_no_content(Method::POST, "/rpc/v1/routes/clear", "clear routes")
+            .await
+    }
+
+    async fn routes(&self) -> Result<ListRoutesResponse> {
+        self.send_json(Method::GET, "/rpc/v1/routes", "list routes")
+            .await
+    }
+
+    async fn statistics(&self, hours: u32) -> Result<StatisticsResponse> {
+        self.send_json(
+            Method::GET,
+            &format!("/rpc/v1/statistics?hours={hours}"),
+            "statistics",
+        )
+        .await
+    }
 }
 
 fn exit_with_status(status: ExitStatus) -> ! {
@@ -245,14 +323,8 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
-async fn cleanup_route_best_effort(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    token: Option<&String>,
-    pid: u32,
-    context: &str,
-) {
-    if let Err(err) = rpc_delete_route(client, rpc_url, token, pid).await {
+async fn cleanup_route_best_effort(rpc: &RpcClient, pid: u32, context: &str) {
+    if let Err(err) = rpc.delete_route(pid).await {
         eprintln!("warning: {context} pid={pid}: {err}");
     }
 }
@@ -268,78 +340,40 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_rpc_url);
 
     let token = args.token.or(cwd_cfg.rpc_token);
-    let client = reqwest::Client::new();
+    let rpc = RpcClient::new(rpc_url, token);
 
     match args.cmd {
         Cmd::Set { pid, provider } => {
-            rpc_set_route(&client, &rpc_url, token.as_ref(), pid, provider).await?;
+            rpc.set_route(pid, provider).await?;
             println!("ok");
         }
         Cmd::SetDefault { provider } => {
-            let url = format!("{}/rpc/v1/default-provider", rpc_url.trim_end_matches('/'));
-            let mut req = client
-                .post(url)
-                .json(&SetDefaultProviderRequest { provider });
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send set-default request")?;
-            resp.error_for_status_ref()
-                .context("set default provider returned error status")?;
+            rpc.set_default_provider(provider).await?;
             println!("ok");
         }
         Cmd::Delete { pid } => {
-            let out = rpc_delete_route(&client, &rpc_url, token.as_ref(), pid).await?;
+            let out = rpc.delete_route(pid).await?;
             println!("removed={}", out.removed);
         }
         Cmd::Clear => {
-            let url = format!("{}/rpc/v1/routes/clear", rpc_url.trim_end_matches('/'));
-            let mut req = client.post(url);
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send clear request")?;
-            resp.error_for_status_ref()
-                .context("clear routes returned error status")?;
+            rpc.clear_routes().await?;
             println!("ok");
         }
         Cmd::List => {
-            let url = format!("{}/rpc/v1/routes", rpc_url.trim_end_matches('/'));
-            let mut req = client.get(url);
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send list request")?;
-            let resp = resp
-                .error_for_status()
-                .context("list routes returned error status")?;
-            let out: ListRoutesResponse = resp.json().await.context("decode response")?;
+            let out = rpc.routes().await?;
             for r in out.routes {
                 println!("pid={} provider={}", r.pid, r.provider);
             }
         }
         Cmd::Providers => {
-            let out = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
+            let out = rpc.providers().await?;
             println!("default={}", out.default_provider);
             for p in out.providers {
                 println!("provider={}", p);
             }
         }
         Cmd::Stats { hours, json } => {
-            let url = format!(
-                "{}/rpc/v1/statistics?hours={hours}",
-                rpc_url.trim_end_matches('/')
-            );
-            let mut req = client.get(url);
-            if let Some(token) = &token {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await.context("send statistics request")?;
-            let resp = resp
-                .error_for_status()
-                .context("statistics returned error status")?;
-            let out: StatisticsResponse =
-                resp.json().await.context("decode statistics response")?;
+            let out = rpc.statistics(hours).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -363,7 +397,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let providers = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
+            let providers = rpc.providers().await?;
             println!(
                 "matched={} (seen_pids={} unreadable_cmdline={} unreadable_cwd={})",
                 matches.len(),
@@ -405,7 +439,7 @@ async fn main() -> Result<()> {
                         if dry_run {
                             println!("dry-run: would set pid={} provider={}", m.pid, input);
                         } else {
-                            rpc_set_route(&client, &rpc_url, token.as_ref(), m.pid, input).await?;
+                            rpc.set_route(m.pid, input).await?;
                             println!("ok");
                         }
                         break;
@@ -426,8 +460,7 @@ async fn main() -> Result<()> {
                 if dry_run {
                     println!("dry-run: would set pid={} provider={}", m.pid, provider);
                 } else {
-                    rpc_set_route(&client, &rpc_url, token.as_ref(), m.pid, provider.clone())
-                        .await?;
+                    rpc.set_route(m.pid, provider.clone()).await?;
                     println!("ok");
                 }
             }
@@ -437,7 +470,7 @@ async fn main() -> Result<()> {
             keep_route,
             command,
         } => {
-            let providers = rpc_list_providers(&client, &rpc_url, token.as_ref()).await?;
+            let providers = rpc.providers().await?;
             if !providers.providers.iter().any(|p| p == &provider) {
                 anyhow::bail!("unknown provider: {provider}");
             }
@@ -446,28 +479,20 @@ async fn main() -> Result<()> {
             let args = &command[1..];
             let parent_pid = std::process::id();
 
-            rpc_set_route(
-                &client,
-                &rpc_url,
-                token.as_ref(),
-                parent_pid,
-                provider.clone(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "set pre-exec route for parent pid={} provider={}",
-                    parent_pid, provider
-                )
-            })?;
+            rpc.set_route(parent_pid, provider.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "set pre-exec route for parent pid={} provider={}",
+                        parent_pid, provider
+                    )
+                })?;
 
             let mut child = match ProcessCommand::new(exec).args(args).spawn() {
                 Ok(child) => child,
                 Err(err) => {
                     cleanup_route_best_effort(
-                        &client,
-                        &rpc_url,
-                        token.as_ref(),
+                        &rpc,
                         parent_pid,
                         "failed to remove pre-exec parent route after spawn failure for",
                     )
@@ -477,15 +502,11 @@ async fn main() -> Result<()> {
             };
             let pid = child.id();
 
-            if let Err(err) =
-                rpc_set_route(&client, &rpc_url, token.as_ref(), pid, provider.clone()).await
-            {
+            if let Err(err) = rpc.set_route(pid, provider.clone()).await {
                 let _ = child.kill();
                 let _ = child.wait();
                 cleanup_route_best_effort(
-                    &client,
-                    &rpc_url,
-                    token.as_ref(),
+                    &rpc,
                     parent_pid,
                     "failed to remove pre-exec parent route after child route setup failure for",
                 )
@@ -495,9 +516,7 @@ async fn main() -> Result<()> {
             }
 
             cleanup_route_best_effort(
-                &client,
-                &rpc_url,
-                token.as_ref(),
+                &rpc,
                 parent_pid,
                 "failed to remove pre-exec parent route for",
             )
@@ -511,7 +530,7 @@ async fn main() -> Result<()> {
             if keep_route {
                 println!("kept route for pid={}", pid);
             } else {
-                match rpc_delete_route(&client, &rpc_url, token.as_ref(), pid).await {
+                match rpc.delete_route(pid).await {
                     Ok(out) => println!("removed={} pid={}", out.removed, pid),
                     Err(err) => {
                         eprintln!("warning: failed to remove pid route for {}: {}", pid, err)
@@ -655,5 +674,46 @@ fn print_statistics_breakdown(label: &str, rows: &[StatisticsBreakdown]) {
             row.average_response_time_ms,
             row.total_tokens
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::{header, Method};
+
+    use super::RpcClient;
+
+    #[test]
+    fn rpc_client_normalizes_base_url_and_adds_auth() {
+        let rpc = RpcClient::new(
+            "http://127.0.0.1:8081///".to_string(),
+            Some("secret".to_string()),
+        );
+
+        let request = rpc
+            .request(Method::GET, "/rpc/v1/providers")
+            .build()
+            .expect("build request");
+
+        assert_eq!(
+            request.url().as_str(),
+            "http://127.0.0.1:8081/rpc/v1/providers"
+        );
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+    }
+
+    #[test]
+    fn rpc_client_omits_auth_without_token() {
+        let rpc = RpcClient::new("http://127.0.0.1:8081".to_string(), None);
+
+        let request = rpc
+            .request(Method::GET, "/rpc/v1/routes")
+            .build()
+            .expect("build request");
+
+        assert!(!request.headers().contains_key(header::AUTHORIZATION));
     }
 }
