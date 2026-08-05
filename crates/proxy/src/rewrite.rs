@@ -346,7 +346,6 @@ fn current_reasoning_effort(json: &Value) -> Option<String> {
             json.pointer("/output_config/effort")
                 .and_then(Value::as_str)
         })
-        .or_else(|| json.pointer("/thinking/type").and_then(Value::as_str))
         .map(str::to_owned)
 }
 
@@ -373,12 +372,6 @@ fn set_reasoning_effort(json: &mut Value, endpoint: ModelEndpoint, effort: &str)
         SetFieldResult::Unchanged => return false,
         SetFieldResult::Missing => {}
     }
-    match set_existing_thinking_type(json, effort) {
-        SetFieldResult::Changed => return true,
-        SetFieldResult::Unchanged => return false,
-        SetFieldResult::Missing => {}
-    }
-
     if json
         .get("reasoning")
         .is_some_and(|reasoning| reasoning.is_object())
@@ -421,16 +414,6 @@ fn set_existing_output_config_effort(json: &mut Value, effort: &str) -> SetField
         return SetFieldResult::Missing;
     }
     set_string_field(output_config, "effort", effort)
-}
-
-fn set_existing_thinking_type(json: &mut Value, effort: &str) -> SetFieldResult {
-    let Some(thinking) = json.get_mut("thinking").and_then(Value::as_object_mut) else {
-        return SetFieldResult::Missing;
-    };
-    if !thinking.contains_key("type") {
-        return SetFieldResult::Missing;
-    }
-    set_string_field(thinking, "type", effort)
 }
 
 fn set_reasoning_effort_object(json: &mut Value, effort: &str) -> bool {
@@ -737,12 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_messages_model_and_legacy_thinking_type_shape_from_claude_code_logs() {
+    fn rewrites_messages_effort_without_overwriting_thinking_type() {
         let cfg = test_config(vec![mapping(
             "claude-fable-5",
-            Some("adaptive"),
+            None,
             "claude-sonnet-5",
-            Some("disabled"),
+            Some("max"),
         )]);
         let headers = HeaderMap::new();
         let body = Bytes::from(
@@ -768,7 +751,8 @@ mod tests {
             vec![AnthropicBetaUpdate::Ensure(AnthropicBetaMarker::Effort)]
         );
         assert_eq!(rewritten["model"], "claude-sonnet-5");
-        assert_eq!(rewritten["thinking"]["type"], "disabled");
+        assert_eq!(rewritten["thinking"]["type"], "adaptive");
+        assert_eq!(rewritten["output_config"]["effort"], "max");
     }
 
     #[test]

@@ -53,7 +53,7 @@ response_body_max_bytes = 16777216
 #
 # `to_reasoning_effort` is optional. When set, the proxy preserves the request family's effort shape:
 # - responses: `reasoning.effort`
-# - messages: `output_config.effort` (`thinking.type` is still recognized for older captured shapes)
+# - messages: `output_config.effort`
 # - chat completions: `reasoning_effort` unless an existing `reasoning` object is present
 # Messages effort rewrites also ensure `anthropic-beta` contains an effort beta marker.
 # For Anthropic Messages, `to_model = "claude-sonnet-5[1m]"` keeps body model

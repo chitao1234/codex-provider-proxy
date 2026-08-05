@@ -165,8 +165,7 @@ Model mappings apply to JSON `POST` request bodies whose routed path ends with o
 The mapper rewrites top-level `model`. For effort matching and rewriting, it recognizes the request shapes seen in
 captured real exchanges:
 - OpenAI-style responses: `reasoning.effort`
-- Claude Code / Anthropic messages: `output_config.effort`; `thinking.type` is still recognized for older captured
-  shapes
+- Claude Code / Anthropic messages: `output_config.effort`
 - Chat completions: `reasoning_effort`; if an existing `reasoning` object is present, that shape is preserved
 
 For Anthropic Messages requests only, a model name ending in `[1m]` is interpreted as Claude's 1M-context model
