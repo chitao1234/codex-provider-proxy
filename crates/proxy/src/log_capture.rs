@@ -2,11 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-#[derive(Debug, Clone)]
-pub struct CaptureConfig {
-    pub max_bytes: usize,
-}
-
 #[derive(Debug, Default)]
 pub struct Capture {
     bytes: Vec<u8>,
@@ -15,11 +10,11 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn new(cfg: CaptureConfig) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Vec::new(),
             truncated: false,
-            max_bytes: cfg.max_bytes,
+            max_bytes,
         }
     }
 
@@ -28,10 +23,6 @@ impl Capture {
             return;
         }
         let remaining = self.max_bytes.saturating_sub(self.bytes.len());
-        if remaining == 0 {
-            self.truncated = true;
-            return;
-        }
         let take = remaining.min(chunk.len());
         self.bytes.extend_from_slice(&chunk[..take]);
         if take < chunk.len() {

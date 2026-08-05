@@ -51,15 +51,7 @@ pub fn maybe_create_exchange_logger(
         cfg.reconstruct_responses && path_supports_reconstruction(ctx.uri.path());
     match ExchangeFileLogger::new(
         root_dir,
-        ctx.request_id,
-        ctx.peer,
-        ctx.pid,
-        ctx.route_pid,
-        ctx.provider_name,
-        ctx.method,
-        ctx.uri,
-        ctx.upstream_url,
-        ctx.request_headers,
+        &ctx,
         should_reconstruct,
         cfg.exchange_body_max_bytes,
         cfg.exchange_body_compression,
@@ -95,18 +87,9 @@ pub struct ExchangeFileLogger {
 }
 
 impl ExchangeFileLogger {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         root_dir: &Path,
-        request_id: u64,
-        peer: SocketAddr,
-        pid: Option<u32>,
-        route_pid: Option<u32>,
-        provider_name: &str,
-        method: &Method,
-        uri: &Uri,
-        upstream_url: &Url,
-        request_headers: &HeaderMap,
+        ctx: &ExchangeLogContext<'_>,
         should_reconstruct: bool,
         body_max_bytes: Option<u64>,
         body_compression: BodyLogCompression,
@@ -114,7 +97,7 @@ impl ExchangeFileLogger {
         fs::create_dir_all(root_dir)?;
 
         let now = now_unix_ms();
-        let stem = format!("{now}_req_{request_id}");
+        let stem = format!("{now}_req_{}", ctx.request_id);
         let body_suffix = body_file_suffix(body_compression);
 
         let metadata_path = root_dir.join(format!("{stem}.meta.json"));
@@ -126,15 +109,15 @@ impl ExchangeFileLogger {
 
         let metadata = ExchangeMetadata {
             schema_version: EXCHANGE_LOG_SCHEMA_VERSION,
-            request_id,
+            request_id: ctx.request_id,
             started_unix_ms: now,
-            peer: peer.to_string(),
-            pid,
-            route_pid,
-            provider: provider_name.to_string(),
-            method: method.to_string(),
-            uri: uri.to_string(),
-            upstream_url: upstream_url.to_string(),
+            peer: ctx.peer.to_string(),
+            pid: ctx.pid,
+            route_pid: ctx.route_pid,
+            provider: ctx.provider_name.to_string(),
+            method: ctx.method.to_string(),
+            uri: ctx.uri.to_string(),
+            upstream_url: ctx.upstream_url.to_string(),
             body_max_bytes,
             body_compression: body_compression.as_str().to_string(),
             should_reconstruct,
@@ -168,10 +151,10 @@ impl ExchangeFileLogger {
         };
         let metadata_json = serde_json::to_vec_pretty(&metadata)?;
         fs::write(&metadata_path, metadata_json)?;
-        write_request_headers_file(&request_headers_path, method, uri, request_headers)?;
+        write_request_headers_file(&request_headers_path, ctx.method, ctx.uri, ctx.request_headers)?;
 
         Ok(Self {
-            request_id,
+            request_id: ctx.request_id,
             root_dir: root_dir.to_path_buf(),
             stem,
             metadata_path,
@@ -264,9 +247,7 @@ impl ExchangeFileLogger {
             "attempt response body",
         );
 
-        self.metadata.route_pid = route.route_pid;
-        self.metadata.provider = route.provider_name.to_string();
-        self.metadata.upstream_url = route.upstream_url.to_string();
+        self.metadata.apply_route(route);
         self.metadata.attempts.push(ExchangeAttemptMetadata {
             attempt: attempt_number,
             is_final: false,
@@ -361,35 +342,11 @@ impl ExchangeFileLogger {
 
         if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
             attempt_meta.is_final = is_final;
-            attempt_meta.route_pid = route.route_pid;
-            attempt_meta.provider = route.provider_name.to_string();
-            attempt_meta.upstream_url = route.upstream_url.to_string();
+            attempt_meta.apply_route(route);
             attempt_meta.response_status_code = Some(status.as_u16());
             attempt_meta.response_status_text = Some(status_text.to_string());
             attempt_meta.upstream_latency_ms = Some(latency_ms);
             attempt_meta.response_headers = attempt_headers_path.display().to_string();
-        } else {
-            self.metadata.attempts.push(ExchangeAttemptMetadata {
-                attempt: attempt_number,
-                is_final,
-                route_pid: route.route_pid,
-                provider: route.provider_name.to_string(),
-                upstream_url: route.upstream_url.to_string(),
-                response_status_code: Some(status.as_u16()),
-                response_status_text: Some(status_text.to_string()),
-                upstream_latency_ms: Some(latency_ms),
-                upstream_error: None,
-                request_body_bytes: None,
-                request_body_logged_bytes: None,
-                request_body_truncated: None,
-                response_body_bytes: None,
-                response_body_logged_bytes: None,
-                response_body_truncated: None,
-                request_headers: String::new(),
-                request_body: String::new(),
-                response_headers: attempt_headers_path.display().to_string(),
-                response_body: String::new(),
-            });
         }
 
         self.persist_metadata_best_effort("write attempt metadata");
@@ -427,9 +384,7 @@ impl ExchangeFileLogger {
     }
 
     pub fn update_upstream_target(&mut self, route: AttemptRouteContext<'_>) {
-        self.metadata.route_pid = route.route_pid;
-        self.metadata.provider = route.provider_name.to_string();
-        self.metadata.upstream_url = route.upstream_url.to_string();
+        self.metadata.apply_route(route);
         self.persist_metadata_best_effort("update upstream target metadata");
     }
 
@@ -450,9 +405,7 @@ impl ExchangeFileLogger {
                 self.response_content_encoding_error = Some(err.to_string());
             }
         }
-        self.metadata.route_pid = route.route_pid;
-        self.metadata.provider = route.provider_name.to_string();
-        self.metadata.upstream_url = route.upstream_url.to_string();
+        self.metadata.apply_route(route);
         let status_text = status.canonical_reason().unwrap_or("unknown");
         let mut body = format!(
             "status: {} {}\nlatency_ms: {}\n",
@@ -477,11 +430,11 @@ impl ExchangeFileLogger {
     }
 
     pub fn mark_upstream_send_error(&mut self, latency_ms: u128, err: &str) {
-        let active_attempt_number = self
+        if let Some(attempt_number) = self
             .active_attempt
             .as_ref()
-            .map(|attempt| attempt.attempt_number);
-        if let Some(attempt_number) = active_attempt_number {
+            .map(|attempt| attempt.attempt_number)
+        {
             self.finish_active_attempt_if_matching(attempt_number);
             if let Some(attempt_meta) = self.attempt_mut(attempt_number) {
                 attempt_meta.is_final = true;
@@ -509,12 +462,10 @@ impl ExchangeFileLogger {
         self.metadata.response_body_logged_bytes = response_body.logged_bytes;
         self.metadata.request_body_truncated = request_body.truncated;
         self.metadata.response_body_truncated = response_body.truncated;
-        self.metadata.completed_unix_ms = Some(now_unix_ms());
+        let completed_unix_ms = now_unix_ms();
+        self.metadata.completed_unix_ms = Some(completed_unix_ms);
         self.metadata.total_duration_ms = Some(
-            self.metadata
-                .completed_unix_ms
-                .unwrap_or(self.metadata.started_unix_ms)
-                .saturating_sub(self.metadata.started_unix_ms),
+            completed_unix_ms.saturating_sub(self.metadata.started_unix_ms),
         );
         if let Some(final_attempt) = self.metadata.attempts.iter_mut().rev().find(|a| a.is_final) {
             final_attempt.response_body_bytes = Some(response_body.bytes);
@@ -524,9 +475,6 @@ impl ExchangeFileLogger {
 
         if self.should_reconstruct {
             self.metadata.reconstruction_attempted = true;
-        }
-
-        if self.should_reconstruct {
             if let Err(err) = self.reconstruct_and_write() {
                 self.metadata.reconstruction_succeeded = Some(false);
                 self.metadata.reconstruction_error = Some(truncate_meta_error(&err.to_string()));
@@ -568,14 +516,13 @@ impl ExchangeFileLogger {
     }
 
     fn finish_active_attempt_if_matching(&mut self, attempt_number: u32) {
-        if self
-            .active_attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.attempt_number == attempt_number)
-        {
-            if let Some(active_attempt) = self.active_attempt.take() {
-                self.finish_attempt_body_writers(active_attempt);
-            }
+        let Some(active_attempt) = self.active_attempt.take() else {
+            return;
+        };
+        if active_attempt.attempt_number == attempt_number {
+            self.finish_attempt_body_writers(active_attempt);
+        } else {
+            self.active_attempt = Some(active_attempt);
         }
     }
 
@@ -684,6 +631,14 @@ struct ExchangeMetadata {
     files: ExchangeMetadataFiles,
 }
 
+impl ExchangeMetadata {
+    fn apply_route(&mut self, route: AttemptRouteContext<'_>) {
+        self.route_pid = route.route_pid;
+        self.provider = route.provider_name.to_string();
+        self.upstream_url = route.upstream_url.to_string();
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ExchangeMetadataFiles {
     request_headers: String,
@@ -714,6 +669,14 @@ struct ExchangeAttemptMetadata {
     request_body: String,
     response_headers: String,
     response_body: String,
+}
+
+impl ExchangeAttemptMetadata {
+    fn apply_route(&mut self, route: AttemptRouteContext<'_>) {
+        self.route_pid = route.route_pid;
+        self.provider = route.provider_name.to_string();
+        self.upstream_url = route.upstream_url.to_string();
+    }
 }
 
 struct ActiveAttemptLog {
@@ -766,40 +729,37 @@ impl BodyLogSink {
         max_bytes: Option<u64>,
         kind: &'static str,
     ) -> Self {
-        match Self::new(path.clone(), compression, max_bytes, kind) {
-            Ok(sink) => sink,
+        let mut sink = Self {
+            path,
+            writer: None,
+            max_bytes,
+            bytes: 0,
+            logged_bytes: 0,
+            truncated: false,
+            kind,
+        };
+        match create_body_writer(&sink.path, compression) {
+            Ok(writer) => sink.writer = Some(writer),
             Err(err) => {
                 warn!(
                     request_id,
                     attempt = attempt_number,
-                    path = %path.display(),
+                    path = %sink.path.display(),
                     error = %err,
                     kind,
                     "failed to create exchange body log"
                 );
-                Self {
-                    path,
-                    writer: None,
-                    max_bytes,
-                    bytes: 0,
-                    logged_bytes: 0,
-                    truncated: false,
-                    kind,
-                }
             }
         }
+        sink
     }
 
     fn append(&mut self, request_id: u64, chunk: &Bytes) {
-        self.bytes = self
-            .bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        self.bytes = self.bytes.saturating_add(chunk.len() as u64);
         let (write_len, truncated) =
             limited_chunk_len(self.max_bytes, self.logged_bytes, chunk.len());
         self.truncated |= truncated;
-        self.logged_bytes = self
-            .logged_bytes
-            .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+        self.logged_bytes = self.logged_bytes.saturating_add(write_len as u64);
 
         if write_len == 0 {
             return;
@@ -927,7 +887,7 @@ fn format_headers(headers: &HeaderMap) -> String {
     for (name, value) in headers.iter() {
         let value = value
             .to_str()
-            .map(std::string::ToString::to_string)
+            .map(str::to_string)
             .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).to_string());
         body.push_str(name.as_str());
         body.push_str(": ");
@@ -964,7 +924,7 @@ fn limited_chunk_len(max_bytes: Option<u64>, logged_bytes: u64, chunk_len: usize
         return (chunk_len, false);
     };
     let remaining = max_bytes.saturating_sub(logged_bytes);
-    let remaining_usize = usize::try_from(remaining).unwrap_or(usize::MAX);
+    let remaining_usize = remaining as usize;
     let write_len = remaining_usize.min(chunk_len);
     (write_len, write_len < chunk_len)
 }
@@ -1032,7 +992,7 @@ fn reconstruct_chat_completion_from_sse(payload: &str) -> Option<String> {
             let Some(index) = event_index(chunk_choice) else {
                 continue;
             };
-            ensure_chat_choice_slot(&mut choices, index);
+            ensure_slot(&mut choices, index);
             let choice = choices[index].get_or_insert_with(|| {
                 let mut choice = Map::new();
                 choice.insert("index".to_string(), Value::from(index));
@@ -1065,9 +1025,7 @@ fn reconstruct_chat_completion_from_sse(payload: &str) -> Option<String> {
     );
 
     let completion = Value::Object(completion);
-    serde_json::to_string_pretty(&completion)
-        .ok()
-        .or_else(|| Some(completion.to_string()))
+    Some(serde_json::to_string_pretty(&completion).unwrap_or_else(|_| completion.to_string()))
 }
 
 fn is_chat_completion_chunk(json: &Value) -> bool {
@@ -1092,9 +1050,9 @@ fn copy_chat_completion_metadata(completion: &mut Map<String, Value>, chunk: &Va
     }
 }
 
-fn ensure_chat_choice_slot(choices: &mut Vec<Option<Map<String, Value>>>, index: usize) {
-    if choices.len() <= index {
-        choices.resize_with(index + 1, || None);
+fn ensure_slot<T: Default>(vec: &mut Vec<T>, index: usize) {
+    if vec.len() <= index {
+        vec.resize_with(index + 1, T::default);
     }
 }
 
@@ -1111,7 +1069,7 @@ fn merge_chat_completion_delta(choice: &mut Map<String, Value>, delta: &Map<Stri
             "content" | "refusal" | "reasoning_content" => {
                 append_json_string(message, field, value);
             }
-            "function_call" => merge_function_call(message, value),
+            "function_call" => merge_append_field(message, "function_call", value),
             "tool_calls" => merge_tool_calls(message, value),
             _ => {
                 message.insert(field.clone(), value.clone());
@@ -1135,22 +1093,22 @@ fn append_json_string(object: &mut Map<String, Value>, field: &str, value: &Valu
     object.insert(field.to_string(), Value::String(combined));
 }
 
-fn merge_function_call(message: &mut Map<String, Value>, value: &Value) {
+fn merge_append_field(parent: &mut Map<String, Value>, key: &str, value: &Value) {
     let Some(delta) = value.as_object() else {
-        message.insert("function_call".to_string(), value.clone());
+        parent.insert(key.to_string(), value.clone());
         return;
     };
-    let function_call = message
-        .entry("function_call".to_string())
+    let object = parent
+        .entry(key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
-    let Some(function_call) = function_call.as_object_mut() else {
+    let Some(object) = object.as_object_mut() else {
         return;
     };
     for (field, value) in delta {
         if matches!(field.as_str(), "name" | "arguments") {
-            append_json_string(function_call, field, value);
+            append_json_string(object, field, value);
         } else {
-            function_call.insert(field.clone(), value.clone());
+            object.insert(field.clone(), value.clone());
         }
     }
 }
@@ -1194,23 +1152,7 @@ fn merge_tool_calls(message: &mut Map<String, Value>, value: &Value) {
 }
 
 fn merge_tool_function(tool_call: &mut Map<String, Value>, value: &Value) {
-    let Some(delta) = value.as_object() else {
-        tool_call.insert("function".to_string(), value.clone());
-        return;
-    };
-    let function = tool_call
-        .entry("function".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(function) = function.as_object_mut() else {
-        return;
-    };
-    for (field, value) in delta {
-        if matches!(field.as_str(), "name" | "arguments") {
-            append_json_string(function, field, value);
-        } else {
-            function.insert(field.clone(), value.clone());
-        }
-    }
+    merge_append_field(tool_call, "function", value);
 }
 
 fn reconstruct_openai_response_from_sse(payload: &str) -> Option<String> {
@@ -1251,9 +1193,9 @@ fn reconstruct_openai_response_from_sse(payload: &str) -> Option<String> {
     }
 
     if let Some(response) = completed_response {
-        return serde_json::to_string_pretty(&response)
-            .ok()
-            .or_else(|| Some(response.to_string()));
+        return Some(
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string()),
+        );
     }
     if !text_deltas.is_empty() {
         return Some(text_deltas);
@@ -1302,7 +1244,7 @@ fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
                 let Some(index) = event_index(&json) else {
                     continue;
                 };
-                ensure_content_slot(&mut content_blocks, index);
+                ensure_slot(&mut content_blocks, index);
                 if let Some(content_block) = json.get("content_block").cloned() {
                     content_blocks[index] = Some(content_block);
                 }
@@ -1312,8 +1254,8 @@ fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
                 let Some(index) = event_index(&json) else {
                     continue;
                 };
-                ensure_content_slot(&mut content_blocks, index);
-                ensure_input_slot(&mut input_json_deltas, index);
+                ensure_slot(&mut content_blocks, index);
+                ensure_slot(&mut input_json_deltas, index);
                 let Some(delta) = json.get("delta").and_then(Value::as_object) else {
                     continue;
                 };
@@ -1405,21 +1347,7 @@ fn reconstruct_anthropic_message_from_sse(payload: &str) -> Option<String> {
     message_obj.insert("content".to_string(), Value::Array(reconstructed_content));
 
     let message = Value::Object(message_obj.clone());
-    serde_json::to_string_pretty(&message)
-        .ok()
-        .or(Some(message.to_string()))
-}
-
-fn ensure_content_slot(content_blocks: &mut Vec<Option<Value>>, index: usize) {
-    if content_blocks.len() <= index {
-        content_blocks.resize_with(index + 1, || None);
-    }
-}
-
-fn ensure_input_slot(input_json_deltas: &mut Vec<String>, index: usize) {
-    if input_json_deltas.len() <= index {
-        input_json_deltas.resize_with(index + 1, String::new);
-    }
+    Some(serde_json::to_string_pretty(&message).unwrap_or_else(|_| message.to_string()))
 }
 
 fn event_index(json: &Value) -> Option<usize> {
@@ -1460,6 +1388,20 @@ struct SseEvent {
     data: String,
 }
 
+fn flush_sse_event(
+    events: &mut Vec<SseEvent>,
+    current_event: &mut Option<String>,
+    data_lines: &mut Vec<String>,
+) {
+    if current_event.is_some() || !data_lines.is_empty() {
+        events.push(SseEvent {
+            event: current_event.take(),
+            data: data_lines.join("\n"),
+        });
+        data_lines.clear();
+    }
+}
+
 fn parse_sse_events(payload: &str) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let mut current_event: Option<String> = None;
@@ -1468,13 +1410,7 @@ fn parse_sse_events(payload: &str) -> Vec<SseEvent> {
     for line in payload.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
-            if current_event.is_some() || !data_lines.is_empty() {
-                events.push(SseEvent {
-                    event: current_event.take(),
-                    data: data_lines.join("\n"),
-                });
-                data_lines.clear();
-            }
+            flush_sse_event(&mut events, &mut current_event, &mut data_lines);
             continue;
         }
 
@@ -1488,13 +1424,7 @@ fn parse_sse_events(payload: &str) -> Vec<SseEvent> {
         }
     }
 
-    if current_event.is_some() || !data_lines.is_empty() {
-        events.push(SseEvent {
-            event: current_event,
-            data: data_lines.join("\n"),
-        });
-    }
-
+    flush_sse_event(&mut events, &mut current_event, &mut data_lines);
     events
 }
 
@@ -1535,7 +1465,7 @@ mod tests {
 
     use super::{
         path_supports_reconstruction, reconstruct_response_payload, AttemptRouteContext,
-        BodyLogCompression, ExchangeFileLogger,
+        BodyLogCompression, ExchangeFileLogger, ExchangeLogContext,
     };
 
     #[test]
@@ -1710,22 +1640,19 @@ mod tests {
         let uri: Uri = "/v1/messages".parse().unwrap();
         let upstream_url = Url::parse("https://api.example.com/v1/messages").unwrap();
         let request_headers = HeaderMap::new();
-        let mut logger = ExchangeFileLogger::new(
-            &root,
-            78,
-            "127.0.0.1:5001".parse().unwrap(),
-            None,
-            None,
-            "provider_a",
-            &method,
-            &uri,
-            &upstream_url,
-            &request_headers,
-            true,
-            None,
-            BodyLogCompression::Zstd,
-        )
-        .unwrap();
+        let ctx = ExchangeLogContext {
+            request_id: 78,
+            peer: "127.0.0.1:5001".parse().unwrap(),
+            pid: None,
+            route_pid: None,
+            provider_name: "provider_a",
+            method: &method,
+            uri: &uri,
+            upstream_url: &upstream_url,
+            request_headers: &request_headers,
+        };
+        let mut logger =
+            ExchangeFileLogger::new(&root, &ctx, true, None, BodyLogCompression::Zstd).unwrap();
         let route = AttemptRouteContext {
             route_pid: None,
             provider_name: "provider_a",
@@ -1818,23 +1745,19 @@ mod tests {
         let upstream_url = Url::parse("https://api.example.com/v1/responses").unwrap();
         let mut request_headers = HeaderMap::new();
         request_headers.insert("x-test", "root".parse().unwrap());
-
-        let mut logger = ExchangeFileLogger::new(
-            &root,
-            77,
-            "127.0.0.1:5000".parse().unwrap(),
-            Some(111),
-            Some(222),
-            "provider_a",
-            &method,
-            &uri,
-            &upstream_url,
-            &request_headers,
-            false,
-            None,
-            BodyLogCompression::None,
-        )
-        .unwrap();
+        let ctx = ExchangeLogContext {
+            request_id: 77,
+            peer: "127.0.0.1:5000".parse().unwrap(),
+            pid: Some(111),
+            route_pid: Some(222),
+            provider_name: "provider_a",
+            method: &method,
+            uri: &uri,
+            upstream_url: &upstream_url,
+            request_headers: &request_headers,
+        };
+        let mut logger = ExchangeFileLogger::new(&root, &ctx, false, None, BodyLogCompression::None)
+            .unwrap();
 
         let route = AttemptRouteContext {
             route_pid: Some(222),

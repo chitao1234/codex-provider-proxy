@@ -31,7 +31,7 @@ use crate::{
         maybe_create_exchange_logger, ExchangeFileLogger, ExchangeLogContext,
         SharedExchangeFileLogger,
     },
-    log_capture::{Capture, CaptureConfig, CaptureSummary, SharedCapture},
+    log_capture::{Capture, CaptureSummary, SharedCapture},
     rewrite::{
         apply_request_rewrites, request_rewrites_may_apply, AnthropicBetaMarker,
         AnthropicBetaPrefix, AnthropicBetaUpdate, RequestRewriteContext,
@@ -1331,9 +1331,9 @@ impl BodyObservers {
         logger_action: &'static str,
     ) -> Self {
         let capture = cfg.logging.log_bodies.then(|| {
-            Arc::new(std::sync::Mutex::new(Capture::new(CaptureConfig {
-                max_bytes: cfg.logging.max_body_log_bytes,
-            })))
+            Arc::new(std::sync::Mutex::new(Capture::new(
+                cfg.logging.max_body_log_bytes,
+            )))
         });
         Self {
             capture,
