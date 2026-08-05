@@ -94,6 +94,20 @@ pub fn convert_messages_request(
             }
         }
     }
+    if let Some(code_params) = &caps.code_interpreter_request_params {
+        if report
+            .mapped_server_tools
+            .iter()
+            .any(|tool| tool == "code_execution")
+        {
+            let rendered = render_search_tool_template(code_params, None);
+            if let Value::Object(params) = rendered {
+                out.extend(params);
+            }
+            // qwen code interpreter requires streaming.
+            out.insert("stream".to_string(), json!(true));
+        }
+    }
 
     let mut chat_messages: Vec<Value> =
         Vec::with_capacity(messages.len() + usize::from(!system.is_empty()));
@@ -620,6 +634,19 @@ fn convert_tools(
                                 report.mapped_server_tools.push("web_fetch".to_string());
                             } else {
                                 report.dropped_server_tools.push("web_fetch".to_string());
+                            }
+                        }
+                        Some("code_execution") => {
+                            if caps.code_interpreter_request_params.is_some() {
+                                // Code execution is enabled via top-level request parameters
+                                // (e.g. qwen enable_code_interpreter); the tool itself is dropped.
+                                report
+                                    .mapped_server_tools
+                                    .push("code_execution".to_string());
+                            } else {
+                                report
+                                    .dropped_server_tools
+                                    .push("code_execution".to_string());
                             }
                         }
                         _ => {
@@ -1460,6 +1487,35 @@ mod tests {
             report.dropped_server_tools,
             vec!["web_fetch", "code_execution"]
         );
+    }
+
+    #[test]
+    fn provider_native_code_interpreter_params_enable_qwen() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.code_interpreter_request_params = Some(json!({
+            "enable_code_interpreter": true,
+            "enable_thinking": true
+        }));
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "stream": false,
+            "messages": [{"role": "user", "content": "12 的 3 次方是多少？"}],
+            "tools": [
+                {"type": "code_execution_20260120", "name": "code_execution"},
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}}
+            ]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["enable_code_interpreter"], true);
+        assert_eq!(out["enable_thinking"], true);
+        // qwen code interpreter requires streaming; forced on.
+        assert_eq!(out["stream"], true);
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert_eq!(report.mapped_server_tools, vec!["code_execution"]);
     }
 
     #[test]

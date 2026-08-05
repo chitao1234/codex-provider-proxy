@@ -148,6 +148,11 @@ pub struct ModelCapabilities {
     /// `agent_max` search strategy that lets the model scrape URLs).
     #[serde(default)]
     pub fetch_request_params: Option<serde_json::Value>,
+    /// Native code-interpreter request parameters for `ServerToolPolicy::ProviderNative`,
+    /// merged into the top-level request when a code_execution server tool is present
+    /// (e.g. qwen's `enable_code_interpreter: true`, must be streaming).
+    #[serde(default)]
+    pub code_interpreter_request_params: Option<serde_json::Value>,
 }
 
 impl Default for ModelCapabilities {
@@ -165,6 +170,7 @@ impl Default for ModelCapabilities {
             search_tool_template: None,
             search_request_params: None,
             fetch_request_params: None,
+            code_interpreter_request_params: None,
         }
     }
 }
