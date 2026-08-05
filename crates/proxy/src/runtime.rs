@@ -160,14 +160,13 @@ impl RuntimeState {
             .prepare_reconfigure(&config.statistics)
             .context("reconfigure statistics database")?;
         let current_routing = self.routing_snapshot().await;
-        let http_client =
-            if current_routing.config.upstream_connect_timeout != config.upstream_connect_timeout {
-                build_http_client(&config)?
-            } else {
-                current_routing.http_client
-            };
         let connect_timeout_changed =
             current_routing.config.upstream_connect_timeout != config.upstream_connect_timeout;
+        let http_client = if connect_timeout_changed {
+            build_http_client(&config)?
+        } else {
+            current_routing.http_client
+        };
         let next_routing = RoutingSnapshot::new(config.clone(), http_client);
 
         self.inner
@@ -279,49 +278,33 @@ impl ServerManager {
 
         let mut listeners = self.listeners.lock().await;
         for bound in new_proxy_listeners {
-            if listeners.proxy.contains_key(&bound.configured_addr) {
-                info!(
-                    configured = %bound.configured_addr,
-                    listen = %bound.local_addr,
-                    "proxy listener already present; dropping newly bound listener"
-                );
-                continue;
-            }
             info!(
                 configured = %bound.configured_addr,
                 listen = %bound.local_addr,
                 "proxy listening"
             );
-            listeners.proxy.insert(
+            let previous = listeners.proxy.insert(
                 bound.configured_addr,
                 spawn_proxy_listener(self.runtime.clone(), bound),
             );
+            debug_assert!(previous.is_none());
         }
 
         if let Some(bound) = new_rpc_listener {
-            if listeners
-                .rpc
-                .as_ref()
-                .map(|(addr, _)| *addr == config.rpc_listen_addr)
-                .unwrap_or(false)
+            debug_assert_ne!(
+                listeners.rpc.as_ref().map(|(addr, _)| *addr),
+                Some(config.rpc_listen_addr)
+            );
+            info!(
+                configured = %bound.configured_addr,
+                rpc_listen = %bound.local_addr,
+                "rpc listening"
+            );
+            let new_handle = spawn_rpc_listener(self.runtime.clone(), bound);
+            if let Some((old_addr, old_handle)) =
+                listeners.rpc.replace((config.rpc_listen_addr, new_handle))
             {
-                info!(
-                    configured = %bound.configured_addr,
-                    rpc_listen = %bound.local_addr,
-                    "rpc listener already present; dropping newly bound listener"
-                );
-            } else {
-                info!(
-                    configured = %bound.configured_addr,
-                    rpc_listen = %bound.local_addr,
-                    "rpc listening"
-                );
-                let new_handle = spawn_rpc_listener(self.runtime.clone(), bound);
-                if let Some((old_addr, old_handle)) =
-                    listeners.rpc.replace((config.rpc_listen_addr, new_handle))
-                {
-                    old_handle.stop("rpc", old_addr);
-                }
+                old_handle.stop("rpc", old_addr);
             }
         }
 
