@@ -104,11 +104,19 @@ pub fn is_server_tool(tool: &Value) -> bool {
 }
 
 /// Well-known Anthropic server tool names as sent by Claude Code / Anthropic SDKs.
+///
+/// This includes Claude Code's camelCase forms (`WebSearch`, `WebFetch`): Claude Code declares
+/// these as custom-looking tools, but Anthropic and Anthropic-compatible upstreams (e.g.
+/// DeepSeek's `/anthropic` endpoint) recognize the name and execute the search server-side,
+/// returning `server_tool_use` + `web_search_tool_result` blocks. Chat Completions upstreams
+/// have no server-side search, so these must be handled by the `ServerToolPolicy`.
 pub fn is_known_server_tool_name(name: &str) -> bool {
     matches!(
         name,
         "web_search"
             | "web_fetch"
+            | "WebSearch"
+            | "WebFetch"
             | "code_execution"
             | "bash"
             | "str_replace_editor"
@@ -124,7 +132,13 @@ pub fn server_tool_function_name(tool: &Value) -> Option<String> {
     let object = tool.as_object()?;
     let name = object.get("name").and_then(Value::as_str)?;
     if is_known_server_tool_name(name) {
-        return Some(name.to_string());
+        // Claude Code's camelCase forms map to their snake_case server names.
+        let normalized = match name {
+            "WebSearch" => "web_search",
+            "WebFetch" => "web_fetch",
+            other => other,
+        };
+        return Some(normalized.to_string());
     }
     if let Some(tool_type) = object.get("type").and_then(Value::as_str) {
         for prefix in SERVER_TOOL_TYPE_PREFIXES {
@@ -321,6 +335,14 @@ mod tests {
         assert!(is_server_tool(
             &json!({"name": "bash", "description": "d", "input_schema": {}})
         ));
+        // Claude Code declares search tools as custom-looking tools; upstreams execute them
+        // server-side, so they must be treated as server tools for conversion.
+        assert!(is_server_tool(
+            &json!({"name": "WebSearch", "description": "Search the web", "input_schema": {}})
+        ));
+        assert!(is_server_tool(
+            &json!({"name": "WebFetch", "description": "Fetch a URL", "input_schema": {}})
+        ));
         assert!(!is_server_tool(
             &json!({"name": "Read", "description": "d", "input_schema": {}})
         ));
@@ -344,6 +366,14 @@ mod tests {
         assert_eq!(
             server_tool_function_name(&json!({"name": "code_execution", "description": "d"})),
             Some("code_execution".to_string())
+        );
+        assert_eq!(
+            server_tool_function_name(&json!({"name": "WebSearch", "description": "d"})),
+            Some("web_search".to_string())
+        );
+        assert_eq!(
+            server_tool_function_name(&json!({"name": "WebFetch", "description": "d"})),
+            Some("web_fetch".to_string())
         );
         assert_eq!(
             server_tool_function_name(&json!({"name": "Read", "description": "d"})),
