@@ -84,6 +84,7 @@ pub fn parse_cutoff_local_datetime(local_datetime: &str) -> Result<u128> {
 
 pub fn build_prune_plan(dir: &Path, cutoff_unix_ms: u128) -> Result<PrunePlan> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
+    let mut files = Vec::new();
     let mut by_stem: BTreeMap<String, PruneGroup> = BTreeMap::new();
 
     for entry in entries {
@@ -96,27 +97,47 @@ pub fn build_prune_plan(dir: &Path, cutoff_unix_ms: u128) -> Result<PrunePlan> {
         }
 
         let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+        else {
             continue;
         };
-        let Some((stem, started_unix_ms)) = parse_exchange_stem_and_started_ms(file_name) else {
-            continue;
-        };
-        if started_unix_ms >= cutoff_unix_ms {
-            continue;
-        }
-
         let size_bytes = entry
             .metadata()
             .with_context(|| format!("read metadata for {}", path.display()))?
             .len();
+        files.push((file_name.clone(), path, size_bytes));
 
-        let group = by_stem.entry(stem.clone()).or_insert_with(|| PruneGroup {
+        let Some(meta_stem) = file_name.strip_suffix(".meta.json") else {
+            continue;
+        };
+        let Some((stem, started_unix_ms)) = parse_exchange_stem_and_started_ms(meta_stem) else {
+            continue;
+        };
+        if stem != meta_stem || started_unix_ms >= cutoff_unix_ms {
+            continue;
+        }
+
+        by_stem.entry(stem.clone()).or_insert_with(|| PruneGroup {
             stem,
             started_unix_ms,
             files: Vec::new(),
             total_bytes: 0,
         });
+    }
+
+    for (file_name, path, size_bytes) in files {
+        let Some((stem, _)) = file_name.split_once('.') else {
+            continue;
+        };
+        let Some(group) = by_stem.get_mut(stem) else {
+            continue;
+        };
+        if !is_exchange_artifact(&file_name, stem) {
+            continue;
+        }
         group.files.push(path);
         group.total_bytes = group.total_bytes.saturating_add(size_bytes);
     }
@@ -175,6 +196,43 @@ fn parse_exchange_stem_and_started_ms(file_name: &str) -> Option<(String, u128)>
     Some((stem.to_string(), started_unix_ms))
 }
 
+fn is_exchange_artifact(file_name: &str, stem: &str) -> bool {
+    let Some(suffix) = file_name.strip_prefix(stem) else {
+        return false;
+    };
+    if matches!(
+        suffix,
+        ".meta.json"
+            | ".request_headers.txt"
+            | ".request_body.bin"
+            | ".request_body.bin.zst"
+            | ".response_headers.txt"
+            | ".response_body.bin"
+            | ".response_body.bin.zst"
+            | ".response_reconstructed.txt"
+    ) {
+        return true;
+    }
+
+    let Some(attempt_suffix) = suffix.strip_prefix(".attempt_") else {
+        return false;
+    };
+    let Some((attempt_number, artifact_suffix)) = attempt_suffix.split_once('.') else {
+        return false;
+    };
+    !attempt_number.is_empty()
+        && attempt_number.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(
+            artifact_suffix,
+            "request_headers.txt"
+                | "request_body.bin"
+                | "request_body.bin.zst"
+                | "response_headers.txt"
+                | "response_body.bin"
+                | "response_body.bin.zst"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -227,6 +285,35 @@ mod tests {
         assert_eq!(plan.total_bytes, 16);
         assert_eq!(plan.groups[0].stem, old_stem);
         assert_eq!(plan.groups[0].files.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_prune_plan_requires_old_meta_anchor_and_keeps_orphans() {
+        let dir = create_temp_dir("prune-plan-requires-meta-anchor");
+
+        let anchored_stem = "1700000000000_req_1";
+        let orphan_stem = "1690000000000_req_orphan";
+        let anchored_meta = dir.join(format!("{anchored_stem}.meta.json"));
+        let anchored_body = dir.join(format!("{anchored_stem}.response_body.bin"));
+        let orphan_body = dir.join(format!("{orphan_stem}.response_body.bin"));
+        let unrelated = dir.join(format!("{anchored_stem}.notes.txt"));
+        write_bytes(&anchored_meta, 3);
+        write_bytes(&anchored_body, 5);
+        write_bytes(&orphan_body, 7);
+        write_bytes(&unrelated, 11);
+
+        let cutoff = parse_cutoff_local_datetime("2024-06-01T00:00:00").expect("parse cutoff");
+        let plan = build_prune_plan(&dir, cutoff).expect("build plan");
+
+        assert_eq!(plan.exchange_count(), 1);
+        assert_eq!(plan.total_files, 2);
+        assert_eq!(plan.total_bytes, 8);
+        assert!(plan.groups[0].files.contains(&anchored_meta));
+        assert!(plan.groups[0].files.contains(&anchored_body));
+        assert!(!plan.groups[0].files.contains(&orphan_body));
+        assert!(!plan.groups[0].files.contains(&unrelated));
 
         let _ = fs::remove_dir_all(&dir);
     }

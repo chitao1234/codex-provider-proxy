@@ -91,6 +91,34 @@ fn prune_logs_with_yes_deletes_only_older_files() {
 }
 
 #[test]
+fn prune_logs_with_yes_retains_orphan_exchange_artifacts() {
+    let dir = create_temp_dir("proxyctl-prune-retains-orphan");
+    let orphan_body = dir.join("1690000000000_req_orphan.response_body.bin");
+    let anchored_meta = dir.join("1700000000000_req_anchored.meta.json");
+    let anchored_body = dir.join("1700000000000_req_anchored.response_body.bin");
+    write_bytes(&orphan_body, 3);
+    write_bytes(&anchored_meta, 5);
+    write_bytes(&anchored_body, 7);
+
+    let out = run_prune_command(
+        &dir,
+        &["--before-local-datetime", CUTOFF_LOCAL_DATETIME, "-y"],
+    );
+
+    assert!(
+        out.status.success(),
+        "expected zero exit with -y; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(orphan_body.exists(), "orphan artifact should be retained");
+    assert!(!anchored_meta.exists(), "anchored meta should be deleted");
+    assert!(!anchored_body.exists(), "anchored body should be deleted");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prune_logs_without_yes_can_delete_after_interactive_confirmation() {
     let dir = create_temp_dir("proxyctl-prune-interactive-confirm");
     let (old_meta, old_body, new_meta) = seed_log_files(&dir);

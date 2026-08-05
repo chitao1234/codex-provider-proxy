@@ -363,18 +363,14 @@ fn resolve_logged_path(meta_path: &Path, configured: &str, fallback_file: &str) 
     }
 
     let direct = PathBuf::from(configured);
-    if direct.is_absolute() || direct.exists() {
+    if direct.is_absolute() {
         return direct;
     }
 
-    let joined = meta_path
+    meta_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(&direct);
-    if joined.exists() {
-        return joined;
-    }
-    direct
+        .join(direct)
 }
 
 fn parse_latency_from_response_headers(path: &Path) -> Option<u128> {
@@ -459,11 +455,14 @@ fn read_logged_body(path: &Path, body_compression: Option<&str>) -> Result<Vec<u
             .is_some_and(|v| v.eq_ignore_ascii_case("zst"));
     if is_zstd {
         let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let bytes = zstd::stream::decode_all(file)
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("open zstd decoder for {}", path.display()))?;
+        let bytes = read_limited(decoder, "logged body")
             .with_context(|| format!("decode zstd {}", path.display()))?;
         return Ok(bytes);
     }
-    fs::read(path).with_context(|| format!("read {}", path.display()))
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    read_limited(file, "logged body").with_context(|| format!("read {}", path.display()))
 }
 
 fn read_response_content_encodings(path: &Path) -> Result<Vec<String>> {
@@ -529,15 +528,17 @@ fn decode_deflate(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_decoded_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    read_limited(reader, "decoded response")
+}
+
+fn read_limited<R: Read>(reader: R, subject: &str) -> io::Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut reader = reader.take(MAX_DECODED_RESPONSE_BODY_BYTES.saturating_add(1));
     reader.read_to_end(&mut decoded)?;
     if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > MAX_DECODED_RESPONSE_BODY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "decoded response exceeds the {MAX_DECODED_RESPONSE_BODY_BYTES}-byte analysis limit"
-            ),
+            format!("{subject} exceeds the {MAX_DECODED_RESPONSE_BODY_BYTES}-byte analysis limit"),
         ));
     }
     Ok(decoded)
@@ -794,6 +795,8 @@ fn percentile_nearest_rank(sorted: &[u128], q: f64) -> u128 {
 mod tests {
     use std::{
         fs,
+        io::{self, Read},
+        path::Path,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -801,8 +804,58 @@ mod tests {
 
     use super::{
         extract_completed_response_from_log, extract_completed_response_from_sse,
-        extract_usage_snapshot, normalize_filter_values, AnalysisFilters, ExchangeAttemptMeta,
+        extract_usage_snapshot, normalize_filter_values, read_logged_body, resolve_logged_path,
+        AnalysisFilters, ExchangeAttemptMeta, MAX_DECODED_RESPONSE_BODY_BYTES,
     };
+
+    #[test]
+    fn resolves_relative_logged_path_against_metadata_parent() {
+        let meta_path = Path::new("logs/exchanges/1700000000000_req_1.meta.json");
+
+        let resolved = resolve_logged_path(meta_path, "bodies/response.bin", "fallback.bin");
+
+        assert_eq!(resolved, Path::new("logs/exchanges/bodies/response.bin"));
+    }
+
+    #[test]
+    fn rejects_raw_logged_body_over_limit() {
+        let path = temp_file_path("raw-over-limit", "bin");
+        let file = fs::File::create(&path).expect("create sparse body");
+        file.set_len(MAX_DECODED_RESPONSE_BODY_BYTES + 1)
+            .expect("size sparse body");
+
+        let error = read_logged_body(&path, None).expect_err("oversized raw body should fail");
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("logged body exceeds the 67108864-byte analysis limit"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_zstd_logged_body_decoding_over_limit() {
+        let path = temp_file_path("zstd-over-limit", "bin.zst");
+        let file = fs::File::create(&path).expect("create compressed body");
+        let mut encoder = zstd::stream::write::Encoder::new(file, 1).expect("create encoder");
+        io::copy(
+            &mut io::repeat(0).take(MAX_DECODED_RESPONSE_BODY_BYTES + 1),
+            &mut encoder,
+        )
+        .expect("encode oversized body");
+        encoder.finish().expect("finish encoder");
+
+        let error =
+            read_logged_body(&path, Some("zstd")).expect_err("oversized decoded body should fail");
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("logged body exceeds the 67108864-byte analysis limit"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn extracts_response_from_completed_event() {
@@ -911,18 +964,8 @@ mod tests {
 
     #[test]
     fn reads_zstd_compressed_response_body() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "proxyctl-log-analyze-zstd-{}-{unique}.response_body.bin.zst",
-            std::process::id()
-        ));
-        let response_headers_path = std::env::temp_dir().join(format!(
-            "proxyctl-log-analyze-zstd-{}-{unique}.response_headers.txt",
-            std::process::id()
-        ));
+        let path = temp_file_path("zstd", "response_body.bin.zst");
+        let response_headers_path = temp_file_path("zstd", "response_headers.txt");
         let payload = r#"{"response":{"id":"resp_zstd","usage":{"input_tokens":1}}}"#;
         let upstream_encoded =
             zstd::stream::encode_all(payload.as_bytes(), 3).expect("encode upstream zstd");
@@ -943,5 +986,16 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&response_headers_path);
+    }
+
+    fn temp_file_path(label: &str, extension: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "proxyctl-log-analyze-{label}-{}-{unique}.{extension}",
+            std::process::id()
+        ))
     }
 }
