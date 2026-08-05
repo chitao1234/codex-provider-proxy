@@ -19,6 +19,7 @@ pub struct Config {
     pub transparent_retry_count: u32,
     pub transparent_retry_head_requests: bool,
     pub transparent_retry_backoff_step: Duration,
+    pub request_body_buffer_max_bytes: usize,
     pub default_provider: String,
     pub providers: HashMap<String, Provider>,
     pub rewrite: RewriteConfig,
@@ -145,6 +146,8 @@ struct ConfigFile {
     transparent_retry_head_requests: bool,
     #[serde(default = "default_transparent_retry_backoff_step_ms")]
     transparent_retry_backoff_step_ms: u64,
+    #[serde(default = "default_request_body_buffer_max_bytes")]
+    request_body_buffer_max_bytes: usize,
     default_provider: String,
     #[serde(default)]
     rewrite: RewriteFile,
@@ -294,6 +297,10 @@ fn default_transparent_retry_backoff_step_ms() -> u64 {
     0
 }
 
+fn default_request_body_buffer_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 fn normalize_base_path(value: &str) -> Result<String> {
     if value.is_empty() {
         return Ok("/".to_string());
@@ -434,6 +441,11 @@ impl Config {
                 "statistics.response_body_max_bytes must be greater than 0"
             ));
         }
+        if file.request_body_buffer_max_bytes == 0 {
+            return Err(anyhow!(
+                "request_body_buffer_max_bytes must be greater than 0"
+            ));
+        }
 
         Ok(Self {
             listen_addrs,
@@ -450,6 +462,7 @@ impl Config {
             transparent_retry_backoff_step: Duration::from_millis(
                 file.transparent_retry_backoff_step_ms,
             ),
+            request_body_buffer_max_bytes: file.request_body_buffer_max_bytes,
             default_provider: file.default_provider,
             providers,
             rewrite,
@@ -685,7 +698,46 @@ mod tests {
         assert_eq!(cfg.transparent_retry_count, 0);
         assert!(!cfg.transparent_retry_head_requests);
         assert_eq!(cfg.transparent_retry_backoff_step, Duration::ZERO);
+        assert_eq!(cfg.request_body_buffer_max_bytes, 64 * 1024 * 1024);
         assert!(!cfg.rewrite.is_enabled());
+    }
+
+    #[test]
+    fn parses_request_body_buffer_limit() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                request_body_buffer_max_bytes = 4096
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.request_body_buffer_max_bytes, 4096);
+    }
+
+    #[test]
+    fn rejects_zero_request_body_buffer_limit() {
+        let error = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                request_body_buffer_max_bytes = 0
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .expect_err("zero buffer limit should fail");
+
+        assert!(error
+            .to_string()
+            .contains("request_body_buffer_max_bytes must be greater than 0"));
     }
 
     #[test]

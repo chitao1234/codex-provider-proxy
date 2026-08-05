@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     error::Error as StdError,
+    fmt,
     future::Future,
     net::SocketAddr,
     sync::Arc,
@@ -147,16 +148,48 @@ pub async fn handle_proxy(
 ) -> Response<Body> {
     match handle_proxy_inner(state, peer, req).await {
         Ok(resp) => resp,
-        Err(err) => {
-            let err_chain = format!("{err:#}");
-            warn!(error = %err_chain, "proxy error");
-            text_response(
-                StatusCode::BAD_GATEWAY,
-                Body::from(format!("proxy error: {err_chain}\n")),
-            )
-        }
+        Err(err) => proxy_error_response(err),
     }
 }
+
+fn proxy_error_response(err: anyhow::Error) -> Response<Body> {
+    let err_chain = format!("{err:#}");
+    warn!(error = %err_chain, "proxy error");
+    if let Some(body_too_large) = err.chain().find_map(|cause| {
+        cause.downcast_ref::<RequestBodyTooLarge>().or_else(|| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .and_then(|source| source.downcast_ref::<RequestBodyTooLarge>())
+        })
+    }) {
+        return text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Body::from(format!("{body_too_large}\n")),
+        );
+    }
+    text_response(
+        StatusCode::BAD_GATEWAY,
+        Body::from(format!("proxy error: {err_chain}\n")),
+    )
+}
+
+#[derive(Debug)]
+struct RequestBodyTooLarge {
+    limit: usize,
+}
+
+impl fmt::Display for RequestBodyTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "request body exceeds the configured {}-byte buffering limit",
+            self.limit
+        )
+    }
+}
+
+impl StdError for RequestBodyTooLarge {}
 
 async fn handle_proxy_inner(
     state: ProxyState,
@@ -633,7 +666,9 @@ async fn send_upstream_request(
                 headers: &initial_attempt.headers,
             },
         ) {
-            SingleAttemptRequestBody::Buffered(buffer_request_body_unlogged(body).await?)
+            SingleAttemptRequestBody::Buffered(
+                buffer_request_body_unlogged(body, cfg.request_body_buffer_max_bytes).await?,
+            )
         } else {
             SingleAttemptRequestBody::Stream(body)
         };
@@ -1364,11 +1399,15 @@ fn maybe_wrap_request_body_for_logging(
     (reqwest::Body::wrap_stream(stream), cap)
 }
 
-async fn buffer_request_body_unlogged(body: Body) -> std::result::Result<Bytes, std::io::Error> {
+async fn buffer_request_body_unlogged(
+    body: Body,
+    max_bytes: usize,
+) -> std::result::Result<Bytes, std::io::Error> {
     let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
     let mut buffered = BytesMut::new();
 
     while let Some(chunk) = stream.try_next().await? {
+        ensure_request_body_fits(buffered.len(), chunk.len(), max_bytes)?;
         buffered.extend_from_slice(&chunk);
     }
 
@@ -1396,6 +1435,11 @@ async fn buffer_request_body_for_retry(
     };
 
     while let Some(chunk) = stream.try_next().await? {
+        ensure_request_body_fits(
+            buffered.len(),
+            chunk.len(),
+            cfg.request_body_buffer_max_bytes,
+        )?;
         buffered.extend_from_slice(&chunk);
 
         if let Some(cap) = &cap {
@@ -1419,6 +1463,20 @@ async fn buffer_request_body_for_retry(
     }
 
     Ok((buffered.freeze(), cap))
+}
+
+fn ensure_request_body_fits(
+    buffered_bytes: usize,
+    next_chunk_bytes: usize,
+    max_bytes: usize,
+) -> std::io::Result<()> {
+    if next_chunk_bytes > max_bytes.saturating_sub(buffered_bytes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            RequestBodyTooLarge { limit: max_bytes },
+        ));
+    }
+    Ok(())
 }
 
 type BoxRespStream =
@@ -2333,15 +2391,48 @@ mod tests {
     };
 
     use super::{
-        apply_anthropic_beta_updates, downstream_response_status, error_log_details,
-        filtered_incoming_headers, filtered_response_headers, format_error_chain,
-        handle_proxy_inner, is_text_event_stream, join_paths, linear_retry_backoff_delay,
-        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
-        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
+        apply_anthropic_beta_updates, buffer_request_body_unlogged, downstream_response_status,
+        error_log_details, filtered_incoming_headers, filtered_response_headers,
+        format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
+        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
+        path_is_messages_count_tokens, proxy_error_response, resolve_upstream_attempt,
+        responses_slow_down_error_code, send_with_non_2xx_retries,
         send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
-        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
-        RetrySendArgs, ANTHROPIC_BETA_HEADER, KEEP_ALIVE_HEADER,
+        strip_listen_base_path, ProxyState, RequestBodyTooLarge, ResolveUpstreamAttemptArgs,
+        RetryRequestTemplate, RetrySendArgs, ANTHROPIC_BETA_HEADER, KEEP_ALIVE_HEADER,
     };
+
+    #[tokio::test]
+    async fn request_body_buffer_accepts_exact_limit_and_rejects_over_limit() {
+        let exact = buffer_request_body_unlogged(Body::from("1234"), 4)
+            .await
+            .expect("exact limit should succeed");
+        assert_eq!(exact, "1234");
+
+        let error = buffer_request_body_unlogged(Body::from("12345"), 4)
+            .await
+            .expect_err("over limit should fail");
+        assert!(error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RequestBodyTooLarge>())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_error_returns_payload_too_large() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            RequestBodyTooLarge { limit: 4 },
+        );
+        let response = proxy_error_response(anyhow::Error::new(error));
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body,
+            "request body exceeds the configured 4-byte buffering limit\n"
+        );
+    }
 
     #[test]
     fn filtered_incoming_headers_removes_connection_named_header() {
@@ -2878,6 +2969,7 @@ mod tests {
             transparent_retry_count: 0,
             transparent_retry_head_requests: false,
             transparent_retry_backoff_step: Duration::ZERO,
+            request_body_buffer_max_bytes: 64 * 1024 * 1024,
             default_provider: default_provider.to_string(),
             providers,
             rewrite: RewriteConfig::default(),

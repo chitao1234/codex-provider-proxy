@@ -503,6 +503,7 @@ mod tests {
             transparent_retry_count: 0,
             transparent_retry_head_requests: false,
             transparent_retry_backoff_step: Duration::ZERO,
+            request_body_buffer_max_bytes: 64 * 1024 * 1024,
             default_provider: "provider_a".to_string(),
             providers: HashMap::from([(
                 "provider_a".to_string(),

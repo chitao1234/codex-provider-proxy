@@ -34,6 +34,9 @@ transparent_retry_head_requests = false
 # Linear backoff step between transparent retries, in milliseconds.
 # The first retry waits 1x this value, the second waits 2x, and so on. Set to 0 for no delay.
 transparent_retry_backoff_step_ms = 0
+# Rewrites and transparent retries replay request bodies from memory. Requests larger than this
+# limit receive HTTP 413 instead of being buffered without bound.
+request_body_buffer_max_bytes = 67108864
 default_provider = "provider_a"
 
 [statistics]

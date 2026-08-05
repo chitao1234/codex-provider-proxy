@@ -24,7 +24,8 @@ cargo run -p codex-provider-proxy -- --config config.toml
 The proxy watches its config file and hot-reloads changes automatically. Updating providers, proxy listen
 addresses, `rpc_listen_addr`, `rpc_token`, `upstream_connect_timeout_secs`, `upstream_idle_timeout_secs`,
 `drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
-`transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, `rewrite.model_mappings`, and all
+`transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, `request_body_buffer_max_bytes`,
+`rewrite.model_mappings`, and all
 `[logging]` and `[statistics]` options takes effect without restarting the process.
 
 To print an example config:
@@ -90,6 +91,9 @@ cargo run -p codex-provider-proxyctl -- stats --hours 0 --json
   - `Authorization` header to `Bearer <provider.api_key>` (or `provider.authorization_header` if set)
 - If `[[rewrite.model_mappings]]` entries are configured, eligible JSON request bodies are rewritten before
   forwarding. With no mappings configured, request bodies use the existing streaming passthrough path.
+- Request bodies that must be buffered for rewrites or transparent retries are limited by
+  `request_body_buffer_max_bytes` (default 64 MiB). Larger requests receive HTTP `413 Payload Too Large`; request
+  bodies that do not need replay continue to stream without this limit.
 - If `reject_messages_count_tokens = true` (the default), requests whose routed path is `/messages/count_tokens`
   or ends with that path segment suffix return a local `404` and are not forwarded upstream. Query strings such
   as `?beta=true` do not bypass this check.

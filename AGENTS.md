@@ -55,6 +55,8 @@ Crates:
   joining onto the provider `base_url` path (e.g. `https://example.com/v2`).
 - **Transparent retries:** retry budget/backoff applies to non-2xx upstream responses and upstream request-send
   failures only while no downstream response has started.
+- **Bounded replay:** request bodies buffered for rewrites or transparent retries must enforce
+  `request_body_buffer_max_bytes`; over-limit requests return HTTP 413 while passthrough bodies remain streaming.
 
 ## Development Commands
 
@@ -75,3 +77,4 @@ Crates:
   streaming (avoid buffering full bodies unless explicitly requested).
 - When modifying transparent retry behavior, preserve route re-resolution on each retry and keep exchange-log
   attempt metadata accurate, with only the final attempt marked final.
+- Keep replay/rewrite buffering bounded and test exact-limit plus over-limit behavior when changing body handling.
