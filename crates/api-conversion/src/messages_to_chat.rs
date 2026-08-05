@@ -67,7 +67,25 @@ pub fn convert_messages_request(
 
     let system = SystemPrompt::parse(request.get("system"));
     let messages = expand_messages(request.get("messages"), caps)?;
-    let (tools, report) = convert_tools(request, caps)?;
+    let (tools, mut report) = convert_tools(request, caps)?;
+    // Force-enable configured server tools even when the client did not declare them.
+    if !caps.always_enable_tools.is_empty() {
+        for tool in &caps.always_enable_tools {
+            let normalized = match tool.as_str() {
+                "WebSearch" => "web_search",
+                "WebFetch" => "web_fetch",
+                "CodeExecution" => "code_execution",
+                other => other,
+            };
+            if !report
+                .mapped_server_tools
+                .iter()
+                .any(|mapped| mapped == normalized)
+            {
+                report.mapped_server_tools.push(normalized.to_string());
+            }
+        }
+    }
     if let Some(search_params) = &caps.search_request_params {
         if report
             .mapped_server_tools
@@ -1487,6 +1505,37 @@ mod tests {
             report.dropped_server_tools,
             vec!["web_fetch", "code_execution"]
         );
+    }
+
+    #[test]
+    fn always_enable_tools_forces_params_without_client_tools() {
+        let mut caps = caps();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.search_request_params = Some(json!({"enable_search": true}));
+        caps.code_interpreter_request_params = Some(json!({"enable_code_interpreter": true}));
+        caps.always_enable_tools = vec!["web_search".to_string(), "code_execution".to_string()];
+        // Client declares no server tools at all.
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
+        });
+        let (out, report) = convert_messages_request(&body, &caps).unwrap();
+        // Search and code interpreter params are force-merged.
+        assert_eq!(out["enable_search"], true);
+        assert_eq!(out["enable_code_interpreter"], true);
+        // Tools array still only has the client's own function.
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert!(report
+            .mapped_server_tools
+            .contains(&"web_search".to_string()));
+        assert!(report
+            .mapped_server_tools
+            .contains(&"code_execution".to_string()));
     }
 
     #[test]

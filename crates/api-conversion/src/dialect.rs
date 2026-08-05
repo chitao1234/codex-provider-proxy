@@ -153,6 +153,11 @@ pub struct ModelCapabilities {
     /// (e.g. qwen's `enable_code_interpreter: true`, must be streaming).
     #[serde(default)]
     pub code_interpreter_request_params: Option<serde_json::Value>,
+    /// Server tools to force-enable on every request even when the downstream client does
+    /// not declare them (e.g. `["web_search", "code_execution"]`). Only effective with
+    /// `ServerToolPolicy::ProviderNative`; forces the corresponding native params/tools.
+    #[serde(default)]
+    pub always_enable_tools: Vec<String>,
 }
 
 impl Default for ModelCapabilities {
@@ -171,6 +176,7 @@ impl Default for ModelCapabilities {
             search_request_params: None,
             fetch_request_params: None,
             code_interpreter_request_params: None,
+            always_enable_tools: Vec::new(),
         }
     }
 }
