@@ -13,6 +13,7 @@ pub enum UpstreamApi {
     #[default]
     Passthrough,
     /// OpenAI Chat Completions (`POST /chat/completions`).
+    #[serde(rename = "openai_chat_completions")]
     OpenAiChatCompletions,
 }
 
