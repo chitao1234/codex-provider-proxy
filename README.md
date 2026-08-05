@@ -146,24 +146,28 @@ It is disabled unless `[[rewrite.model_mappings]]` contains at least one entry:
 
 ```toml
 [[rewrite.model_mappings]]
-provider = "provider_a"              # optional
-from_model = "gpt-5.5"
-from_reasoning_effort = "xhigh"      # optional
-to_model = "grok-4.5"
-to_reasoning_effort = "high"         # optional; omit to preserve the current effort field
+provider = ["provider_a", "provider_b"]  # optional
+from_model = ["gpt-5.5", "gpt-5.4"]
+from_reasoning_effort = "xhigh"          # optional
+to_model = "grok-4.5"                 # optional
+to_reasoning_effort = "high"             # optional
 ```
 
-Model matching is exact. `provider` limits a mapping to one configured provider. `from_reasoning_effort` limits a
-mapping to requests whose current effort value matches. If several entries match a request, the most specific
-mapping wins: provider-specific beats global, and effort-specific beats model-only. Ties keep config order.
+Model matching is exact. `from_model` matches any model in its nonempty array. `provider` limits a mapping to any
+configured provider in its nonempty array. `from_reasoning_effort` limits a mapping to requests whose current effort
+value matches. If several entries match a request, the most specific mapping wins: provider-specific beats global,
+and effort-specific beats model-only. Ties keep config order.
+
+Each mapping must set `to_model`, `to_reasoning_effort`, or both. Omitting `to_model` rewrites only the reasoning
+effort and preserves the request model. Omitting `to_reasoning_effort` preserves the current effort field.
 
 Model mappings apply to JSON `POST` request bodies whose routed path ends with one of these API shapes:
 - `responses`
 - `messages`
 - `chat/completions`
 
-The mapper rewrites top-level `model`. For effort matching and rewriting, it recognizes the request shapes seen in
-captured real exchanges:
+When `to_model` is set, the mapper rewrites top-level `model`. For effort matching and rewriting, it recognizes the
+request shapes seen in captured real exchanges:
 - OpenAI-style responses: `reasoning.effort`
 - Claude Code / Anthropic messages: `output_config.effort`
 - Chat completions: `reasoning_effort`; if an existing `reasoning` object is present, that shape is preserved
@@ -172,9 +176,9 @@ For Anthropic Messages requests only, a model name ending in `[1m]` is interpret
 variant. For example, `to_model = "claude-sonnet-5[1m]"` keeps JSON body `model = "claude-sonnet-5"` and ensures
 `anthropic-beta` contains a `context-1m` marker, matching the captured Claude Code request shape. Incoming Messages
 requests that already contain a `context-1m` beta marker have an effective model of `base-model[1m]` for matching;
-mapping that effective model to a non-`[1m]` target removes existing `context-1m` beta markers. A base `from_model`
-can still match as a fallback, with variant-specific mappings preferred among entries with the same provider and
-effort specificity. The `[1m]` suffix is not special-cased for Responses or Chat Completions requests.
+mapping that effective model to a non-`[1m]` target removes existing `context-1m` beta markers. A base model in
+`from_model` can still match as a fallback, with variant-specific mappings preferred among entries with the same
+provider and effort specificity. The `[1m]` suffix is not special-cased for Responses or Chat Completions requests.
 
 For Claude Code 2.1.137 with `--model sonnet`, `--effort low|medium|high|max` sends
 `output_config.effort = "low"|"medium"|"high"|"max"` and keeps `thinking.type = "adaptive"`. `--effort xhigh`

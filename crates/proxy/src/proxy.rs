@@ -1116,7 +1116,7 @@ fn rewrite_request_body_for_attempt(
             upstream_url = %attempt.url,
             from_model = %mapping.from_model,
             from_reasoning_effort = ?mapping.from_reasoning_effort,
-            to_model = %mapping.to_model,
+            to_model = ?mapping.to_model,
             to_reasoning_effort = ?mapping.to_reasoning_effort,
             body_changed = out.body_changed,
             "request rewrite model mapping applied"
@@ -2910,10 +2910,10 @@ mod tests {
         let mut cfg = test_config("provider_a", providers);
         cfg.listen_base_path = "/v1".to_string();
         cfg.rewrite.model_mappings.push(ModelMapping {
-            provider: Some("provider_a".to_string()),
-            from_model: "gpt-5.5".to_string(),
+            provider: Some(vec!["provider_a".to_string()]),
+            from_model: vec!["gpt-5.5".to_string()],
             from_reasoning_effort: Some("xhigh".to_string()),
-            to_model: "grok-4.20-non-reasoning".to_string(),
+            to_model: Some("grok-4.20-non-reasoning".to_string()),
             to_reasoning_effort: Some("high".to_string()),
         });
         let state = test_proxy_state(cfg);
@@ -2965,10 +2965,10 @@ mod tests {
         let mut cfg = test_config("provider_a", providers);
         cfg.listen_base_path = "/v1".to_string();
         cfg.rewrite.model_mappings.push(ModelMapping {
-            provider: Some("provider_a".to_string()),
-            from_model: "claude-sonnet-5".to_string(),
+            provider: Some(vec!["provider_a".to_string()]),
+            from_model: vec!["claude-sonnet-5".to_string()],
             from_reasoning_effort: None,
-            to_model: "claude-sonnet-5[1m]".to_string(),
+            to_model: Some("claude-sonnet-5[1m]".to_string()),
             to_reasoning_effort: None,
         });
         let state = test_proxy_state(cfg);
@@ -3022,10 +3022,10 @@ mod tests {
         let mut cfg = test_config("provider_a", providers);
         cfg.listen_base_path = "/v1".to_string();
         cfg.rewrite.model_mappings.push(ModelMapping {
-            provider: Some("provider_a".to_string()),
-            from_model: "gpt-5.5".to_string(),
+            provider: Some(vec!["provider_a".to_string()]),
+            from_model: vec!["gpt-5.5".to_string()],
             from_reasoning_effort: None,
-            to_model: "grok-4.20-non-reasoning".to_string(),
+            to_model: Some("grok-4.20-non-reasoning".to_string()),
             to_reasoning_effort: Some("high".to_string()),
         });
         let state = test_proxy_state(cfg);

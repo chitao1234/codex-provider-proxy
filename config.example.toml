@@ -51,7 +51,8 @@ response_body_max_bytes = 16777216
 # or `chat/completions`. Matching is exact. `provider` and `from_reasoning_effort` are optional;
 # provider-specific and effort-specific mappings take precedence over broader mappings.
 #
-# `to_reasoning_effort` is optional. When set, the proxy preserves the request family's effort shape:
+# `to_model` and `to_reasoning_effort` are optional, but each mapping must set at least one.
+# When `to_reasoning_effort` is set, the proxy preserves the request family's effort shape:
 # - responses: `reasoning.effort`
 # - messages: `output_config.effort`
 # - chat completions: `reasoning_effort` unless an existing `reasoning` object is present
@@ -60,8 +61,8 @@ response_body_max_bytes = 16777216
 # `claude-sonnet-5` and ensures `anthropic-beta` contains a context-1m marker.
 #
 # [[rewrite.model_mappings]]
-# provider = "provider_a"
-# from_model = "gpt-5.5"
+# provider = ["provider_a", "provider_b"]
+# from_model = ["gpt-5.5", "gpt-5.4"]
 # from_reasoning_effort = "xhigh"
 # to_model = "grok-4.5"
 # to_reasoning_effort = "high"

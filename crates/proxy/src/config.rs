@@ -77,10 +77,10 @@ impl RewriteConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelMapping {
-    pub provider: Option<String>,
-    pub from_model: String,
+    pub provider: Option<Vec<String>>,
+    pub from_model: Vec<String>,
     pub from_reasoning_effort: Option<String>,
-    pub to_model: String,
+    pub to_model: Option<String>,
     pub to_reasoning_effort: Option<String>,
 }
 
@@ -211,11 +211,12 @@ struct RewriteFile {
 #[derive(Debug, Deserialize)]
 struct ModelMappingFile {
     #[serde(default)]
-    provider: Option<String>,
-    from_model: String,
+    provider: Option<Vec<String>>,
+    from_model: Vec<String>,
     #[serde(default)]
     from_reasoning_effort: Option<String>,
-    to_model: String,
+    #[serde(default)]
+    to_model: Option<String>,
     #[serde(default)]
     to_reasoning_effort: Option<String>,
 }
@@ -344,6 +345,26 @@ fn optional_non_empty_string(field: &str, value: Option<String>) -> Result<Optio
         .unwrap_or(Ok(None))
 }
 
+fn required_non_empty_strings(field: &str, values: Vec<String>) -> Result<Vec<String>> {
+    if values.is_empty() {
+        return Err(anyhow!("{field} must contain at least one value"));
+    }
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| required_non_empty_string(&format!("{field}[{index}]"), value))
+        .collect()
+}
+
+fn optional_non_empty_strings(
+    field: &str,
+    values: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>> {
+    values
+        .map(|values| required_non_empty_strings(field, values).map(Some))
+        .unwrap_or(Ok(None))
+}
+
 #[derive(Debug, Deserialize)]
 struct ProviderFile {
     base_url: Url,
@@ -460,21 +481,38 @@ fn normalize_rewrite_config(
 ) -> Result<RewriteConfig> {
     let mut model_mappings = Vec::with_capacity(rewrite.model_mappings.len());
     for (index, mapping) in rewrite.model_mappings.into_iter().enumerate() {
-        let provider = optional_non_empty_string(
+        let provider = optional_non_empty_strings(
             &format!("rewrite.model_mappings[{index}].provider"),
             mapping.provider,
         )?;
-        if let Some(provider) = &provider {
-            if !providers.contains_key(provider) {
+        if let Some(provider_names) = &provider {
+            for provider in provider_names {
+                if providers.contains_key(provider) {
+                    continue;
+                }
                 return Err(anyhow!(
                     "rewrite.model_mappings[{index}].provider {provider:?} not present in providers"
                 ));
             }
         }
 
+        let to_model = optional_non_empty_string(
+            &format!("rewrite.model_mappings[{index}].to_model"),
+            mapping.to_model,
+        )?;
+        let to_reasoning_effort = optional_non_empty_string(
+            &format!("rewrite.model_mappings[{index}].to_reasoning_effort"),
+            mapping.to_reasoning_effort,
+        )?;
+        if to_model.is_none() && to_reasoning_effort.is_none() {
+            return Err(anyhow!(
+                "rewrite.model_mappings[{index}] must set to_model or to_reasoning_effort"
+            ));
+        }
+
         model_mappings.push(ModelMapping {
             provider,
-            from_model: required_non_empty_string(
+            from_model: required_non_empty_strings(
                 &format!("rewrite.model_mappings[{index}].from_model"),
                 mapping.from_model,
             )?,
@@ -482,14 +520,8 @@ fn normalize_rewrite_config(
                 &format!("rewrite.model_mappings[{index}].from_reasoning_effort"),
                 mapping.from_reasoning_effort,
             )?,
-            to_model: required_non_empty_string(
-                &format!("rewrite.model_mappings[{index}].to_model"),
-                mapping.to_model,
-            )?,
-            to_reasoning_effort: optional_non_empty_string(
-                &format!("rewrite.model_mappings[{index}].to_reasoning_effort"),
-                mapping.to_reasoning_effort,
-            )?,
+            to_model,
+            to_reasoning_effort,
         });
     }
 
@@ -743,8 +775,8 @@ mod tests {
                 default_provider = "provider_a"
 
                 [[rewrite.model_mappings]]
-                provider = "provider_a"
-                from_model = " gpt-5.5 "
+                provider = [" provider_a "]
+                from_model = [" gpt-5.5 ", "gpt-5.4"]
                 from_reasoning_effort = " xhigh "
                 to_model = "grok-4.5"
                 to_reasoning_effort = "high"
@@ -759,10 +791,13 @@ mod tests {
         assert!(cfg.rewrite.is_enabled());
         assert_eq!(cfg.rewrite.model_mappings.len(), 1);
         let mapping = &cfg.rewrite.model_mappings[0];
-        assert_eq!(mapping.provider.as_deref(), Some("provider_a"));
-        assert_eq!(mapping.from_model, "gpt-5.5");
+        assert_eq!(
+            mapping.provider.as_deref(),
+            Some(["provider_a".to_string()].as_slice())
+        );
+        assert_eq!(mapping.from_model, ["gpt-5.5", "gpt-5.4"]);
         assert_eq!(mapping.from_reasoning_effort.as_deref(), Some("xhigh"));
-        assert_eq!(mapping.to_model, "grok-4.5");
+        assert_eq!(mapping.to_model.as_deref(), Some("grok-4.5"));
         assert_eq!(mapping.to_reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -774,8 +809,8 @@ mod tests {
                 default_provider = "provider_a"
 
                 [[rewrite.model_mappings]]
-                provider = "missing"
-                from_model = "gpt-5.5"
+                provider = ["provider_a", "missing"]
+                from_model = ["gpt-5.5"]
                 to_model = "grok-4.5"
 
                 [providers.provider_a]
@@ -798,7 +833,7 @@ mod tests {
                 default_provider = "provider_a"
 
                 [[rewrite.model_mappings]]
-                from_model = " "
+                from_model = [" "]
                 to_model = "grok-4.5"
 
                 [providers.provider_a]
@@ -811,6 +846,52 @@ mod tests {
         assert!(err
             .to_string()
             .contains("rewrite.model_mappings[0].from_model"));
+    }
+
+    #[test]
+    fn allows_request_model_mapping_with_only_target_effort() {
+        let cfg = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [[rewrite.model_mappings]]
+                from_model = ["gpt-5.5", "gpt-5.4"]
+                to_reasoning_effort = "high"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap();
+
+        let mapping = &cfg.rewrite.model_mappings[0];
+        assert_eq!(mapping.from_model, ["gpt-5.5", "gpt-5.4"]);
+        assert_eq!(mapping.to_model, None);
+        assert_eq!(mapping.to_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn rejects_request_model_mapping_without_target_values() {
+        let err = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [[rewrite.model_mappings]]
+                from_model = ["gpt-5.5"]
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("must set to_model or to_reasoning_effort"));
     }
 
     #[test]

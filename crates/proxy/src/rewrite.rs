@@ -23,7 +23,7 @@ pub struct RequestRewriteOutcome {
 pub struct AppliedModelMapping {
     pub from_model: String,
     pub from_reasoning_effort: Option<String>,
-    pub to_model: String,
+    pub to_model: Option<String>,
     pub to_reasoning_effort: Option<String>,
 }
 
@@ -104,15 +104,17 @@ pub fn apply_request_rewrites(
 
     let mut body_changed = false;
     let mut anthropic_beta_updates = Vec::new();
-    let target_model = target_body_model(endpoint, &mapping.to_model);
-    body_changed |= set_top_level_string(&mut json, "model", &target_model);
-    if endpoint == ModelEndpoint::Messages {
-        update_messages_context_1m_beta(
-            ctx.headers,
-            &current_model,
-            &mapping.to_model,
-            &mut anthropic_beta_updates,
-        );
+    if let Some(to_model) = &mapping.to_model {
+        let target_model = target_body_model(endpoint, to_model);
+        body_changed |= set_top_level_string(&mut json, "model", &target_model);
+        if endpoint == ModelEndpoint::Messages {
+            update_messages_context_1m_beta(
+                ctx.headers,
+                &current_model,
+                to_model,
+                &mut anthropic_beta_updates,
+            );
+        }
     }
     if let Some(to_reasoning_effort) = &mapping.to_reasoning_effort {
         body_changed |= set_reasoning_effort(&mut json, endpoint, to_reasoning_effort);
@@ -239,14 +241,20 @@ fn mapping_matches(
 ) -> Option<bool> {
     if mapping
         .provider
-        .as_deref()
-        .is_some_and(|p| p != provider_name)
+        .as_ref()
+        .is_some_and(|providers| !providers.iter().any(|provider| provider == provider_name))
     {
         return None;
     }
-    let model_specific = if mapping.from_model == current_model {
+    let model_specific = if mapping
+        .from_model
+        .iter()
+        .any(|model| model == current_model)
+    {
         true
-    } else if current_model != body_model && mapping.from_model == body_model {
+    } else if current_model != body_model
+        && mapping.from_model.iter().any(|model| model == body_model)
+    {
         false
     } else {
         return None;
@@ -548,9 +556,9 @@ mod tests {
     ) -> ModelMapping {
         ModelMapping {
             provider: None,
-            from_model: from_model.to_string(),
+            from_model: vec![from_model.to_string()],
             from_reasoning_effort: from_effort.map(str::to_string),
-            to_model: to_model.to_string(),
+            to_model: Some(to_model.to_string()),
             to_reasoning_effort: to_effort.map(str::to_string),
         }
     }
@@ -789,7 +797,7 @@ mod tests {
         );
         let applied = out.applied_model_mapping.unwrap();
         assert_eq!(applied.from_model, "claude-sonnet-5");
-        assert_eq!(applied.to_model, "claude-sonnet-5[1m]");
+        assert_eq!(applied.to_model.as_deref(), Some("claude-sonnet-5[1m]"));
     }
 
     #[test]
@@ -834,7 +842,7 @@ mod tests {
         );
         let applied = out.applied_model_mapping.unwrap();
         assert_eq!(applied.from_model, "claude-sonnet-5[1m]");
-        assert_eq!(applied.to_model, "claude-sonnet-5");
+        assert_eq!(applied.to_model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]
@@ -874,7 +882,7 @@ mod tests {
         );
         let applied = out.applied_model_mapping.unwrap();
         assert_eq!(applied.from_model, "claude-sonnet-5[1m]");
-        assert_eq!(applied.to_model, "variant-target");
+        assert_eq!(applied.to_model.as_deref(), Some("variant-target"));
     }
 
     #[test]
@@ -916,7 +924,7 @@ mod tests {
     #[test]
     fn provider_and_effort_specific_mapping_wins() {
         let mut provider_mapping = mapping("gpt-5.5", Some("xhigh"), "provider-specific", None);
-        provider_mapping.provider = Some("provider_a".to_string());
+        provider_mapping.provider = Some(vec!["provider_a".to_string(), "provider_b".to_string()]);
         let cfg = test_config(vec![
             mapping("gpt-5.5", None, "model-only", None),
             mapping("gpt-5.5", Some("xhigh"), "effort-specific", None),
@@ -934,6 +942,53 @@ mod tests {
         let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
 
         assert_eq!(rewritten["model"], "provider-specific");
+    }
+
+    #[test]
+    fn mapping_matches_any_configured_source_model() {
+        let mut model_mapping = mapping("gpt-5.5", None, "grok-4.5", None);
+        model_mapping.from_model.push("gpt-5.4".to_string());
+        let cfg = test_config(vec![model_mapping]);
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(br#"{"model":"gpt-5.4"}"#);
+
+        let out = apply_request_rewrites(
+            &cfg,
+            &ctx(&Method::POST, "/v1/responses", "provider_a", &headers),
+            body,
+        );
+        let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+
+        assert!(out.body_changed);
+        assert_eq!(rewritten["model"], "grok-4.5");
+    }
+
+    #[test]
+    fn mapping_can_rewrite_effort_without_rewriting_model() {
+        let cfg = test_config(vec![ModelMapping {
+            provider: None,
+            from_model: vec!["gpt-5.5".to_string()],
+            from_reasoning_effort: None,
+            to_model: None,
+            to_reasoning_effort: Some("high".to_string()),
+        }]);
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5.5","reasoning":{"effort":"low","summary":"auto"}}"#,
+        );
+
+        let out = apply_request_rewrites(
+            &cfg,
+            &ctx(&Method::POST, "/v1/responses", "provider_a", &headers),
+            body,
+        );
+        let rewritten: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+
+        assert!(out.body_changed);
+        assert_eq!(rewritten["model"], "gpt-5.5");
+        assert_eq!(rewritten["reasoning"]["effort"], "high");
+        assert_eq!(rewritten["reasoning"]["summary"], "auto");
+        assert_eq!(out.applied_model_mapping.unwrap().to_model, None);
     }
 
     #[test]
