@@ -96,6 +96,13 @@ struct RetrySendArgs {
     initial_http_client: reqwest::Client,
 }
 
+struct RetryAttemptContext {
+    config: Arc<Config>,
+    http_client: reqwest::Client,
+    attempt: PreparedUpstreamAttempt,
+    rerouted: bool,
+}
+
 struct ResolveUpstreamAttemptArgs<'a> {
     state: &'a ProxyState,
     cfg: &'a Config,
@@ -1863,7 +1870,7 @@ where
 async fn send_with_idle_timeout<F>(
     request_id: u64,
     idle_timeout: Duration,
-    upload_activity: Arc<Notify>,
+    upload_activity: Option<Arc<Notify>>,
     send_fut: F,
 ) -> std::result::Result<reqwest::Response, std::io::Error>
 where
@@ -1872,6 +1879,23 @@ where
     tokio::pin!(send_fut);
     let sleep = tokio::time::sleep(idle_timeout);
     tokio::pin!(sleep);
+
+    let Some(upload_activity) = upload_activity else {
+        return tokio::select! {
+            result = &mut send_fut => result.map_err(map_reqwest_body_err),
+            _ = &mut sleep => {
+                warn!(
+                    request_id,
+                    idle_timeout_secs = idle_timeout.as_secs(),
+                    "closing proxied connection after upstream idle timeout while sending request or waiting for response headers"
+                );
+                Err(idle_timeout_error(
+                    "sending request or waiting for upstream response headers",
+                    idle_timeout,
+                ))
+            }
+        };
+    };
 
     loop {
         tokio::select! {
@@ -1907,7 +1931,6 @@ where
 {
     match idle_timeout {
         Some(idle_timeout) => {
-            let upload_activity = upload_activity.unwrap_or_else(|| Arc::new(Notify::new()));
             send_with_idle_timeout(request_id, idle_timeout, upload_activity, send_fut).await
         }
         None => send_fut.await.map_err(map_reqwest_body_err),
@@ -1918,6 +1941,42 @@ async fn send_with_non_2xx_retries(
     args: RetrySendArgs,
 ) -> std::result::Result<(reqwest::Response, PreparedUpstreamAttempt, u32, u128), std::io::Error> {
     send_with_non_2xx_retries_with_sleep(args, tokio::time::sleep).await
+}
+
+async fn resolve_retry_attempt_context(
+    args: &RetrySendArgs,
+    attempt_index: u32,
+) -> std::result::Result<RetryAttemptContext, std::io::Error> {
+    if attempt_index == 0 {
+        return Ok(RetryAttemptContext {
+            config: args.initial_config.clone(),
+            http_client: args.initial_http_client.clone(),
+            attempt: args.initial_attempt.clone(),
+            rerouted: false,
+        });
+    }
+
+    let routing = args.state.runtime.routing_snapshot().await;
+    let attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
+        state: &args.state,
+        cfg: &routing.config,
+        default_provider: &routing.default_provider,
+        pid: args.pid,
+        peer: args.peer,
+        request_id: args.request_id,
+        forwarded_path: &args.request.forwarded_path,
+        incoming_query: args.request.incoming_query.as_deref(),
+        base_headers: &args.request.base_headers,
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+
+    Ok(RetryAttemptContext {
+        config: routing.config,
+        http_client: routing.http_client,
+        attempt,
+        rerouted: true,
+    })
 }
 
 async fn update_exchange_logger_upstream_target(
@@ -2019,43 +2078,18 @@ where
     Fut: Future<Output = ()>,
 {
     for attempt in 0..=args.transparent_retry_count {
-        let routing = if attempt == 0 {
-            None
-        } else {
-            Some(args.state.runtime.routing_snapshot().await)
-        };
-        let (cfg, http_client) = if let Some(routing) = &routing {
-            (routing.config.clone(), routing.http_client.clone())
-        } else {
-            (
-                args.initial_config.clone(),
-                args.initial_http_client.clone(),
+        let context = resolve_retry_attempt_context(&args, attempt).await?;
+        let cfg = context.config;
+        let http_client = context.http_client;
+        let mut current_attempt = context.attempt;
+        if context.rerouted {
+            update_exchange_logger_upstream_target(
+                args.exchange_logger.clone(),
+                args.request_id,
+                &current_attempt,
             )
-        };
-        let mut current_attempt = if attempt == 0 {
-            args.initial_attempt.clone()
-        } else {
-            let routing = routing.as_ref().expect("retry routing snapshot");
-            resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
-                state: &args.state,
-                cfg: &cfg,
-                default_provider: &routing.default_provider,
-                pid: args.pid,
-                peer: args.peer,
-                request_id: args.request_id,
-                forwarded_path: &args.request.forwarded_path,
-                incoming_query: args.request.incoming_query.as_deref(),
-                base_headers: &args.request.base_headers,
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        };
-        update_exchange_logger_upstream_target(
-            args.exchange_logger.clone(),
-            args.request_id,
-            &current_attempt,
-        )
-        .await;
+            .await;
+        }
 
         let attempt_started = Instant::now();
         let attempt_number = attempt.saturating_add(1);
@@ -2117,8 +2151,11 @@ where
         };
 
         let status = resp.status();
-        let resp_headers = resp.headers().clone();
         let attempt_latency_ms = attempt_started.elapsed().as_millis();
+        if status.is_success() || attempt == args.transparent_retry_count {
+            return Ok((resp, current_attempt, attempt_number, attempt_latency_ms));
+        }
+
         record_exchange_log_attempt_response(
             args.exchange_logger.clone(),
             args.request_id,
@@ -2126,15 +2163,12 @@ where
                 attempt_number,
                 attempt: &current_attempt,
                 status,
-                headers: resp_headers.clone(),
+                headers: resp.headers().clone(),
                 latency_ms: attempt_latency_ms,
-                is_final: status.is_success() || attempt == args.transparent_retry_count,
+                is_final: false,
             },
         )
         .await;
-        if status.is_success() || attempt == args.transparent_retry_count {
-            return Ok((resp, current_attempt, attempt_number, attempt_latency_ms));
-        }
 
         drain_response_body_with_optional_idle_timeout(
             args.request_id,
