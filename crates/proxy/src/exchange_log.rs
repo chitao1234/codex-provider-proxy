@@ -151,7 +151,12 @@ impl ExchangeFileLogger {
         };
         let metadata_json = serde_json::to_vec_pretty(&metadata)?;
         fs::write(&metadata_path, metadata_json)?;
-        write_request_headers_file(&request_headers_path, ctx.method, ctx.uri, ctx.request_headers)?;
+        write_request_headers_file(
+            &request_headers_path,
+            ctx.method,
+            ctx.uri,
+            ctx.request_headers,
+        )?;
 
         Ok(Self {
             request_id: ctx.request_id,
@@ -464,9 +469,8 @@ impl ExchangeFileLogger {
         self.metadata.response_body_truncated = response_body.truncated;
         let completed_unix_ms = now_unix_ms();
         self.metadata.completed_unix_ms = Some(completed_unix_ms);
-        self.metadata.total_duration_ms = Some(
-            completed_unix_ms.saturating_sub(self.metadata.started_unix_ms),
-        );
+        self.metadata.total_duration_ms =
+            Some(completed_unix_ms.saturating_sub(self.metadata.started_unix_ms));
         if let Some(final_attempt) = self.metadata.attempts.iter_mut().rev().find(|a| a.is_final) {
             final_attempt.response_body_bytes = Some(response_body.bytes);
             final_attempt.response_body_logged_bytes = Some(response_body.logged_bytes);
@@ -1756,8 +1760,8 @@ mod tests {
             upstream_url: &upstream_url,
             request_headers: &request_headers,
         };
-        let mut logger = ExchangeFileLogger::new(&root, &ctx, false, None, BodyLogCompression::None)
-            .unwrap();
+        let mut logger =
+            ExchangeFileLogger::new(&root, &ctx, false, None, BodyLogCompression::None).unwrap();
 
         let route = AttemptRouteContext {
             route_pid: Some(222),

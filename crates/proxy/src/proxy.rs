@@ -507,10 +507,10 @@ fn text_response(status: StatusCode, body: Body) -> Response<Body> {
 }
 
 fn not_found_response() -> Result<Response<Body>> {
-    Ok(Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from("not found\n"))?)
+    Ok(text_response(
+        StatusCode::NOT_FOUND,
+        Body::from("not found\n"),
+    ))
 }
 
 async fn resolve_request_pid(state: &ProxyState, peer: SocketAddr, request_id: u64) -> Option<u32> {
@@ -563,8 +563,8 @@ async fn resolve_provider_for_pid(
     peer: SocketAddr,
     request_id: u64,
 ) -> Result<ResolvedProviderRoute> {
-    let (provider_name, route_pid) = match pid {
-        Some(pid) => match find_provider_for_pid_or_ancestors(state, pid).await {
+    let (provider_name, route_pid) = if let Some(pid) = pid {
+        match find_provider_for_pid_or_ancestors(state, pid).await {
             Ok(Some((route_pid, provider_name))) => (provider_name, Some(route_pid)),
             Ok(None) => (default_provider.to_owned(), None),
             Err(err) => {
@@ -577,8 +577,9 @@ async fn resolve_provider_for_pid(
                 );
                 (default_provider.to_owned(), None)
             }
-        },
-        None => (default_provider.to_owned(), None),
+        }
+    } else {
+        (default_provider.to_owned(), None)
     };
 
     let provider = cfg
@@ -673,9 +674,15 @@ async fn send_upstream_request(
                 headers: &initial_attempt.headers,
             },
         ) {
-            SingleAttemptRequestBody::Buffered(
+            SingleAttemptRequestBody::Buffered(rewrite_request_body_for_attempt(
+                cfg,
+                &method,
+                &forwarded_path,
+                &mut initial_attempt,
                 buffer_request_body_unlogged(body, cfg.request_body_buffer_max_bytes).await?,
-            )
+                request_id,
+                1,
+            ))
         } else {
             SingleAttemptRequestBody::Stream(body)
         };
@@ -685,21 +692,6 @@ async fn send_upstream_request(
                 cfg.upstream_idle_timeout.map(|_| Arc::new(Notify::new()))
             }
             SingleAttemptRequestBody::Buffered(_) => None,
-        };
-        let request_body = match request_body {
-            SingleAttemptRequestBody::Stream(body) => SingleAttemptRequestBody::Stream(body),
-            SingleAttemptRequestBody::Buffered(request_body) => {
-                let request_body = rewrite_request_body_for_attempt(
-                    cfg,
-                    &method,
-                    &forwarded_path,
-                    &mut initial_attempt,
-                    request_body,
-                    request_id,
-                    1,
-                );
-                SingleAttemptRequestBody::Buffered(request_body)
-            }
         };
         begin_exchange_log_attempt(
             exchange_logger.clone(),
@@ -879,14 +871,17 @@ async fn record_exchange_log_attempt_response(
     request_id: u64,
     entry: AttemptResponseLog<'_>,
 ) {
-    let provider_name = entry.attempt.provider_name.clone();
-    let upstream_url = entry.attempt.url.clone();
-    let route_pid = entry.attempt.route_pid;
-    let attempt_number = entry.attempt_number;
-    let status = entry.status;
-    let headers = entry.headers;
-    let latency_ms = entry.latency_ms;
-    let is_final = entry.is_final;
+    let AttemptResponseLog {
+        attempt_number,
+        attempt,
+        status,
+        headers,
+        latency_ms,
+        is_final,
+    } = entry;
+    let provider_name = attempt.provider_name.clone();
+    let upstream_url = attempt.url.clone();
+    let route_pid = attempt.route_pid;
     with_exchange_logger_blocking(
         exchange_logger,
         request_id,
@@ -1051,11 +1046,10 @@ fn build_outgoing_url(
 }
 
 fn join_paths(base_path: &str, incoming_path: &str) -> String {
-    // Preserve any path prefix in the base URL.
     let base = if base_path.is_empty() { "/" } else { base_path };
     let base = base.trim_end_matches('/');
     let incoming = incoming_path.strip_prefix('/').unwrap_or(incoming_path);
-    if base.is_empty() || base == "/" {
+    if base.is_empty() {
         format!("/{}", incoming)
     } else if incoming.is_empty() {
         format!("{}/", base)
@@ -1065,25 +1059,21 @@ fn join_paths(base_path: &str, incoming_path: &str) -> String {
 }
 
 fn filtered_incoming_headers(headers: &HeaderMap) -> HeaderMap {
-    let connection_headers = connection_header_names(headers);
-    let mut out = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) || connection_headers.contains(name) {
-            continue;
-        }
-        if name == header::HOST || name == header::AUTHORIZATION {
-            continue;
-        }
-        out.append(name, value.clone());
-    }
-    out
+    filter_headers(headers, true)
 }
 
 fn filtered_response_headers(headers: &HeaderMap) -> HeaderMap {
+    filter_headers(headers, false)
+}
+
+fn filter_headers(headers: &HeaderMap, strip_host_and_auth: bool) -> HeaderMap {
     let connection_headers = connection_header_names(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name) || connection_headers.contains(name) {
+            continue;
+        }
+        if strip_host_and_auth && (name == header::HOST || name == header::AUTHORIZATION) {
             continue;
         }
         out.append(name, value.clone());
@@ -1245,14 +1235,11 @@ fn ensure_anthropic_beta(headers: &mut HeaderMap, marker: AnthropicBetaMarker) {
         return;
     };
 
-    if let Ok(value) = HeaderValue::from_str(&format!("{existing},{marker_value}")) {
-        headers.insert(ANTHROPIC_BETA_HEADER, value);
-    } else {
-        headers.append(
-            ANTHROPIC_BETA_HEADER,
-            HeaderValue::from_static(marker_value),
-        );
-    }
+    headers.insert(
+        ANTHROPIC_BETA_HEADER,
+        HeaderValue::from_str(&format!("{existing},{marker_value}"))
+            .expect("existing and marker values are valid ASCII"),
+    );
 }
 
 fn anthropic_beta_marker_matches(marker: AnthropicBetaMarker, beta: &str) -> bool {
@@ -1442,7 +1429,7 @@ fn maybe_wrap_request_body_for_logging(
     upload_activity: Option<Arc<Notify>>,
     request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
-    let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
+    let stream = TryStreamExt::map_err(body.into_data_stream(), map_body_err);
     let observers = BodyObservers::new(
         cfg,
         exchange_logger,
@@ -1457,19 +1444,30 @@ fn maybe_wrap_request_body_for_logging(
     (reqwest::Body::wrap_stream(stream), capture)
 }
 
-async fn buffer_request_body_unlogged(
+async fn buffer_request_body(
     body: Body,
     max_bytes: usize,
+    observers: Option<&BodyObservers>,
 ) -> std::result::Result<Bytes, std::io::Error> {
-    let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
+    let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_body_err);
     let mut buffered = BytesMut::new();
 
     while let Some(chunk) = stream.try_next().await? {
         ensure_request_body_fits(buffered.len(), chunk.len(), max_bytes)?;
         buffered.extend_from_slice(&chunk);
+        if let Some(observers) = observers {
+            observers.observe(&chunk).await;
+        }
     }
 
     Ok(buffered.freeze())
+}
+
+async fn buffer_request_body_unlogged(
+    body: Body,
+    max_bytes: usize,
+) -> std::result::Result<Bytes, std::io::Error> {
+    buffer_request_body(body, max_bytes, None).await
 }
 
 async fn buffer_request_body_for_retry(
@@ -1479,8 +1477,6 @@ async fn buffer_request_body_for_retry(
     statistics: Option<StatisticsTracker>,
     request_id: u64,
 ) -> std::result::Result<(Bytes, Option<SharedCapture>), std::io::Error> {
-    let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
-    let mut buffered = BytesMut::new();
     let observers = BodyObservers::new(
         cfg,
         exchange_logger,
@@ -1490,18 +1486,10 @@ async fn buffer_request_body_for_retry(
         "append buffered request body chunk",
     );
     let capture = observers.capture();
+    let request_body =
+        buffer_request_body(body, cfg.request_body_buffer_max_bytes, Some(&observers)).await?;
 
-    while let Some(chunk) = stream.try_next().await? {
-        ensure_request_body_fits(
-            buffered.len(),
-            chunk.len(),
-            cfg.request_body_buffer_max_bytes,
-        )?;
-        buffered.extend_from_slice(&chunk);
-        observers.observe(&chunk).await;
-    }
-
-    Ok((buffered.freeze(), capture))
+    Ok((request_body, capture))
 }
 
 fn ensure_request_body_fits(
@@ -1528,7 +1516,7 @@ fn response_stream_and_capture(
     exchange_logger: Option<SharedExchangeFileLogger>,
     statistics: Option<StatisticsTracker>,
 ) -> (BoxRespStream, Option<SharedCapture>) {
-    let stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
+    let stream = TryStreamExt::map_err(resp.bytes_stream(), map_body_err);
     let observers = BodyObservers::new(
         cfg,
         exchange_logger,
@@ -1588,10 +1576,14 @@ fn is_text_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .map(|value| value.eq_ignore_ascii_case("text/event-stream"))
-        .unwrap_or(false)
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
 }
 
 fn path_ends_with_responses(path: &str) -> bool {
@@ -1736,12 +1728,11 @@ where
                     while let Some(boundary_end) = find_sse_event_boundary(this.pending.as_ref()) {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         if let Some(code) = responses_slow_down_error_code(&event_bytes) {
-                            warn!(
-                                request_id = *this.request_id,
-                                route_pid = ?*this.route_pid,
-                                provider = %this.provider_name,
+                            warn_slow_down_drop(
+                                *this.request_id,
+                                *this.route_pid,
+                                this.provider_name.as_str(),
                                 code,
-                                "dropping upstream responses SSE overload event and disconnecting client"
                             );
                             this.pending.clear();
                             *this.finished = true;
@@ -1772,12 +1763,11 @@ where
 
                     let tail = this.pending.split().freeze();
                     if let Some(code) = responses_slow_down_error_code(&tail) {
-                        warn!(
-                            request_id = *this.request_id,
-                            route_pid = ?*this.route_pid,
-                            provider = %this.provider_name,
+                        warn_slow_down_drop(
+                            *this.request_id,
+                            *this.route_pid,
+                            this.provider_name.as_str(),
                             code,
-                            "dropping upstream responses SSE overload event and disconnecting client"
                         );
                         return std::task::Poll::Ready(Some(Err(slow_down_disconnect_error(code))));
                     }
@@ -1790,11 +1780,20 @@ where
     }
 }
 
-fn map_axum_body_err(err: axum::Error) -> std::io::Error {
-    std::io::Error::other(err)
+fn warn_slow_down_drop(request_id: u64, route_pid: Option<u32>, provider_name: &str, code: &str) {
+    warn!(
+        request_id,
+        route_pid = ?route_pid,
+        provider = %provider_name,
+        code,
+        "dropping upstream responses SSE overload event and disconnecting client"
+    );
 }
 
-fn map_reqwest_body_err(err: reqwest::Error) -> std::io::Error {
+fn map_body_err<E>(err: E) -> std::io::Error
+where
+    E: Into<Box<dyn StdError + Send + Sync>>,
+{
     std::io::Error::other(err)
 }
 
@@ -1879,38 +1878,32 @@ where
     let sleep = tokio::time::sleep(idle_timeout);
     tokio::pin!(sleep);
 
+    let timed_out = || {
+        warn!(
+            request_id,
+            idle_timeout_secs = idle_timeout.as_secs(),
+            "closing proxied connection after upstream idle timeout while sending request or waiting for response headers"
+        );
+        Err(idle_timeout_error(
+            "sending request or waiting for upstream response headers",
+            idle_timeout,
+        ))
+    };
+
     let Some(upload_activity) = upload_activity else {
         return tokio::select! {
-            result = &mut send_fut => result.map_err(map_reqwest_body_err),
-            _ = &mut sleep => {
-                warn!(
-                    request_id,
-                    idle_timeout_secs = idle_timeout.as_secs(),
-                    "closing proxied connection after upstream idle timeout while sending request or waiting for response headers"
-                );
-                Err(idle_timeout_error(
-                    "sending request or waiting for upstream response headers",
-                    idle_timeout,
-                ))
-            }
+            result = &mut send_fut => result.map_err(map_body_err),
+            _ = &mut sleep => timed_out(),
         };
     };
 
     loop {
         tokio::select! {
             result = &mut send_fut => {
-                return result.map_err(map_reqwest_body_err);
+                return result.map_err(map_body_err);
             }
             _ = &mut sleep => {
-                warn!(
-                    request_id,
-                    idle_timeout_secs = idle_timeout.as_secs(),
-                    "closing proxied connection after upstream idle timeout while sending request or waiting for response headers"
-                );
-                return Err(idle_timeout_error(
-                    "sending request or waiting for upstream response headers",
-                    idle_timeout,
-                ));
+                return timed_out();
             }
             _ = upload_activity.notified() => {
                 sleep.as_mut().reset(TokioInstant::now() + idle_timeout);
@@ -1932,7 +1925,7 @@ where
         Some(idle_timeout) => {
             send_with_idle_timeout(request_id, idle_timeout, upload_activity, send_fut).await
         }
-        None => send_fut.await.map_err(map_reqwest_body_err),
+        None => send_fut.await.map_err(map_body_err),
     }
 }
 
@@ -2019,6 +2012,12 @@ async fn wait_before_transparent_retry<S, Fut>(
 {
     let retry_backoff =
         linear_retry_backoff_delay(args.transparent_retry_backoff_step, attempt_number);
+    let route_pid = current_attempt.route_pid;
+    let provider = current_attempt.provider_name.as_str();
+    let upstream_url = &current_attempt.url;
+    let total_attempts = args.transparent_retry_count.saturating_add(1);
+    let retries_remaining = args.transparent_retry_count - attempt_index;
+    let retry_backoff_ms = retry_backoff.as_millis();
     match reason {
         TransparentRetryReason::SendError(err) => {
             let error_details = error_log_details(err);
@@ -2038,12 +2037,12 @@ async fn wait_before_transparent_retry<S, Fut>(
                 reqwest_is_timeout,
                 reqwest_is_body,
                 attempt = attempt_number,
-                route_pid = ?current_attempt.route_pid,
-                provider = %current_attempt.provider_name,
-                upstream_url = %current_attempt.url,
-                total_attempts = args.transparent_retry_count.saturating_add(1),
-                retries_remaining = args.transparent_retry_count - attempt_index,
-                retry_backoff_ms = retry_backoff.as_millis(),
+                route_pid,
+                provider = %provider,
+                upstream_url = %upstream_url,
+                total_attempts,
+                retries_remaining,
+                retry_backoff_ms,
                 "upstream request send failed before downstream response; retrying transparently"
             );
         }
@@ -2052,12 +2051,12 @@ async fn wait_before_transparent_retry<S, Fut>(
                 args.request_id,
                 status = %status,
                 attempt = attempt_number,
-                route_pid = ?current_attempt.route_pid,
-                provider = %current_attempt.provider_name,
-                upstream_url = %current_attempt.url,
-                total_attempts = args.transparent_retry_count.saturating_add(1),
-                retries_remaining = args.transparent_retry_count - attempt_index,
-                retry_backoff_ms = retry_backoff.as_millis(),
+                route_pid,
+                provider = %provider,
+                upstream_url = %upstream_url,
+                total_attempts,
+                retries_remaining,
+                retry_backoff_ms,
                 "upstream returned non-2xx status; retrying transparently"
             );
         }
@@ -2215,9 +2214,8 @@ async fn drain_response_body_with_optional_idle_timeout(
     attempt_number: u32,
     resp: reqwest::Response,
     phase: &'static str,
-) -> std::result::Result<u64, std::io::Error> {
-    let mut stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
-    let mut total_bytes = 0u64;
+) -> std::result::Result<(), std::io::Error> {
+    let mut stream = TryStreamExt::map_err(resp.bytes_stream(), map_body_err);
 
     loop {
         let next_chunk = match idle_timeout {
@@ -2239,7 +2237,6 @@ async fn drain_response_body_with_optional_idle_timeout(
         let Some(chunk) = next_chunk else {
             break;
         };
-        total_bytes = total_bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         append_exchange_log_attempt_response_chunk(
             exchange_logger.clone(),
             request_id,
@@ -2249,7 +2246,7 @@ async fn drain_response_body_with_optional_idle_timeout(
         .await;
     }
 
-    Ok(total_bytes)
+    Ok(())
 }
 
 fn idle_timeout_error(phase: &'static str, idle_timeout: Duration) -> std::io::Error {
@@ -2725,21 +2722,9 @@ mod tests {
         (status, format!("attempt-{call_index}"))
     }
 
-    async fn spawn_retry_server(
-        statuses: Vec<StatusCode>,
-    ) -> (Url, Arc<AtomicUsize>, oneshot::Sender<()>) {
+    async fn spawn_test_server(app: Router) -> (Url, oneshot::Sender<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let state = RetryServerState {
-            statuses: Arc::new(statuses),
-            call_count: call_count.clone(),
-        };
-        let app = Router::new()
-            .route("/", any(retry_server_handler))
-            .with_state(state);
-
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -2749,12 +2734,22 @@ mod tests {
                 .await
                 .unwrap();
         });
+        (Url::parse(&format!("http://{addr}/")).unwrap(), shutdown_tx)
+    }
 
-        (
-            Url::parse(&format!("http://{addr}/")).unwrap(),
-            call_count,
-            shutdown_tx,
-        )
+    async fn spawn_retry_server(
+        statuses: Vec<StatusCode>,
+    ) -> (Url, Arc<AtomicUsize>, oneshot::Sender<()>) {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let state = RetryServerState {
+            statuses: Arc::new(statuses),
+            call_count: call_count.clone(),
+        };
+        let app = Router::new()
+            .route("/", any(retry_server_handler))
+            .with_state(state);
+        let (url, shutdown_tx) = spawn_test_server(app).await;
+        (url, call_count, shutdown_tx)
     }
 
     fn unused_loopback_url() -> Url {
@@ -2797,9 +2792,6 @@ mod tests {
         Arc<Mutex<Vec<String>>>,
         oneshot::Sender<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
         let call_count = Arc::new(AtomicUsize::new(0));
         let auth_headers = Arc::new(Mutex::new(Vec::new()));
         let state = AuthCaptureServerState {
@@ -2811,23 +2803,8 @@ mod tests {
         let app = Router::new()
             .route("/", any(auth_capture_server_handler))
             .with_state(state);
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        (
-            Url::parse(&format!("http://{addr}/")).unwrap(),
-            call_count,
-            auth_headers,
-            shutdown_tx,
-        )
+        let (url, shutdown_tx) = spawn_test_server(app).await;
+        (url, call_count, auth_headers, shutdown_tx)
     }
 
     #[derive(Clone)]
@@ -2844,9 +2821,6 @@ mod tests {
     }
 
     async fn spawn_path_capture_server() -> (Url, Arc<Mutex<Vec<Uri>>>, oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = PathCaptureServerState {
             requests: requests.clone(),
@@ -2854,22 +2828,8 @@ mod tests {
         let app = Router::new()
             .route("/messages/count_tokens", any(path_capture_server_handler))
             .with_state(state);
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        (
-            Url::parse(&format!("http://{addr}/")).unwrap(),
-            requests,
-            shutdown_tx,
-        )
+        let (url, shutdown_tx) = spawn_test_server(app).await;
+        (url, requests, shutdown_tx)
     }
 
     #[derive(Clone)]
@@ -2896,9 +2856,6 @@ mod tests {
         Arc<Mutex<Vec<HeaderMap>>>,
         oneshot::Sender<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let headers = Arc::new(Mutex::new(Vec::new()));
         let state = BodyCaptureServerState {
@@ -2908,23 +2865,8 @@ mod tests {
         let app = Router::new()
             .route(path, any(body_capture_server_handler))
             .with_state(state);
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        (
-            Url::parse(&format!("http://{addr}/")).unwrap(),
-            bodies,
-            headers,
-            shutdown_tx,
-        )
+        let (url, shutdown_tx) = spawn_test_server(app).await;
+        (url, bodies, headers, shutdown_tx)
     }
 
     async fn compressed_response_handler() -> Response<Body> {
@@ -2939,21 +2881,8 @@ mod tests {
     }
 
     async fn spawn_compressed_response_server() -> (Url, oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let app = Router::new().route("/messages", any(compressed_response_handler));
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        (Url::parse(&format!("http://{addr}/")).unwrap(), shutdown_tx)
+        spawn_test_server(app).await
     }
 
     fn test_logging_config() -> LoggingConfig {
