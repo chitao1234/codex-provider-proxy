@@ -98,11 +98,110 @@ fn ipv4_from_network_dword(dw_addr: u32) -> Ipv4Addr {
     Ipv4Addr::from(u32::from_be(dw_addr))
 }
 
-fn pid_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
-    use std::ptr;
+struct AlignedBuffer {
+    words: Vec<usize>,
+    len_bytes: usize,
+}
+
+impl AlignedBuffer {
+    fn as_ptr(&self) -> *const u8 {
+        self.words.as_ptr().cast()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.words.as_mut_ptr().cast()
+    }
+}
+
+fn query_tcp_table(address_family: u32, context: &str) -> Result<Option<AlignedBuffer>> {
+    use std::{mem::size_of, ptr};
 
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+    };
+
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    let mut size = 0u32;
+    let rc = unsafe {
+        GetExtendedTcpTable(
+            ptr::null_mut(),
+            &mut size,
+            0,
+            address_family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    if rc != 0 && rc != ERROR_INSUFFICIENT_BUFFER {
+        return Err(anyhow!(
+            "GetExtendedTcpTable size probe ({context}) failed with error {rc}"
+        ));
+    }
+
+    while size != 0 {
+        let requested_bytes = size as usize;
+        let word_count = requested_bytes.div_ceil(size_of::<usize>());
+        let mut buffer = AlignedBuffer {
+            words: vec![0usize; word_count],
+            len_bytes: requested_bytes,
+        };
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr(),
+                &mut size,
+                0,
+                address_family,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
+        };
+        if rc == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if rc != 0 {
+            return Err(anyhow!(
+                "GetExtendedTcpTable ({context}) failed with error {rc}"
+            ));
+        }
+        if size as usize > buffer.words.len() * size_of::<usize>() {
+            return Err(anyhow!(
+                "GetExtendedTcpTable ({context}) returned size {size} larger than its buffer"
+            ));
+        }
+        buffer.len_bytes = size as usize;
+        return Ok(Some(buffer));
+    }
+
+    Ok(None)
+}
+
+fn validate_table_rows(
+    buffer_len: usize,
+    rows_offset: usize,
+    row_size: usize,
+    row_count: usize,
+    context: &str,
+) -> Result<()> {
+    let rows_bytes = row_size
+        .checked_mul(row_count)
+        .ok_or_else(|| anyhow!("{context} row byte count overflow"))?;
+    let required_bytes = rows_offset
+        .checked_add(rows_bytes)
+        .ok_or_else(|| anyhow!("{context} table byte count overflow"))?;
+    if required_bytes > buffer_len {
+        return Err(anyhow!(
+            "{context} table is truncated: needs {required_bytes} bytes, has {buffer_len}"
+        ));
+    }
+    Ok(())
+}
+
+fn pid_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
+    use std::mem::{offset_of, size_of};
+
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
@@ -113,57 +212,31 @@ fn pid_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u
         return Ok(None);
     };
 
-    let local_ip = local_ip;
     let local_port = local.port();
-    let peer_ip = peer_ip;
     let peer_port = peer.port();
 
-    let mut size: u32 = 0;
-    // First call to get required size.
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-
-    // ERROR_INSUFFICIENT_BUFFER (122) is expected here.
-    if rc != 0 && rc != 122 {
-        return Err(anyhow!(
-            "GetExtendedTcpTable(size probe) failed with error {rc}"
-        ));
-    }
-    if size == 0 {
+    let Some(buffer) = query_tcp_table(AF_INET as u32, "IPv4")? else {
         return Ok(None);
-    }
-
-    let mut buf = vec![0u8; size as usize];
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
     };
-    if rc != 0 {
-        return Err(anyhow!("GetExtendedTcpTable failed with error {rc}"));
+    if buffer.len_bytes < size_of::<u32>() {
+        return Err(anyhow!("IPv4 TCP table is missing its entry count"));
     }
-
-    let table = buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+    let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
     let num_entries = unsafe { (*table).dwNumEntries as usize };
-    if num_entries == 0 {
-        return Ok(None);
-    }
-
-    // Safety: buffer is owned and large enough for dwNumEntries rows.
-    let first_row = unsafe { (*table).table.as_ptr() };
+    let rows_offset = offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+    validate_table_rows(
+        buffer.len_bytes,
+        rows_offset,
+        size_of::<MIB_TCPROW_OWNER_PID>(),
+        num_entries,
+        "IPv4 TCP",
+    )?;
+    let first_row = unsafe {
+        buffer
+            .as_ptr()
+            .add(rows_offset)
+            .cast::<MIB_TCPROW_OWNER_PID>()
+    };
     let rows = unsafe { std::slice::from_raw_parts(first_row, num_entries) };
 
     for row in rows {
@@ -185,10 +258,10 @@ fn pid_for_connection_v4(local: SocketAddr, peer: SocketAddr) -> Result<Option<u
 }
 
 fn pid_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u32>> {
-    use std::ptr;
+    use std::mem::{offset_of, size_of};
 
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET6;
 
@@ -199,53 +272,31 @@ fn pid_for_connection_v6(local: SocketAddr, peer: SocketAddr) -> Result<Option<u
         return Ok(None);
     };
 
-    let local_ip = local_ip;
     let local_port = local.port();
-    let peer_ip = peer_ip;
     let peer_port = peer.port();
 
-    let mut size: u32 = 0;
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if rc != 0 && rc != 122 {
-        return Err(anyhow!(
-            "GetExtendedTcpTable(size probe, v6) failed with error {rc}"
-        ));
-    }
-    if size == 0 {
+    let Some(buffer) = query_tcp_table(AF_INET6 as u32, "IPv6")? else {
         return Ok(None);
-    }
-
-    let mut buf = vec![0u8; size as usize];
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
     };
-    if rc != 0 {
-        return Err(anyhow!("GetExtendedTcpTable(v6) failed with error {rc}"));
+    if buffer.len_bytes < size_of::<u32>() {
+        return Err(anyhow!("IPv6 TCP table is missing its entry count"));
     }
-
-    let table = buf.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
+    let table = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
     let num_entries = unsafe { (*table).dwNumEntries as usize };
-    if num_entries == 0 {
-        return Ok(None);
-    }
-
-    let first_row = unsafe { (*table).table.as_ptr() };
+    let rows_offset = offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
+    validate_table_rows(
+        buffer.len_bytes,
+        rows_offset,
+        size_of::<MIB_TCP6ROW_OWNER_PID>(),
+        num_entries,
+        "IPv6 TCP",
+    )?;
+    let first_row = unsafe {
+        buffer
+            .as_ptr()
+            .add(rows_offset)
+            .cast::<MIB_TCP6ROW_OWNER_PID>()
+    };
     let rows = unsafe { std::slice::from_raw_parts(first_row, num_entries) };
 
     for row in rows {
@@ -296,4 +347,40 @@ fn process_parent_pid(pid: u32) -> Result<u32> {
     unsafe { CloseHandle(snapshot) };
 
     Ok(found.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::align_of;
+
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    };
+
+    use super::*;
+
+    #[test]
+    fn tcp_table_buffer_is_aligned_for_windows_table_types() {
+        let buffer = AlignedBuffer {
+            words: vec![0usize; 4],
+            len_bytes: 4 * size_of::<usize>(),
+        };
+        let address = buffer.as_ptr() as usize;
+
+        assert_eq!(address % align_of::<MIB_TCPTABLE_OWNER_PID>(), 0);
+        assert_eq!(address % align_of::<MIB_TCP6TABLE_OWNER_PID>(), 0);
+    }
+
+    #[test]
+    fn validates_complete_table_rows() {
+        validate_table_rows(44, 4, 20, 2, "test").expect("complete rows");
+    }
+
+    #[test]
+    fn rejects_truncated_table_rows() {
+        let error =
+            validate_table_rows(43, 4, 20, 2, "test").expect_err("truncated rows should fail");
+
+        assert!(error.to_string().contains("table is truncated"));
+    }
 }
