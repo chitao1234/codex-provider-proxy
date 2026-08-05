@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     error::Error as StdError,
     future::Future,
     net::SocketAddr,
@@ -40,6 +41,8 @@ use crate::{
 
 const MAX_ANCESTOR_PID_DEPTH: usize = 64;
 const ANTHROPIC_BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
+const KEEP_ALIVE_HEADER: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_CONNECTION_HEADER: HeaderName = HeaderName::from_static("proxy-connection");
 const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
 const ANTHROPIC_EFFORT_BETA_PREFIX: &str = "effort";
 const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
@@ -1020,9 +1023,10 @@ fn join_paths(base_path: &str, incoming_path: &str) -> String {
 }
 
 fn filtered_incoming_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_headers = connection_header_names(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || connection_headers.contains(name) {
             continue;
         }
         if name == header::HOST || name == header::AUTHORIZATION {
@@ -1034,14 +1038,24 @@ fn filtered_incoming_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 fn filtered_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_headers = connection_header_names(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || connection_headers.contains(name) {
             continue;
         }
         out.append(name, value.clone());
     }
     out
+}
+
+fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim_ascii()).ok())
+        .collect()
 }
 
 fn downstream_response_status(
@@ -1058,16 +1072,13 @@ fn downstream_response_status(
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     // Minimal hop-by-hop list for a reverse proxy:
     // https://www.rfc-editor.org/rfc/rfc7230#section-6.1
-    matches!(
-        name.as_str().to_ascii_lowercase().as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "upgrade"
-            | "te"
-            | "trailer"
-    )
+    name == header::CONNECTION
+        || name == PROXY_CONNECTION_HEADER
+        || name == KEEP_ALIVE_HEADER
+        || name == header::TRANSFER_ENCODING
+        || name == header::UPGRADE
+        || name == header::TE
+        || name == header::TRAILER
 }
 
 fn capture_summary(
@@ -2323,13 +2334,63 @@ mod tests {
 
     use super::{
         apply_anthropic_beta_updates, downstream_response_status, error_log_details,
-        format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
-        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
-        path_is_messages_count_tokens, resolve_upstream_attempt, responses_slow_down_error_code,
-        send_with_non_2xx_retries, send_with_non_2xx_retries_with_sleep,
-        should_drop_responses_slow_down_errors, strip_listen_base_path, ProxyState,
-        ResolveUpstreamAttemptArgs, RetryRequestTemplate, RetrySendArgs, ANTHROPIC_BETA_HEADER,
+        filtered_incoming_headers, filtered_response_headers, format_error_chain,
+        handle_proxy_inner, is_text_event_stream, join_paths, linear_retry_backoff_delay,
+        maybe_filter_responses_slow_down_stream, path_is_messages_count_tokens,
+        resolve_upstream_attempt, responses_slow_down_error_code, send_with_non_2xx_retries,
+        send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
+        strip_listen_base_path, ProxyState, ResolveUpstreamAttemptArgs, RetryRequestTemplate,
+        RetrySendArgs, ANTHROPIC_BETA_HEADER, KEEP_ALIVE_HEADER,
     };
+
+    #[test]
+    fn filtered_incoming_headers_removes_connection_named_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, "Foo".parse().unwrap());
+        headers.insert("foo", "remove-me".parse().unwrap());
+        headers.insert(header::HOST, "proxy.test".parse().unwrap());
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        headers.insert("x-preserved", "keep-me".parse().unwrap());
+
+        let filtered = filtered_incoming_headers(&headers);
+
+        assert_eq!(filtered.get("x-preserved").unwrap(), "keep-me");
+        assert!(!filtered.contains_key(header::CONNECTION));
+        assert!(!filtered.contains_key("foo"));
+        assert!(!filtered.contains_key(header::HOST));
+        assert!(!filtered.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn filtered_response_headers_removes_keep_alive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(KEEP_ALIVE_HEADER, "timeout=5".parse().unwrap());
+        headers.insert("x-preserved", "keep-me".parse().unwrap());
+
+        let filtered = filtered_response_headers(&headers);
+
+        assert_eq!(filtered.get("x-preserved").unwrap(), "keep-me");
+        assert!(!filtered.contains_key(KEEP_ALIVE_HEADER));
+    }
+
+    #[test]
+    fn filtered_response_headers_honors_multiple_connection_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONNECTION, "Foo".parse().unwrap());
+        headers.append(header::CONNECTION, "Bar, Baz".parse().unwrap());
+        headers.insert("foo", "remove-me".parse().unwrap());
+        headers.insert("bar", "remove-me".parse().unwrap());
+        headers.insert("baz", "remove-me".parse().unwrap());
+        headers.insert("x-preserved", "keep-me".parse().unwrap());
+
+        let filtered = filtered_response_headers(&headers);
+
+        assert_eq!(filtered.get("x-preserved").unwrap(), "keep-me");
+        assert!(!filtered.contains_key(header::CONNECTION));
+        assert!(!filtered.contains_key("foo"));
+        assert!(!filtered.contains_key("bar"));
+        assert!(!filtered.contains_key("baz"));
+    }
 
     #[test]
     fn apply_anthropic_beta_updates_adds_deduplicates_and_removes_by_prefix() {
