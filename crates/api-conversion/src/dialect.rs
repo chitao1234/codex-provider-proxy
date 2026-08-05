@@ -122,6 +122,10 @@ pub struct ModelCapabilities {
     pub response_format: ResponseFormatCap,
     /// Whether to request streamed usage (`stream_options.include_usage`).
     pub stream_include_usage: bool,
+    /// Upper bound applied to the downstream `max_tokens` (e.g. DeepSeek caps at 393216).
+    /// `None` passes the downstream value through unchanged.
+    #[serde(default)]
+    pub max_tokens_cap: Option<u64>,
 }
 
 impl Default for ModelCapabilities {
@@ -135,6 +139,7 @@ impl Default for ModelCapabilities {
             parallel_tool_calls: true,
             response_format: ResponseFormatCap::JsonObject,
             stream_include_usage: true,
+            max_tokens_cap: None,
         }
     }
 }

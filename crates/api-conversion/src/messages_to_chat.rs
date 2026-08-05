@@ -56,6 +56,7 @@ pub fn convert_messages_request(
     if stream && caps.stream_include_usage {
         out.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
+    apply_max_tokens_cap(caps, &mut out);
     copy_value(request, &mut out, "temperature", "temperature");
     copy_user(request, &mut out);
     convert_stop_sequences(request, &mut out);
@@ -98,6 +99,20 @@ fn copy_string(request: &Map<String, Value>, out: &mut Map<String, Value>, from:
 fn copy_u64(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
     if let Some(value) = request.get(from).and_then(Value::as_u64) {
         out.insert(to.to_string(), Value::from(value));
+    }
+}
+
+/// Clamp the copied `max_tokens` to the upstream's cap when configured.
+fn apply_max_tokens_cap(caps: &ModelCapabilities, out: &mut Map<String, Value>) {
+    let Some(cap) = caps.max_tokens_cap else {
+        return;
+    };
+    let field = max_tokens_field(caps.max_tokens_field);
+    let Some(value) = out.get(field).and_then(Value::as_u64) else {
+        return;
+    };
+    if value > cap {
+        out.insert(field.to_string(), Value::from(cap));
     }
 }
 
@@ -1150,6 +1165,19 @@ mod tests {
 
     fn caps() -> ModelCapabilities {
         ModelCapabilities::default()
+    }
+
+    #[test]
+    fn clamps_max_tokens_to_upstream_cap() {
+        let mut caps = caps();
+        caps.max_tokens_cap = Some(393216);
+        let body = json!({"model": "m", "max_tokens": 1000000, "messages": []});
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["max_tokens"], 393216);
+
+        let body = json!({"model": "m", "max_tokens": 64000, "messages": []});
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["max_tokens"], 64000);
     }
 
     #[test]
