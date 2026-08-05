@@ -2,17 +2,15 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
-use crate::PidResolver;
+use crate::{platform::TtlCache, PidResolver};
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5);
 // These are best-effort caps to avoid unbounded growth. We prune expired entries
@@ -28,16 +26,16 @@ struct ConnectionKey {
 
 #[derive(Clone)]
 pub struct LinuxPidResolver {
-    conn_cache: Arc<DashMap<ConnectionKey, (u32, Instant)>>,
-    ppid_cache: Arc<DashMap<u32, (Option<u32>, Instant)>>,
+    conn_cache: TtlCache<ConnectionKey, u32>,
+    ppid_cache: TtlCache<u32, Option<u32>>,
     cache_ttl: Duration,
 }
 
 impl Default for LinuxPidResolver {
     fn default() -> Self {
         Self {
-            conn_cache: Arc::new(DashMap::new()),
-            ppid_cache: Arc::new(DashMap::new()),
+            conn_cache: TtlCache::default(),
+            ppid_cache: TtlCache::default(),
             cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
@@ -62,14 +60,9 @@ impl LinuxPidResolver {
         // This is safer than caching by inode: socket inodes can be reused after close, while
         // 4-tuples typically don't get reused quickly (TIME_WAIT).
         let key = ConnectionKey { local, peer };
-        if let Some(entry) = self.conn_cache.get(&key) {
-            let (pid, at) = *entry.value();
-            if at.elapsed() <= self.cache_ttl {
-                return Ok(Some(pid));
-            }
+        if let Some(pid) = self.conn_cache.get(&key, self.cache_ttl) {
+            return Ok(Some(pid));
         }
-        // If it was expired, drop it so the map doesn't grow unboundedly with cold entries.
-        self.conn_cache.remove(&key);
 
         // Important: when we accept a TCP connection, `/proc/net/tcp*` will contain two entries:
         // - server socket: local=server_addr, remote=client_addr (inode owned by the server process)
@@ -102,27 +95,24 @@ impl LinuxPidResolver {
             }
         };
 
-        self.conn_cache.insert(key, (pid, Instant::now()));
-        self.maybe_prune_conn_cache();
+        self.conn_cache.insert(key, pid);
+        self.conn_cache
+            .prune_expired_if_over(MAX_CONN_CACHE_ENTRIES, self.cache_ttl);
         Ok(Some(pid))
     }
 
     fn parent_pid_blocking(&self, pid: u32) -> Result<Option<u32>> {
-        if let Some(entry) = self.ppid_cache.get(&pid) {
-            let (ppid, at) = entry.value();
-            if at.elapsed() <= self.cache_ttl {
-                return Ok(*ppid);
-            }
+        if let Some(ppid) = self.ppid_cache.get(&pid, self.cache_ttl) {
+            return Ok(ppid);
         }
-        // Expired; remove eagerly.
-        self.ppid_cache.remove(&pid);
 
         let stat_path = format!("/proc/{pid}/stat");
         let stat = match fs::read_to_string(&stat_path) {
             Ok(s) => s,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.ppid_cache.insert(pid, (None, Instant::now()));
-                self.maybe_prune_ppid_cache();
+                self.ppid_cache.insert(pid, None);
+                self.ppid_cache
+                    .prune_expired_if_over(MAX_PPID_CACHE_ENTRIES, self.cache_ttl);
                 return Ok(None);
             }
             Err(err) => return Err(err).with_context(|| format!("read {stat_path}")),
@@ -133,39 +123,10 @@ impl LinuxPidResolver {
         })?;
 
         let ppid = if ppid == 0 { None } else { Some(ppid) };
-        self.ppid_cache.insert(pid, (ppid, Instant::now()));
-        self.maybe_prune_ppid_cache();
+        self.ppid_cache.insert(pid, ppid);
+        self.ppid_cache
+            .prune_expired_if_over(MAX_PPID_CACHE_ENTRIES, self.cache_ttl);
         Ok(ppid)
-    }
-
-    fn maybe_prune_conn_cache(&self) {
-        if self.conn_cache.len() <= MAX_CONN_CACHE_ENTRIES {
-            return;
-        }
-        let mut expired: Vec<ConnectionKey> = Vec::new();
-        for entry in self.conn_cache.iter() {
-            if entry.value().1.elapsed() > self.cache_ttl {
-                expired.push(*entry.key());
-            }
-        }
-        for key in expired {
-            self.conn_cache.remove(&key);
-        }
-    }
-
-    fn maybe_prune_ppid_cache(&self) {
-        if self.ppid_cache.len() <= MAX_PPID_CACHE_ENTRIES {
-            return;
-        }
-        let mut expired: Vec<u32> = Vec::new();
-        for entry in self.ppid_cache.iter() {
-            if entry.value().1.elapsed() > self.cache_ttl {
-                expired.push(*entry.key());
-            }
-        }
-        for pid in expired {
-            self.ppid_cache.remove(&pid);
-        }
     }
 }
 
@@ -391,22 +352,6 @@ fn parse_socket_inode(link_target: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
-
-    #[test]
-    fn clones_share_caches() {
-        let resolver = LinuxPidResolver::default();
-        let cloned = resolver.clone();
-        let key = ConnectionKey {
-            local: "127.0.0.1:8080".parse().unwrap(),
-            peer: "127.0.0.1:50000".parse().unwrap(),
-        };
-
-        resolver.conn_cache.insert(key, (42, Instant::now()));
-        cloned.ppid_cache.insert(42, (Some(7), Instant::now()));
-
-        assert_eq!(cloned.conn_cache.get(&key).unwrap().value().0, 42);
-        assert_eq!(resolver.ppid_cache.get(&42).unwrap().value().0, Some(7));
-    }
 
     #[test]
     fn encodes_ipv4_as_proc_net_tcp_key() {
