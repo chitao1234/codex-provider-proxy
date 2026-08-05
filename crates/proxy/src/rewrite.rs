@@ -62,10 +62,17 @@ const CLAUDE_CONTEXT_1M_MODEL_SUFFIX: &str = "[1m]";
 const ANTHROPIC_CONTEXT_1M_BETA_PREFIX: &str = "context-1m";
 
 pub fn request_rewrites_may_apply(cfg: &Config, ctx: &RequestRewriteContext<'_>) -> bool {
-    cfg.rewrite.is_enabled()
-        && *ctx.method == Method::POST
-        && model_endpoint(ctx.forwarded_path).is_some()
-        && request_content_encoding_allows_json(ctx.headers)
+    rewrite_endpoint(cfg, ctx).is_some()
+}
+
+fn rewrite_endpoint(cfg: &Config, ctx: &RequestRewriteContext<'_>) -> Option<ModelEndpoint> {
+    if !cfg.rewrite.is_enabled()
+        || *ctx.method != Method::POST
+        || !request_content_encoding_allows_json(ctx.headers)
+    {
+        return None;
+    }
+    model_endpoint(ctx.forwarded_path)
 }
 
 pub fn apply_request_rewrites(
@@ -73,11 +80,7 @@ pub fn apply_request_rewrites(
     ctx: &RequestRewriteContext<'_>,
     body: Bytes,
 ) -> RequestRewriteOutcome {
-    if !request_rewrites_may_apply(cfg, ctx) {
-        return passthrough(body);
-    }
-
-    let Some(endpoint) = model_endpoint(ctx.forwarded_path) else {
+    let Some(endpoint) = rewrite_endpoint(cfg, ctx) else {
         return passthrough(body);
     };
     let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
@@ -135,10 +138,9 @@ pub fn apply_request_rewrites(
 
     if !body_changed {
         return RequestRewriteOutcome {
-            body,
-            body_changed,
             applied_model_mapping,
             anthropic_beta_updates,
+            ..passthrough(body)
         };
     }
 
@@ -149,12 +151,7 @@ pub fn apply_request_rewrites(
             applied_model_mapping,
             anthropic_beta_updates,
         },
-        Err(_) => RequestRewriteOutcome {
-            body,
-            body_changed: false,
-            applied_model_mapping: None,
-            anthropic_beta_updates: Vec::new(),
-        },
+        Err(_) => passthrough(body),
     }
 }
 
@@ -365,105 +362,70 @@ fn set_top_level_string(json: &mut Value, field: &str, value: &str) -> bool {
 }
 
 fn set_reasoning_effort(json: &mut Value, endpoint: ModelEndpoint, effort: &str) -> bool {
-    match set_existing_reasoning_effort(json, effort) {
-        SetFieldResult::Changed => return true,
-        SetFieldResult::Unchanged => return false,
-        SetFieldResult::Missing => {}
-    }
-    match set_existing_top_level_reasoning_effort(json, effort) {
-        SetFieldResult::Changed => return true,
-        SetFieldResult::Unchanged => return false,
-        SetFieldResult::Missing => {}
-    }
-    match set_existing_output_config_effort(json, effort) {
-        SetFieldResult::Changed => return true,
-        SetFieldResult::Unchanged => return false,
-        SetFieldResult::Missing => {}
+    for (container, field) in [
+        (Some("reasoning"), "effort"),
+        (None, "reasoning_effort"),
+        (Some("output_config"), "effort"),
+    ] {
+        match set_existing_effort(json, container, field, effort) {
+            SetFieldResult::Changed => return true,
+            SetFieldResult::Unchanged => return false,
+            SetFieldResult::Missing => {}
+        }
     }
     if json
         .get("reasoning")
         .is_some_and(|reasoning| reasoning.is_object())
     {
-        return set_reasoning_effort_object(json, effort);
+        return set_effort_object(json, "reasoning", effort);
     }
 
     match endpoint {
-        ModelEndpoint::Responses => set_reasoning_effort_object(json, effort),
-        ModelEndpoint::Messages => set_output_config_effort_object(json, effort),
+        ModelEndpoint::Responses => set_effort_object(json, "reasoning", effort),
+        ModelEndpoint::Messages => set_effort_object(json, "output_config", effort),
         ModelEndpoint::ChatCompletions => set_top_level_string(json, "reasoning_effort", effort),
     }
 }
 
-fn set_existing_reasoning_effort(json: &mut Value, effort: &str) -> SetFieldResult {
-    let Some(reasoning) = json.get_mut("reasoning").and_then(Value::as_object_mut) else {
+fn set_existing_effort(
+    json: &mut Value,
+    container: Option<&str>,
+    field: &str,
+    effort: &str,
+) -> SetFieldResult {
+    let object = match container {
+        Some(key) => json.get_mut(key).and_then(Value::as_object_mut),
+        None => json.as_object_mut(),
+    };
+    let Some(object) = object else {
         return SetFieldResult::Missing;
     };
-    if !reasoning.contains_key("effort") {
+    if !object.contains_key(field) {
         return SetFieldResult::Missing;
     }
-    set_string_field(reasoning, "effort", effort)
+    set_string_field(object, field, effort)
 }
 
-fn set_existing_top_level_reasoning_effort(json: &mut Value, effort: &str) -> SetFieldResult {
-    let Some(object) = json.as_object_mut() else {
-        return SetFieldResult::Missing;
-    };
-    if !object.contains_key("reasoning_effort") {
-        return SetFieldResult::Missing;
-    }
-    set_string_field(object, "reasoning_effort", effort)
-}
-
-fn set_existing_output_config_effort(json: &mut Value, effort: &str) -> SetFieldResult {
-    let Some(output_config) = json.get_mut("output_config").and_then(Value::as_object_mut) else {
-        return SetFieldResult::Missing;
-    };
-    if !output_config.contains_key("effort") {
-        return SetFieldResult::Missing;
-    }
-    set_string_field(output_config, "effort", effort)
-}
-
-fn set_reasoning_effort_object(json: &mut Value, effort: &str) -> bool {
+fn set_effort_object(json: &mut Value, key: &str, effort: &str) -> bool {
     let Some(object) = json.as_object_mut() else {
         return false;
     };
-    let reasoning = object
-        .entry("reasoning".to_string())
+    let container = object
+        .entry(key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
-    if !reasoning.is_object() {
-        *reasoning = Value::Object(Map::new());
+    if !container.is_object() {
+        *container = Value::Object(Map::new());
     }
-    let Some(reasoning) = reasoning.as_object_mut() else {
+    let Some(container) = container.as_object_mut() else {
         return false;
     };
-    set_string_field(reasoning, "effort", effort) == SetFieldResult::Changed
-}
-
-fn set_output_config_effort_object(json: &mut Value, effort: &str) -> bool {
-    let Some(object) = json.as_object_mut() else {
-        return false;
-    };
-    let output_config = object
-        .entry("output_config".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !output_config.is_object() {
-        *output_config = Value::Object(Map::new());
-    }
-    let Some(output_config) = output_config.as_object_mut() else {
-        return false;
-    };
-    set_string_field(output_config, "effort", effort) == SetFieldResult::Changed
+    set_string_field(container, "effort", effort) == SetFieldResult::Changed
 }
 
 fn set_string_field(object: &mut Map<String, Value>, field: &str, value: &str) -> SetFieldResult {
     match object.get(field) {
         Some(Value::String(current)) if current == value => SetFieldResult::Unchanged,
-        Some(_) => {
-            object.insert(field.to_string(), Value::String(value.to_string()));
-            SetFieldResult::Changed
-        }
-        None => {
+        _ => {
             object.insert(field.to_string(), Value::String(value.to_string()));
             SetFieldResult::Changed
         }
