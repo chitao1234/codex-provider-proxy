@@ -1304,6 +1304,115 @@ fn beta_token_matches_prefix(beta: &str, prefix: &str) -> bool {
             && beta.as_bytes().get(prefix.len()) == Some(&b'-')
 }
 
+#[derive(Clone, Copy)]
+enum BodyObservationDirection {
+    Request,
+    Response,
+}
+
+#[derive(Clone)]
+struct BodyObservers {
+    capture: Option<SharedCapture>,
+    exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
+    upload_activity: Option<Arc<Notify>>,
+    request_id: u64,
+    direction: BodyObservationDirection,
+    logger_action: &'static str,
+}
+
+impl BodyObservers {
+    fn new(
+        cfg: &crate::config::Config,
+        exchange_logger: Option<SharedExchangeFileLogger>,
+        statistics: Option<StatisticsTracker>,
+        request_id: u64,
+        direction: BodyObservationDirection,
+        logger_action: &'static str,
+    ) -> Self {
+        let capture = cfg.logging.log_bodies.then(|| {
+            Arc::new(std::sync::Mutex::new(Capture::new(CaptureConfig {
+                max_bytes: cfg.logging.max_body_log_bytes,
+            })))
+        });
+        Self {
+            capture,
+            exchange_logger,
+            statistics,
+            upload_activity: None,
+            request_id,
+            direction,
+            logger_action,
+        }
+    }
+
+    fn with_upload_activity(mut self, upload_activity: Option<Arc<Notify>>) -> Self {
+        self.upload_activity = upload_activity;
+        self
+    }
+
+    fn is_active(&self) -> bool {
+        self.capture.is_some()
+            || self.exchange_logger.is_some()
+            || self.statistics.is_some()
+            || self.upload_activity.is_some()
+    }
+
+    fn capture(&self) -> Option<SharedCapture> {
+        self.capture.clone()
+    }
+
+    async fn observe(&self, chunk: &Bytes) {
+        if let Some(capture) = &self.capture {
+            if let Ok(mut capture) = capture.lock() {
+                capture.push_chunk(chunk);
+            }
+        }
+        if let Some(statistics) = &self.statistics {
+            match self.direction {
+                BodyObservationDirection::Request => statistics.capture_request_chunk(chunk),
+                BodyObservationDirection::Response => statistics.capture_response_chunk(chunk),
+            }
+        }
+
+        if let Some(exchange_logger) = &self.exchange_logger {
+            let chunk = chunk.clone();
+            let direction = self.direction;
+            with_exchange_logger_blocking(
+                Some(exchange_logger.clone()),
+                self.request_id,
+                self.logger_action,
+                move |logger| match direction {
+                    BodyObservationDirection::Request => logger.on_request_body_chunk(&chunk),
+                    BodyObservationDirection::Response => logger.on_response_body_chunk(&chunk),
+                },
+            )
+            .await;
+        }
+
+        if let Some(upload_activity) = &self.upload_activity {
+            upload_activity.notify_one();
+        }
+    }
+}
+
+fn observe_body_stream<S>(stream: S, observers: BodyObservers) -> BoxRespStream
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    if !observers.is_active() {
+        return Box::pin(stream);
+    }
+
+    Box::pin(stream.and_then(move |chunk| {
+        let observers = observers.clone();
+        async move {
+            observers.observe(&chunk).await;
+            Ok(chunk)
+        }
+    }))
+}
+
 async fn body_from_bytes_for_logging(
     cfg: &crate::config::Config,
     request_body: Bytes,
@@ -1311,35 +1420,18 @@ async fn body_from_bytes_for_logging(
     statistics: Option<StatisticsTracker>,
     request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
-    let cap = if cfg.logging.log_bodies {
-        Some(Arc::new(std::sync::Mutex::new(Capture::new(
-            CaptureConfig {
-                max_bytes: cfg.logging.max_body_log_bytes,
-            },
-        ))))
-    } else {
-        None
-    };
-    if let Some(cap) = &cap {
-        if let Ok(mut c) = cap.lock() {
-            c.push_chunk(&request_body);
-        }
-    }
-    if let Some(statistics) = &statistics {
-        statistics.capture_request_chunk(&request_body);
-    }
-    with_exchange_logger_blocking(
+    let observers = BodyObservers::new(
+        cfg,
         exchange_logger,
+        statistics,
         request_id,
+        BodyObservationDirection::Request,
         "append buffered request body",
-        {
-            let request_body = request_body.clone();
-            move |logger| logger.on_request_body_chunk(&request_body)
-        },
-    )
-    .await;
+    );
+    let capture = observers.capture();
+    observers.observe(&request_body).await;
 
-    (reqwest::Body::from(request_body), cap)
+    (reqwest::Body::from(request_body), capture)
 }
 
 fn maybe_wrap_request_body_for_logging(
@@ -1351,59 +1443,18 @@ fn maybe_wrap_request_body_for_logging(
     request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
     let stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
-
-    let cap = if cfg.logging.log_bodies {
-        Some(Arc::new(std::sync::Mutex::new(Capture::new(
-            CaptureConfig {
-                max_bytes: cfg.logging.max_body_log_bytes,
-            },
-        ))))
-    } else {
-        None
-    };
-    let cap2 = cap.clone();
-    let exchange_logger2 = exchange_logger.clone();
-    let statistics2 = statistics.clone();
-    let upload_activity2 = upload_activity.clone();
-    let stream = if cfg.logging.log_bodies
-        || exchange_logger.is_some()
-        || statistics.is_some()
-        || upload_activity.is_some()
-    {
-        Box::pin(stream.and_then(move |chunk| {
-            let cap2 = cap2.clone();
-            let exchange_logger2 = exchange_logger2.clone();
-            let statistics2 = statistics2.clone();
-            let upload_activity2 = upload_activity2.clone();
-            async move {
-                if let Some(cap2) = &cap2 {
-                    if let Ok(mut c) = cap2.lock() {
-                        c.push_chunk(&chunk);
-                    }
-                }
-                if let Some(statistics) = &statistics2 {
-                    statistics.capture_request_chunk(&chunk);
-                }
-                with_exchange_logger_blocking(
-                    exchange_logger2,
-                    request_id,
-                    "append request body chunk",
-                    {
-                        let chunk = chunk.clone();
-                        move |logger| logger.on_request_body_chunk(&chunk)
-                    },
-                )
-                .await;
-                if let Some(upload_activity) = &upload_activity2 {
-                    upload_activity.notify_one();
-                }
-                Ok(chunk)
-            }
-        })) as BoxRespStream
-    } else {
-        Box::pin(stream)
-    };
-    (reqwest::Body::wrap_stream(stream), cap)
+    let observers = BodyObservers::new(
+        cfg,
+        exchange_logger,
+        statistics,
+        request_id,
+        BodyObservationDirection::Request,
+        "append request body chunk",
+    )
+    .with_upload_activity(upload_activity);
+    let capture = observers.capture();
+    let stream = observe_body_stream(stream, observers);
+    (reqwest::Body::wrap_stream(stream), capture)
 }
 
 async fn buffer_request_body_unlogged(
@@ -1430,16 +1481,15 @@ async fn buffer_request_body_for_retry(
 ) -> std::result::Result<(Bytes, Option<SharedCapture>), std::io::Error> {
     let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
     let mut buffered = BytesMut::new();
-
-    let cap = if cfg.logging.log_bodies {
-        Some(Arc::new(std::sync::Mutex::new(Capture::new(
-            CaptureConfig {
-                max_bytes: cfg.logging.max_body_log_bytes,
-            },
-        ))))
-    } else {
-        None
-    };
+    let observers = BodyObservers::new(
+        cfg,
+        exchange_logger,
+        statistics,
+        request_id,
+        BodyObservationDirection::Request,
+        "append buffered request body chunk",
+    );
+    let capture = observers.capture();
 
     while let Some(chunk) = stream.try_next().await? {
         ensure_request_body_fits(
@@ -1448,28 +1498,10 @@ async fn buffer_request_body_for_retry(
             cfg.request_body_buffer_max_bytes,
         )?;
         buffered.extend_from_slice(&chunk);
-
-        if let Some(cap) = &cap {
-            if let Ok(mut c) = cap.lock() {
-                c.push_chunk(&chunk);
-            }
-        }
-        if let Some(statistics) = &statistics {
-            statistics.capture_request_chunk(&chunk);
-        }
-        with_exchange_logger_blocking(
-            exchange_logger.clone(),
-            request_id,
-            "append buffered request body chunk",
-            {
-                let chunk = chunk.clone();
-                move |logger| logger.on_request_body_chunk(&chunk)
-            },
-        )
-        .await;
+        observers.observe(&chunk).await;
     }
 
-    Ok((buffered.freeze(), cap))
+    Ok((buffered.freeze(), capture))
 }
 
 fn ensure_request_body_fits(
@@ -1497,49 +1529,16 @@ fn response_stream_and_capture(
     statistics: Option<StatisticsTracker>,
 ) -> (BoxRespStream, Option<SharedCapture>) {
     let stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
-
-    let cap = if cfg.logging.log_bodies {
-        Some(Arc::new(std::sync::Mutex::new(Capture::new(
-            CaptureConfig {
-                max_bytes: cfg.logging.max_body_log_bytes,
-            },
-        ))))
-    } else {
-        None
-    };
-    let cap2 = cap.clone();
-    let exchange_logger2 = exchange_logger.clone();
-    let statistics2 = statistics.clone();
-    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() || statistics.is_some() {
-        Box::pin(stream.and_then(move |chunk| {
-            let cap2 = cap2.clone();
-            let exchange_logger2 = exchange_logger2.clone();
-            let statistics2 = statistics2.clone();
-            async move {
-                if let Some(cap2) = &cap2 {
-                    if let Ok(mut c) = cap2.lock() {
-                        c.push_chunk(&chunk);
-                    }
-                }
-                if let Some(statistics) = &statistics2 {
-                    statistics.capture_response_chunk(&chunk);
-                }
-                with_exchange_logger_blocking(
-                    exchange_logger2,
-                    request_id,
-                    "append response body chunk",
-                    {
-                        let chunk = chunk.clone();
-                        move |logger| logger.on_response_body_chunk(&chunk)
-                    },
-                )
-                .await;
-                Ok(chunk)
-            }
-        })) as BoxRespStream
-    } else {
-        Box::pin(stream)
-    };
+    let observers = BodyObservers::new(
+        cfg,
+        exchange_logger,
+        statistics,
+        request_id,
+        BodyObservationDirection::Response,
+        "append response body chunk",
+    );
+    let capture = observers.capture();
+    let stream = observe_body_stream(stream, observers);
     match cfg.upstream_idle_timeout {
         Some(idle_timeout) => {
             let stream = IdleTimeoutStream::new(
@@ -1548,9 +1547,9 @@ fn response_stream_and_capture(
                 request_id,
                 "upstream response body download",
             );
-            (Box::pin(stream), cap)
+            (Box::pin(stream), capture)
         }
-        None => (stream, cap),
+        None => (stream, capture),
     }
 }
 
