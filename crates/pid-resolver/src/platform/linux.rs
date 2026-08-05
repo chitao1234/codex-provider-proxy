@@ -2,6 +2,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -27,16 +28,16 @@ struct ConnectionKey {
 
 #[derive(Clone)]
 pub struct LinuxPidResolver {
-    conn_cache: DashMap<ConnectionKey, (u32, Instant)>,
-    ppid_cache: DashMap<u32, (Option<u32>, Instant)>,
+    conn_cache: Arc<DashMap<ConnectionKey, (u32, Instant)>>,
+    ppid_cache: Arc<DashMap<u32, (Option<u32>, Instant)>>,
     cache_ttl: Duration,
 }
 
 impl Default for LinuxPidResolver {
     fn default() -> Self {
         Self {
-            conn_cache: DashMap::new(),
-            ppid_cache: DashMap::new(),
+            conn_cache: Arc::new(DashMap::new()),
+            ppid_cache: Arc::new(DashMap::new()),
             cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
@@ -390,6 +391,22 @@ fn parse_socket_inode(link_target: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn clones_share_caches() {
+        let resolver = LinuxPidResolver::default();
+        let cloned = resolver.clone();
+        let key = ConnectionKey {
+            local: "127.0.0.1:8080".parse().unwrap(),
+            peer: "127.0.0.1:50000".parse().unwrap(),
+        };
+
+        resolver.conn_cache.insert(key, (42, Instant::now()));
+        cloned.ppid_cache.insert(42, (Some(7), Instant::now()));
+
+        assert_eq!(cloned.conn_cache.get(&key).unwrap().value().0, 42);
+        assert_eq!(resolver.ppid_cache.get(&42).unwrap().value().0, Some(7));
+    }
 
     #[test]
     fn encodes_ipv4_as_proc_net_tcp_key() {

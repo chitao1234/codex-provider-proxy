@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,16 +24,16 @@ struct ConnectionKey {
 
 #[derive(Clone)]
 pub struct WindowsPidResolver {
-    conn_cache: DashMap<ConnectionKey, (u32, Instant)>,
-    ppid_cache: DashMap<u32, (Option<u32>, Instant)>,
+    conn_cache: Arc<DashMap<ConnectionKey, (u32, Instant)>>,
+    ppid_cache: Arc<DashMap<u32, (Option<u32>, Instant)>>,
     cache_ttl: Duration,
 }
 
 impl Default for WindowsPidResolver {
     fn default() -> Self {
         Self {
-            conn_cache: DashMap::new(),
-            ppid_cache: DashMap::new(),
+            conn_cache: Arc::new(DashMap::new()),
+            ppid_cache: Arc::new(DashMap::new()),
             cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
