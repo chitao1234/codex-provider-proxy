@@ -78,3 +78,10 @@ Crates:
 - When modifying transparent retry behavior, preserve route re-resolution on each retry and keep exchange-log
   attempt metadata accurate, with only the final attempt marked final.
 - Keep replay/rewrite buffering bounded and test exact-limit plus over-limit behavior when changing body handling.
+- The RPC router takes `RuntimeState` directly as axum state (no wrapper type); proxy tests spawn upstream
+  servers via the shared `spawn_test_server` helper; `runtime::load_config` is the single config read/parse
+  entry point for both the binary and `ServerManager`.
+- Maintain the current hygiene bar when editing: no commented-out code, no stale TODOs, no dead defensive
+  branches (e.g. `unwrap_or` on conversions that cannot fail, guards for states callers already guarantee),
+  no identity matches; prefer let-else, `Option::is_some_and`/`map_or`, and extracting shared helpers over
+  copy-pasted blocks. `cargo clippy --workspace --all-targets` must stay warning-free.
