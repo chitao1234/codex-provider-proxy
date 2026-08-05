@@ -200,6 +200,14 @@ fn convert_effort_and_thinking(
             }
             _ => {}
         }
+    } else if caps.thinking_param == ThinkingParam::EnableThinking {
+        // qwen / DashScope uses a top-level boolean.
+        let thinking = request.get("thinking");
+        let disabled = thinking
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+            == Some("disabled");
+        out.insert("enable_thinking".to_string(), json!(!disabled));
     }
 
     let reasoning_config = caps.reasoning_effort.as_ref();
@@ -1515,6 +1523,31 @@ mod tests {
             let (out, _) = convert_messages_request(&body, &caps()).unwrap();
             assert_eq!(out["tool_choice"], expected);
         }
+    }
+
+    #[test]
+    fn converts_thinking_to_qwen_enable_thinking() {
+        let mut caps = caps();
+        caps.thinking_param = ThinkingParam::EnableThinking;
+        caps.reasoning_effort = None;
+        let body = json!({
+            "model": "qwen3.7-plus",
+            "max_tokens": 1,
+            "thinking": {"type": "adaptive"},
+            "messages": []
+        });
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["enable_thinking"], true);
+        assert!(out.get("thinking").is_none());
+
+        let body = json!({
+            "model": "qwen3.7-plus",
+            "max_tokens": 1,
+            "thinking": {"type": "disabled"},
+            "messages": []
+        });
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["enable_thinking"], false);
     }
 
     #[test]

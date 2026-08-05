@@ -40,9 +40,11 @@ pub enum MaxTokensField {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingParam {
-    /// `thinking: {"type": "enabled"|"disabled"}` (DeepSeek chat).
+    /// `thinking: {"type": "enabled"|"disabled"}` (DeepSeek chat, glm, volcengine).
     #[default]
     TopLevel,
+    /// `enable_thinking: true|false` boolean (qwen / DashScope).
+    EnableThinking,
     /// No top-level thinking parameter (OpenAI, Grok); effort maps to `reasoning_effort` only.
     None,
 }
