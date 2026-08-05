@@ -490,6 +490,7 @@ mod tests {
 
     use crate::config::{
         BodyLogCompression, Config, LoggingConfig, ModelMapping, Provider, RewriteConfig,
+        StatisticsConfig,
     };
 
     use super::{
@@ -532,6 +533,12 @@ mod tests {
                 reconstruct_responses: false,
                 level: "info".to_string(),
                 rule: None,
+            },
+            statistics: StatisticsConfig {
+                enabled: false,
+                database_path: "unused.sqlite3".into(),
+                request_body_max_bytes: 1024,
+                response_body_max_bytes: 1024,
             },
         }
     }

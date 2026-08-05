@@ -25,6 +25,7 @@ use crate::{
     config::Config,
     proxy::{self, ProxyState},
     rpc::{self, RpcState},
+    statistics::StatisticsManager,
 };
 
 pub type LogReloadHandle = reload::Handle<EnvFilter, Registry>;
@@ -75,6 +76,7 @@ struct RuntimeInner {
     http_client: StdRwLock<reqwest::Client>,
     request_seq: AtomicU64,
     log_reload: LogReloadHandle,
+    statistics: StatisticsManager,
 }
 
 pub struct ApplyConfigSummary {
@@ -87,6 +89,7 @@ impl RuntimeState {
         pid_resolver: Arc<dyn PidResolver>,
         http_client: reqwest::Client,
         log_reload: LogReloadHandle,
+        statistics: StatisticsManager,
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeInner {
@@ -97,6 +100,7 @@ impl RuntimeState {
                 http_client: StdRwLock::new(http_client),
                 request_seq: AtomicU64::new(1),
                 log_reload,
+                statistics,
             }),
         }
     }
@@ -133,8 +137,16 @@ impl RuntimeState {
         self.inner.request_seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub fn statistics(&self) -> StatisticsManager {
+        self.inner.statistics.clone()
+    }
+
     pub async fn apply_config(&self, config: Arc<Config>) -> Result<ApplyConfigSummary> {
         let filter = config.logging.env_filter()?;
+        self.inner
+            .statistics
+            .reconfigure(&config.statistics)
+            .context("reconfigure statistics database")?;
         let should_rebuild_http_client = {
             let current = self.inner.config.read().await;
             current.upstream_connect_timeout != config.upstream_connect_timeout

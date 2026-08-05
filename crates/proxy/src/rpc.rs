@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -12,6 +12,7 @@ use codex_provider_proxy_rpc_types::{
     DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, RouteEntry,
     SetDefaultProviderRequest, SetRouteRequest,
 };
+use serde::Deserialize;
 
 use crate::{config::Config, runtime::RuntimeState};
 
@@ -27,8 +28,19 @@ pub fn router(state: RpcState) -> Router {
         .route("/rpc/v1/routes/clear", post(clear_routes))
         .route("/rpc/v1/routes/:pid", delete(delete_route))
         .route("/rpc/v1/providers", get(list_providers))
+        .route("/rpc/v1/statistics", get(statistics))
         .route("/rpc/v1/default-provider", post(set_default_provider))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct StatisticsQuery {
+    #[serde(default = "default_statistics_hours")]
+    hours: u32,
+}
+
+fn default_statistics_hours() -> u32 {
+    24
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -174,6 +186,28 @@ async fn list_providers(
         providers,
     })
     .into_response()
+}
+
+async fn statistics(
+    State(state): State<RpcState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<StatisticsQuery>,
+) -> impl IntoResponse {
+    let _cfg = match authorize_rpc_request(&state, peer, &headers).await {
+        Ok(cfg) => cfg,
+        Err(response) => return response,
+    };
+
+    let hours = (query.hours != 0).then_some(query.hours);
+    match state.runtime.statistics().query(hours).await {
+        Ok(statistics) => Json(statistics).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("query statistics: {err:#}\n"),
+        )
+            .into_response(),
+    }
 }
 
 async fn set_default_provider(

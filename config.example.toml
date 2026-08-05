@@ -36,6 +36,16 @@ transparent_retry_head_requests = false
 transparent_retry_backoff_step_ms = 0
 default_provider = "provider_a"
 
+[statistics]
+# Persistent built-in request, latency, error, traffic, model, client IP, and token metrics.
+# Enabled by default even when this section is omitted.
+enabled = true
+database_path = "./data/statistics.sqlite3"
+# Bounded captures used only to identify request models and response token usage.
+# Proxy request/response streaming remains unchanged.
+request_body_max_bytes = 1048576
+response_body_max_bytes = 16777216
+
 # Optional request rewrite layer. It is disabled when no mapping entries are configured.
 # Model mappings apply to JSON POST requests whose routed path ends with `responses`, `messages`,
 # or `chat/completions`. Matching is exact. `provider` and `from_reasoning_effort` are optional;

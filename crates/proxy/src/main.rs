@@ -6,6 +6,7 @@ mod proxy;
 mod rewrite;
 mod rpc;
 mod runtime;
+mod statistics;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -19,6 +20,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::config::{example_config_toml, Config};
+use crate::statistics::StatisticsManager;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-provider-proxy")]
@@ -76,11 +78,14 @@ async fn main() -> Result<()> {
         .init();
 
     let http_client = build_http_client(&initial_config)?;
+    let statistics = StatisticsManager::new(&initial_config.statistics)
+        .context("initialize statistics database")?;
     let runtime = RuntimeState::new(
         Arc::new(initial_config.clone()),
         default_pid_resolver(),
         http_client,
         filter_reload,
+        statistics,
     );
     let manager = Arc::new(ServerManager::new(config_path.clone(), overrides, runtime));
     manager.reconfigure(initial_config).await?;

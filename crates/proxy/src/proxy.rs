@@ -35,6 +35,7 @@ use crate::{
         AnthropicBetaPrefix, AnthropicBetaUpdate, RequestRewriteContext,
     },
     runtime::RuntimeState,
+    statistics::{StatisticsRequestContext, StatisticsTracker},
 };
 
 const MAX_ANCESTOR_PID_DEPTH: usize = 64;
@@ -84,6 +85,7 @@ struct RetrySendArgs {
     transparent_retry_backoff_step: Duration,
     idle_timeout: Option<Duration>,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     request: RetryRequestTemplate,
     initial_attempt: PreparedUpstreamAttempt,
 }
@@ -110,6 +112,7 @@ struct UpstreamSendRequest {
     base_headers: HeaderMap,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
 }
 
 enum SingleAttemptRequestBody {
@@ -167,6 +170,15 @@ async fn handle_proxy_inner(
     }
 
     let pid = resolve_request_pid(&state, peer, request_id).await;
+    let statistics = state
+        .runtime
+        .statistics()
+        .begin_request(StatisticsRequestContext {
+            peer,
+            pid,
+            method: parts.method.as_str(),
+            path: parts.uri.path(),
+        });
     let base_headers = filtered_incoming_headers(&parts.headers);
     let initial_attempt = resolve_upstream_attempt(ResolveUpstreamAttemptArgs {
         state: &state,
@@ -230,6 +242,7 @@ async fn handle_proxy_inner(
             base_headers,
             body,
             exchange_logger: exchange_logger.clone(),
+            statistics: statistics.clone(),
         },
     )
     .await;
@@ -240,16 +253,21 @@ async fn handle_proxy_inner(
             Err(err) => {
                 let error_latency_ms = started.elapsed().as_millis();
                 let err_text = format_error_chain(&err);
+                let exchange_error_text = err_text.clone();
                 with_exchange_logger_blocking(
                     exchange_logger.clone(),
                     request_id,
                     "mark upstream send error",
                     move |logger| {
-                        logger.mark_upstream_send_error(error_latency_ms, &err_text);
+                        logger.mark_upstream_send_error(error_latency_ms, &exchange_error_text);
                         logger.finalize();
                     },
                 )
                 .await;
+                if let Some(statistics) = &statistics {
+                    statistics.record_attempt_send_error(&err_text);
+                    statistics.finalize();
+                }
                 return Err(err).context("send upstream request");
             }
         };
@@ -295,6 +313,14 @@ async fn handle_proxy_inner(
 
     let resp_headers_for_log = resp_headers.clone();
     let upstream_latency_ms = started.elapsed().as_millis();
+    if let Some(statistics) = &statistics {
+        statistics.record_response(
+            status,
+            downstream_status,
+            &resp_headers,
+            upstream_latency_ms,
+        );
+    }
     let final_provider_name = final_attempt.provider_name.clone();
     let final_url = final_attempt.url.clone();
     let final_route_pid = final_attempt.route_pid;
@@ -347,8 +373,13 @@ async fn handle_proxy_inner(
 
     let out_headers = filtered_response_headers(&resp_headers);
 
-    let (resp_stream, resp_capture) =
-        response_stream_and_capture(&cfg, request_id, resp, exchange_logger.clone());
+    let (resp_stream, resp_capture) = response_stream_and_capture(
+        &cfg,
+        request_id,
+        resp,
+        exchange_logger.clone(),
+        statistics.clone(),
+    );
     let resp_stream = maybe_filter_responses_slow_down_stream(
         &cfg,
         request_id,
@@ -358,6 +389,12 @@ async fn handle_proxy_inner(
         &final_attempt.provider_name,
         resp_stream,
     );
+    let statistics_for_stream = statistics.clone();
+    let resp_stream = Box::pin(resp_stream.inspect_err(move |err| {
+        if let Some(statistics) = &statistics_for_stream {
+            statistics.record_response_stream_error(&err.to_string());
+        }
+    })) as BoxRespStream;
     let final_provider_name = final_attempt.provider_name.clone();
     let final_route_pid = final_attempt.route_pid;
     let resp_headers_for_body_log = resp_headers.clone();
@@ -398,6 +435,9 @@ async fn handle_proxy_inner(
                 request_id,
                 final_attempt_number,
             );
+        }
+        if let Some(statistics) = statistics {
+            statistics.finalize();
         }
     }));
 
@@ -563,6 +603,7 @@ async fn send_upstream_request(
         base_headers,
         body,
         exchange_logger,
+        statistics,
     } = request;
     if !transparent_retries_enabled(cfg, &method) {
         let mut initial_attempt = initial_attempt;
@@ -603,6 +644,7 @@ async fn send_upstream_request(
         };
         begin_exchange_log_attempt(
             exchange_logger.clone(),
+            statistics.clone(),
             request_id,
             1,
             &initial_attempt,
@@ -615,12 +657,19 @@ async fn send_upstream_request(
                 cfg,
                 body,
                 exchange_logger.clone(),
+                statistics.clone(),
                 upload_activity.clone(),
                 request_id,
             ),
             SingleAttemptRequestBody::Buffered(request_body) => {
-                body_from_bytes_for_logging(cfg, request_body, exchange_logger.clone(), request_id)
-                    .await
+                body_from_bytes_for_logging(
+                    cfg,
+                    request_body,
+                    exchange_logger.clone(),
+                    statistics.clone(),
+                    request_id,
+                )
+                .await
             }
         };
         let out = state
@@ -642,6 +691,7 @@ async fn send_upstream_request(
             Err(err) => {
                 record_exchange_log_attempt_send_error(
                     exchange_logger.clone(),
+                    statistics.clone(),
                     request_id,
                     1,
                     attempt_started.elapsed().as_millis(),
@@ -660,8 +710,14 @@ async fn send_upstream_request(
             attempt_started.elapsed().as_millis(),
         ))
     } else {
-        let (request_body, req_body_capture) =
-            buffer_request_body_for_retry(cfg, body, exchange_logger.clone(), request_id).await?;
+        let (request_body, req_body_capture) = buffer_request_body_for_retry(
+            cfg,
+            body,
+            exchange_logger.clone(),
+            statistics.clone(),
+            request_id,
+        )
+        .await?;
         let (resp, final_attempt, attempt_count, final_attempt_latency_ms) =
             send_with_non_2xx_retries(RetrySendArgs {
                 state: state.clone(),
@@ -672,6 +728,7 @@ async fn send_upstream_request(
                 transparent_retry_backoff_step: cfg.transparent_retry_backoff_step,
                 idle_timeout: cfg.upstream_idle_timeout,
                 exchange_logger,
+                statistics,
                 request: RetryRequestTemplate {
                     method,
                     forwarded_path,
@@ -722,12 +779,16 @@ async fn with_exchange_logger_blocking<F>(
 
 async fn begin_exchange_log_attempt(
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     request_id: u64,
     attempt_number: u32,
     attempt: &PreparedUpstreamAttempt,
     method: &http::Method,
     request_body: Option<Bytes>,
 ) {
+    if let Some(statistics) = &statistics {
+        statistics.begin_attempt(&attempt.provider_name, attempt.route_pid);
+    }
     let provider_name = attempt.provider_name.clone();
     let upstream_url = attempt.url.clone();
     let route_pid = attempt.route_pid;
@@ -791,6 +852,7 @@ async fn record_exchange_log_attempt_response(
 
 async fn record_exchange_log_attempt_send_error(
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     request_id: u64,
     attempt_number: u32,
     latency_ms: u128,
@@ -798,6 +860,9 @@ async fn record_exchange_log_attempt_send_error(
     is_final: bool,
 ) {
     let err = format_error_chain(err);
+    if let Some(statistics) = &statistics {
+        statistics.record_attempt_send_error(&err);
+    }
     with_exchange_logger_blocking(
         exchange_logger,
         request_id,
@@ -1176,6 +1241,7 @@ async fn body_from_bytes_for_logging(
     cfg: &crate::config::Config,
     request_body: Bytes,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
     let cap = if cfg.logging.log_bodies {
@@ -1191,6 +1257,9 @@ async fn body_from_bytes_for_logging(
         if let Ok(mut c) = cap.lock() {
             c.push_chunk(&request_body);
         }
+    }
+    if let Some(statistics) = &statistics {
+        statistics.capture_request_chunk(&request_body);
     }
     with_exchange_logger_blocking(
         exchange_logger,
@@ -1210,6 +1279,7 @@ fn maybe_wrap_request_body_for_logging(
     cfg: &crate::config::Config,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     upload_activity: Option<Arc<Notify>>,
     request_id: u64,
 ) -> (reqwest::Body, Option<SharedCapture>) {
@@ -1226,18 +1296,26 @@ fn maybe_wrap_request_body_for_logging(
     };
     let cap2 = cap.clone();
     let exchange_logger2 = exchange_logger.clone();
+    let statistics2 = statistics.clone();
     let upload_activity2 = upload_activity.clone();
-    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() || upload_activity.is_some()
+    let stream = if cfg.logging.log_bodies
+        || exchange_logger.is_some()
+        || statistics.is_some()
+        || upload_activity.is_some()
     {
         Box::pin(stream.and_then(move |chunk| {
             let cap2 = cap2.clone();
             let exchange_logger2 = exchange_logger2.clone();
+            let statistics2 = statistics2.clone();
             let upload_activity2 = upload_activity2.clone();
             async move {
                 if let Some(cap2) = &cap2 {
                     if let Ok(mut c) = cap2.lock() {
                         c.push_chunk(&chunk);
                     }
+                }
+                if let Some(statistics) = &statistics2 {
+                    statistics.capture_request_chunk(&chunk);
                 }
                 with_exchange_logger_blocking(
                     exchange_logger2,
@@ -1276,6 +1354,7 @@ async fn buffer_request_body_for_retry(
     cfg: &crate::config::Config,
     body: Body,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
     request_id: u64,
 ) -> std::result::Result<(Bytes, Option<SharedCapture>), std::io::Error> {
     let mut stream = TryStreamExt::map_err(body.into_data_stream(), map_axum_body_err);
@@ -1298,6 +1377,9 @@ async fn buffer_request_body_for_retry(
             if let Ok(mut c) = cap.lock() {
                 c.push_chunk(&chunk);
             }
+        }
+        if let Some(statistics) = &statistics {
+            statistics.capture_request_chunk(&chunk);
         }
         with_exchange_logger_blocking(
             exchange_logger.clone(),
@@ -1322,6 +1404,7 @@ fn response_stream_and_capture(
     request_id: u64,
     resp: reqwest::Response,
     exchange_logger: Option<SharedExchangeFileLogger>,
+    statistics: Option<StatisticsTracker>,
 ) -> (BoxRespStream, Option<SharedCapture>) {
     let stream = TryStreamExt::map_err(resp.bytes_stream(), map_reqwest_body_err);
 
@@ -1336,15 +1419,20 @@ fn response_stream_and_capture(
     };
     let cap2 = cap.clone();
     let exchange_logger2 = exchange_logger.clone();
-    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() {
+    let statistics2 = statistics.clone();
+    let stream = if cfg.logging.log_bodies || exchange_logger.is_some() || statistics.is_some() {
         Box::pin(stream.and_then(move |chunk| {
             let cap2 = cap2.clone();
             let exchange_logger2 = exchange_logger2.clone();
+            let statistics2 = statistics2.clone();
             async move {
                 if let Some(cap2) = &cap2 {
                     if let Ok(mut c) = cap2.lock() {
                         c.push_chunk(&chunk);
                     }
+                }
+                if let Some(statistics) = &statistics2 {
+                    statistics.capture_response_chunk(&chunk);
                 }
                 with_exchange_logger_blocking(
                     exchange_logger2,
@@ -1885,6 +1973,7 @@ where
         );
         begin_exchange_log_attempt(
             args.exchange_logger.clone(),
+            args.statistics.clone(),
             args.request_id,
             attempt_number,
             &current_attempt,
@@ -1908,6 +1997,7 @@ where
                 let is_final_attempt = attempt == args.transparent_retry_count;
                 record_exchange_log_attempt_send_error(
                     args.exchange_logger.clone(),
+                    args.statistics.clone(),
                     args.request_id,
                     attempt_number,
                     attempt_started.elapsed().as_millis(),
@@ -2199,9 +2289,11 @@ mod tests {
     use crate::{
         config::{
             BodyLogCompression, Config, LoggingConfig, ModelMapping, Provider, RewriteConfig,
+            StatisticsConfig,
         },
         rewrite::{AnthropicBetaMarker, AnthropicBetaPrefix, AnthropicBetaUpdate},
         runtime::RuntimeState,
+        statistics::StatisticsManager,
     };
 
     use super::{
@@ -2672,11 +2764,13 @@ mod tests {
     fn test_proxy_state(config: Config) -> ProxyState {
         let (_filter_layer, filter_reload) =
             tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
+        let statistics = StatisticsManager::new(&config.statistics).unwrap();
         let runtime = RuntimeState::new(
             Arc::new(config),
             default_pid_resolver(),
             reqwest::Client::new(),
             filter_reload,
+            statistics,
         );
         ProxyState {
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
@@ -2702,6 +2796,12 @@ mod tests {
             providers,
             rewrite: RewriteConfig::default(),
             logging: test_logging_config(),
+            statistics: StatisticsConfig {
+                enabled: false,
+                database_path: "unused.sqlite3".into(),
+                request_body_max_bytes: 1024,
+                response_body_max_bytes: 1024,
+            },
         }
     }
 
@@ -3141,6 +3241,7 @@ mod tests {
             transparent_retry_backoff_step,
             idle_timeout: None,
             exchange_logger: None,
+            statistics: None,
             request: RetryRequestTemplate {
                 method: Method::POST,
                 forwarded_path: "/".to_string(),

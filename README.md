@@ -25,7 +25,7 @@ The proxy watches its config file and hot-reloads changes automatically. Updatin
 addresses, `rpc_listen_addr`, `rpc_token`, `upstream_connect_timeout_secs`, `upstream_idle_timeout_secs`,
 `drop_responses_slow_down_errors`, `convert_429_to_503`, `transparent_retry_count`,
 `transparent_retry_head_requests`, `transparent_retry_backoff_step_ms`, `rewrite.model_mappings`, and all
-`[logging]` options takes effect without restarting the process.
+`[logging]` and `[statistics]` options takes effect without restarting the process.
 
 To print an example config:
 
@@ -68,6 +68,14 @@ cargo run -p codex-provider-proxyctl -- exec -p provider_b -- \
 By default, `exec` removes the PID route when the command exits. Use `--keep-route` to keep it.
 To avoid a startup race, `exec` pre-binds a temporary route on the controller process before spawning
 the child, then transfers routing to the child PID.
+
+View the built-in persistent statistics report (last 24 hours by default):
+
+```bash
+cargo run -p codex-provider-proxyctl -- stats
+cargo run -p codex-provider-proxyctl -- stats --hours 168
+cargo run -p codex-provider-proxyctl -- stats --hours 0 --json
+```
 
 4. Send a request from that same local process; it will be routed to the provider assigned to the PID.
 
@@ -178,6 +186,45 @@ Claude Code request header shape without depending on a specific dated beta valu
 Compressed request bodies are not rewritten unless their `Content-Encoding` is absent or `identity`. When a rewrite
 changes the JSON body, the proxy removes the downstream `Content-Length` header before forwarding so the upstream
 client can send the correct length for the rewritten body.
+
+## Persistent Statistics
+
+Statistics are enabled by default and stored in SQLite, independently of tracing and exchange-body logging:
+
+```toml
+[statistics]
+enabled = true
+database_path = "./data/statistics.sqlite3"
+request_body_max_bytes = 1048576
+response_body_max_bytes = 16777216
+```
+
+The database keeps one compact row per completed or failed proxied exchange, so restarting the proxy does not reset
+previously collected metrics. The database uses WAL mode and creates its parent directory automatically. No request
+or response bodies are stored in the database; bounded in-memory captures are used only while an exchange is active
+to identify the request model and extract response token usage.
+
+The default `proxyctl stats` report covers the last 24 hours. `--hours 0` selects all retained history, and `--json`
+returns the complete report. The authenticated RPC equivalent is `GET /rpc/v1/statistics?hours=24`; `hours=0`
+selects all time.
+
+The report includes:
+
+- Request, success, and error totals plus overall error rate.
+- Upstream and end-to-end response latency (`average`, `min`, `p50`, `p95`, `p99`, `max`).
+- Request/response byte totals and transparent-retry attempt counts.
+- Input, output, total, cached, cache-creation, and reasoning token totals.
+- Per-provider error rate, response time, traffic, and token usage.
+- Per-model, client IP, client PID, matched route PID, upstream status, method, and path breakdowns.
+- Hourly request, error-rate, response-time, and token buckets.
+
+Token extraction supports JSON and SSE usage shapes used by OpenAI Responses, Chat Completions, and Anthropic
+Messages. If a body exceeds its configured capture limit, proxy streaming continues normally; byte counts and
+non-token metrics remain accurate, while model or usage extraction for that exchange may be unavailable.
+
+Changing `statistics.database_path` at runtime switches new exchanges and queries to the new database. Existing
+in-flight exchanges finish writing to the database they started with. Set `statistics.enabled = false` to stop
+collection without deleting existing data.
 
 ## Runtime Logging
 

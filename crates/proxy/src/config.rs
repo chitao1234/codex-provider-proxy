@@ -23,6 +23,7 @@ pub struct Config {
     pub providers: HashMap<String, Provider>,
     pub rewrite: RewriteConfig,
     pub logging: LoggingConfig,
+    pub statistics: StatisticsConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,14 @@ pub struct LoggingConfig {
     pub reconstruct_responses: bool,
     pub level: String,
     pub rule: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatisticsConfig {
+    pub enabled: bool,
+    pub database_path: PathBuf,
+    pub request_body_max_bytes: usize,
+    pub response_body_max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,6 +150,8 @@ struct ConfigFile {
     rewrite: RewriteFile,
     #[serde(default)]
     logging: LoggingFile,
+    #[serde(default)]
+    statistics: StatisticsFile,
     providers: HashMap<String, ProviderFile>,
 }
 
@@ -166,6 +177,29 @@ struct LoggingFile {
     level: String,
     #[serde(default)]
     rule: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatisticsFile {
+    #[serde(default = "default_statistics_enabled")]
+    enabled: bool,
+    #[serde(default = "default_statistics_database_path")]
+    database_path: String,
+    #[serde(default = "default_statistics_request_body_max_bytes")]
+    request_body_max_bytes: usize,
+    #[serde(default = "default_statistics_response_body_max_bytes")]
+    response_body_max_bytes: usize,
+}
+
+impl Default for StatisticsFile {
+    fn default() -> Self {
+        Self {
+            enabled: default_statistics_enabled(),
+            database_path: default_statistics_database_path(),
+            request_body_max_bytes: default_statistics_request_body_max_bytes(),
+            response_body_max_bytes: default_statistics_response_body_max_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -204,6 +238,22 @@ fn default_exchange_body_max_bytes() -> u64 {
 
 fn default_exchange_body_compression() -> BodyLogCompression {
     BodyLogCompression::default()
+}
+
+fn default_statistics_enabled() -> bool {
+    true
+}
+
+fn default_statistics_database_path() -> String {
+    "./data/statistics.sqlite3".to_string()
+}
+
+fn default_statistics_request_body_max_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_statistics_response_body_max_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn default_listen_base_path() -> String {
@@ -349,6 +399,20 @@ impl Config {
             0 => None,
             value => Some(value),
         };
+        let statistics_database_path = file.statistics.database_path.trim();
+        if statistics_database_path.is_empty() {
+            return Err(anyhow!("statistics.database_path cannot be empty"));
+        }
+        if file.statistics.request_body_max_bytes == 0 {
+            return Err(anyhow!(
+                "statistics.request_body_max_bytes must be greater than 0"
+            ));
+        }
+        if file.statistics.response_body_max_bytes == 0 {
+            return Err(anyhow!(
+                "statistics.response_body_max_bytes must be greater than 0"
+            ));
+        }
 
         Ok(Self {
             listen_addrs,
@@ -379,6 +443,12 @@ impl Config {
                 reconstruct_responses: file.logging.reconstruct_responses,
                 level: file.logging.level,
                 rule: file.logging.rule,
+            },
+            statistics: StatisticsConfig {
+                enabled: file.statistics.enabled,
+                database_path: PathBuf::from(statistics_database_path),
+                request_body_max_bytes: file.statistics.request_body_max_bytes,
+                response_body_max_bytes: file.statistics.response_body_max_bytes,
             },
         })
     }
@@ -762,6 +832,13 @@ mod tests {
             cfg.logging.exchange_body_compression,
             BodyLogCompression::None
         );
+        assert!(cfg.statistics.enabled);
+        assert_eq!(
+            cfg.statistics.database_path,
+            std::path::PathBuf::from("./data/statistics.sqlite3")
+        );
+        assert_eq!(cfg.statistics.request_body_max_bytes, 1024 * 1024);
+        assert_eq!(cfg.statistics.response_body_max_bytes, 16 * 1024 * 1024);
     }
 
     #[test]

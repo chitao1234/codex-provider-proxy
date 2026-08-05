@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use codex_provider_proxy_rpc_types::{
     DeleteRouteResponse, ListRoutesResponse, ProvidersResponse, SetDefaultProviderRequest,
-    SetRouteRequest,
+    SetRouteRequest, StatisticsBreakdown, StatisticsResponse,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -63,6 +63,17 @@ enum Cmd {
 
     /// List configured providers and the default provider
     Providers,
+
+    /// Show persistent proxy statistics (last 24 hours by default)
+    Stats {
+        /// Window size in hours; use 0 for all-time statistics.
+        #[arg(short = 'H', long, default_value_t = 24)]
+        hours: u32,
+
+        /// Print the full machine-readable response as JSON.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
 
     /// Match processes by cmdline regex and set PID routes interactively
     Match {
@@ -314,6 +325,27 @@ async fn main() -> Result<()> {
                 println!("provider={}", p);
             }
         }
+        Cmd::Stats { hours, json } => {
+            let url = format!(
+                "{}/rpc/v1/statistics?hours={hours}",
+                rpc_url.trim_end_matches('/')
+            );
+            let mut req = client.get(url);
+            if let Some(token) = &token {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().await.context("send statistics request")?;
+            let resp = resp
+                .error_for_status()
+                .context("statistics returned error status")?;
+            let out: StatisticsResponse =
+                resp.json().await.context("decode statistics response")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print_statistics_report(&out);
+            }
+        }
         Cmd::Match {
             regex,
             limit,
@@ -552,4 +584,76 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_statistics_report(statistics: &StatisticsResponse) {
+    let window = statistics
+        .window
+        .hours
+        .map(|hours| format!("last {hours}h"))
+        .unwrap_or_else(|| "all time".to_string());
+    println!("statistics.enabled={}", statistics.enabled);
+    println!("statistics.window={window}");
+    println!("requests={}", statistics.summary.requests);
+    println!(
+        "requests.successful={}",
+        statistics.summary.successful_requests
+    );
+    println!("requests.errors={}", statistics.summary.error_requests);
+    println!(
+        "requests.error_rate={:.2}%",
+        statistics.summary.error_rate * 100.0
+    );
+    println!(
+        "latency.total_ms.avg={:.2} p50={} p95={} p99={} max={}",
+        statistics.summary.total_duration_ms.average,
+        statistics.summary.total_duration_ms.p50,
+        statistics.summary.total_duration_ms.p95,
+        statistics.summary.total_duration_ms.p99,
+        statistics.summary.total_duration_ms.max
+    );
+    println!(
+        "latency.upstream_ms.avg={:.2} p50={} p95={} p99={} max={}",
+        statistics.summary.upstream_latency_ms.average,
+        statistics.summary.upstream_latency_ms.p50,
+        statistics.summary.upstream_latency_ms.p95,
+        statistics.summary.upstream_latency_ms.p99,
+        statistics.summary.upstream_latency_ms.max
+    );
+    println!(
+        "traffic.request_bytes={} traffic.response_bytes={}",
+        statistics.summary.request_bytes, statistics.summary.response_bytes
+    );
+    println!(
+        "tokens.input={} tokens.output={} tokens.total={} tokens.cached={} tokens.reasoning={}",
+        statistics.tokens.input_tokens,
+        statistics.tokens.output_tokens,
+        statistics.tokens.total_tokens,
+        statistics.tokens.cached_tokens,
+        statistics.tokens.reasoning_tokens
+    );
+    print_statistics_breakdown("providers", &statistics.providers);
+    print_statistics_breakdown("models", &statistics.models);
+    print_statistics_breakdown("client_ips", &statistics.client_ips);
+    print_statistics_breakdown("status_codes", &statistics.status_codes);
+}
+
+fn print_statistics_breakdown(label: &str, rows: &[StatisticsBreakdown]) {
+    println!();
+    println!("{label}:");
+    if rows.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for row in rows {
+        println!(
+            "  {} requests={} errors={} error_rate={:.2}% avg_ms={:.2} tokens={}",
+            row.key,
+            row.requests,
+            row.error_requests,
+            row.error_rate * 100.0,
+            row.average_response_time_ms,
+            row.total_tokens
+        );
+    }
 }
