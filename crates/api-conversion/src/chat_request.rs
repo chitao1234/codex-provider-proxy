@@ -55,6 +55,18 @@ pub(crate) fn copy_value(
     }
 }
 
+pub(crate) fn copy_unknown_top_level(
+    request: &Map<String, Value>,
+    out: &mut Map<String, Value>,
+    known: &[&str],
+) {
+    for (key, value) in request {
+        if !known.contains(&key.as_str()) && !out.contains_key(key) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 pub(crate) fn apply_max_tokens_cap(caps: &ModelCapabilities, out: &mut Map<String, Value>) {
     let Some(cap) = caps.max_tokens_cap else {
         return;

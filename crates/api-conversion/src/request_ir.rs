@@ -95,6 +95,33 @@ impl RequestIr {
         Ok(ir)
     }
 
+    pub fn parse_with_context(
+        protocol: Protocol,
+        body: &Value,
+        previous_messages: Option<&[Value]>,
+        last_reasoning: Option<&str>,
+    ) -> Result<Self, ConversionError> {
+        let mut ir = Self::parse(protocol, body)?;
+        if protocol == Protocol::OpenAiResponses {
+            if let Some(previous_messages) = previous_messages {
+                let previous = serde_json::json!({"messages": previous_messages});
+                let previous_ir = Self::parse(Protocol::OpenAiChatCompletions, &previous)?;
+                let mut messages = previous_ir.messages;
+                messages.extend(ir.messages);
+                ir.messages = messages;
+            }
+            if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
+                if ir.reasoning.is_empty() {
+                    ir.reasoning.push(serde_json::json!({
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": reasoning}]
+                    }));
+                }
+            }
+        }
+        Ok(ir)
+    }
+
     fn parse_messages(&mut self) {
         if let Some(system) = self.original.get("system") {
             self.instructions.push(system.clone());
@@ -157,6 +184,18 @@ impl RequestIr {
         if let Some(previous) = self.original.get("previous_response_id") {
             self.continuation
                 .insert("previous_response_id".to_owned(), previous.clone());
+        }
+        if let Some(input) = self.original.get("input") {
+            if let Some(text) = input.as_str() {
+                self.messages.push(IrMessage {
+                    role: "user".to_owned(),
+                    content: vec![serde_json::json!({"type":"text", "text":text})],
+                    item_id: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    extra: Map::new(),
+                });
+            }
         }
         if let Some(input) = self
             .original
@@ -760,5 +799,79 @@ impl IrTool {
                 .unwrap_or_else(|| serde_json::json!({"type":"object"})),
         );
         Value::Object(object)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn messages_to_responses_keeps_unknown_parameters_and_tool_metadata() {
+        let request = json!({
+            "model": "m",
+            "max_tokens": 32,
+            "system": "be precise",
+            "messages": [{"role":"user", "content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],
+            "tools": [{"name":"lookup","input_schema":{"type":"object"},"vendor_extension":{"x":true}}],
+            "provider_budget": {"reasoning": 7}
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["provider_budget"]["reasoning"], 7);
+        assert_eq!(responses["tools"][0]["vendor_extension"]["x"], true);
+        assert_eq!(
+            responses["input"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn responses_to_messages_preserves_continuation_and_reasoning() {
+        let request = json!({
+            "model": "m",
+            "instructions": "be concise",
+            "input": [
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"think"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+                {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"done"}
+            ],
+            "provider_budget": 9
+        });
+        let previous = vec![json!({"role":"user","content":"earlier"})];
+        let ir = RequestIr::parse_with_context(
+            Protocol::OpenAiResponses,
+            &request,
+            Some(&previous),
+            None,
+        )
+        .unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(messages["provider_budget"], 9);
+        assert!(messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"] == "earlier"
+                    || message["content"]
+                        .as_array()
+                        .is_some_and(|blocks| blocks.iter().any(|block| block["text"] == "earlier"))
+            }));
+        assert!(messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"))
+            }));
     }
 }

@@ -305,7 +305,13 @@ pub fn convert_request_body(
             parser: RequestParserKind::OpenAIResponses,
             renderer: RequestRendererKind::AnthropicMessages,
         }) => {
-            let request = RequestIr::parse(Protocol::OpenAiResponses, &json).map_err(|err| {
+            let request = RequestIr::parse_with_context(
+                Protocol::OpenAiResponses,
+                &json,
+                previous_messages,
+                last_reasoning,
+            )
+            .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
             let rendered = request

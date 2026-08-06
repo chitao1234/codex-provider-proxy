@@ -11,8 +11,8 @@ use crate::chat::{
     ChatUsage,
 };
 use crate::chat_request::{
-    add_forced_server_tools, apply_max_tokens_cap, copy_bool, copy_string, copy_u64, copy_value,
-    max_tokens_field,
+    add_forced_server_tools, apply_max_tokens_cap, copy_bool, copy_string, copy_u64,
+    copy_unknown_top_level, copy_value, max_tokens_field,
 };
 use crate::dialect::{ModelCapabilities, RequestConversionReport};
 use crate::error::ConversionError;
@@ -97,6 +97,33 @@ pub fn convert_responses_request(
     if caps.ark_style {
         apply_ark_style(&mut out);
     }
+    copy_unknown_top_level(
+        request,
+        &mut out,
+        &[
+            "model",
+            "input",
+            "instructions",
+            "stream",
+            "temperature",
+            "top_p",
+            "parallel_tool_calls",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "tools",
+            "tool_choice",
+            "previous_response_id",
+            "store",
+            "include",
+            "metadata",
+            "truncation",
+            "service_tier",
+            "prompt_cache_key",
+            "safety_identifier",
+            "conversation",
+        ],
+    );
 
     Ok((Value::Object(out), report))
 }

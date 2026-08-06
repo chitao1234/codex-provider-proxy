@@ -8,8 +8,8 @@ use crate::chat::{
     upstream_model, ChatUsage,
 };
 use crate::chat_request::{
-    add_forced_server_tools, apply_max_tokens_cap, copy_bool, copy_string, copy_u64, copy_value,
-    max_tokens_field,
+    add_forced_server_tools, apply_max_tokens_cap, copy_bool, copy_string, copy_u64,
+    copy_unknown_top_level, copy_value, max_tokens_field,
 };
 use crate::dialect::{ModelCapabilities, ResponseFormatCap, ServerToolPolicy, ThinkingParam};
 use crate::error::ConversionError;
@@ -112,6 +112,33 @@ pub fn convert_messages_request(
     if !tools.is_empty() {
         out.insert("tools".to_string(), Value::Array(tools));
     }
+    copy_unknown_top_level(
+        request,
+        &mut out,
+        &[
+            "model",
+            "max_tokens",
+            "stream",
+            "temperature",
+            "top_p",
+            "top_k",
+            "user",
+            "stop_sequences",
+            "output_config",
+            "thinking",
+            "tool_choice",
+            "parallel_tool_use",
+            "system",
+            "messages",
+            "tools",
+            "metadata",
+            "service_tier",
+            "cache_control",
+            "container",
+            "context_management",
+            "mcp_servers",
+        ],
+    );
 
     Ok((Value::Object(out), report))
 }
