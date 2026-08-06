@@ -1378,7 +1378,8 @@ fn maybe_convert_request_body(
         Some(crate::api_conversion::DownstreamApi::OpenAiResponses)
     );
     let previous_messages = if is_responses {
-        resolve_previous_response_messages(state, &attempt.provider_name, &body)?
+        resolve_previous_response_messages(state, &attempt.provider_name, &body)
+            .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?
     } else {
         None
     };
@@ -1435,13 +1436,12 @@ fn resolve_previous_response_messages(
     state: &ProxyState,
     provider_name: &str,
     body: &[u8],
-) -> std::result::Result<Option<Vec<Value>>, std::io::Error> {
-    let Ok(json) = serde_json::from_slice::<Value>(body) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+) -> std::result::Result<Option<Vec<Value>>, crate::api_conversion::RequestConversionRejected> {
+    let json: Value = serde_json::from_slice(body).map_err(|_| {
+        crate::api_conversion::RequestConversionRejected::openai_invalid(
             "responses request body is not valid JSON",
-        ));
-    };
+        )
+    })?;
     let Some(previous_id) = json
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -1451,19 +1451,19 @@ fn resolve_previous_response_messages(
     };
     let store = state.runtime.response_states();
     let Some(previous) = store.get(previous_id) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unknown or expired previous_response_id {previous_id:?}"),
-        ));
+        return Err(
+            crate::api_conversion::RequestConversionRejected::openai_invalid(format!(
+                "unknown or expired previous_response_id {previous_id:?}"
+            )),
+        );
     };
     if previous.provider_name != provider_name {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
+        return Err(
+            crate::api_conversion::RequestConversionRejected::openai_invalid(format!(
                 "previous_response_id {previous_id:?} belongs to provider {:?}, not {provider_name:?}",
                 previous.provider_name
-            ),
-        ));
+            )),
+        );
     }
     if let Ok(model) = serde_json::from_slice::<Value>(body) {
         let model = model

@@ -162,6 +162,13 @@ impl RequestConversionRejected {
         }
     }
 
+    pub(crate) fn openai_invalid(message: impl Into<String>) -> Self {
+        Self::from_conversion_error(
+            ConversionError::invalid(message),
+            DownstreamApi::OpenAiResponses,
+        )
+    }
+
     fn invalid(message: &str) -> Self {
         Self::from_conversion_error(
             ConversionError::invalid(message),
