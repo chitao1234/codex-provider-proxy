@@ -64,15 +64,21 @@ pub fn provider_converts_path(provider: &Provider, path: &str) -> bool {
 
 /// The upstream path to use for a provider/forwarded-path pair: the provider's upstream
 /// protocol endpoint when conversion applies, otherwise the forwarded path unchanged.
-pub fn conversion_upstream_path<'a>(provider: &Provider, forwarded_path: &'a str) -> &'a str {
+pub fn conversion_upstream_path<'a>(
+    provider: &Provider,
+    forwarded_path: &'a str,
+) -> std::borrow::Cow<'a, str> {
     if !provider_converts_path(provider, forwarded_path) {
-        return forwarded_path;
+        return std::borrow::Cow::Borrowed(forwarded_path);
+    }
+    if let Some(path) = &provider.upstream_path {
+        return std::borrow::Cow::Owned(path.clone());
     }
     match provider.upstream_api {
-        UpstreamApi::OpenAiChatCompletions => CHAT_COMPLETIONS_PATH,
-        UpstreamApi::AnthropicMessages => MESSAGES_UPSTREAM_PATH,
-        UpstreamApi::OpenAiResponses => RESPONSES_UPSTREAM_PATH,
-        UpstreamApi::Passthrough => forwarded_path,
+        UpstreamApi::OpenAiChatCompletions => std::borrow::Cow::Borrowed(CHAT_COMPLETIONS_PATH),
+        UpstreamApi::AnthropicMessages => std::borrow::Cow::Borrowed(MESSAGES_UPSTREAM_PATH),
+        UpstreamApi::OpenAiResponses => std::borrow::Cow::Borrowed(RESPONSES_UPSTREAM_PATH),
+        UpstreamApi::Passthrough => std::borrow::Cow::Borrowed(forwarded_path),
     }
 }
 
@@ -137,9 +143,23 @@ pub fn convert_request_body(
     {
         return Ok(body);
     }
+    // Upstream Responses + downstream Responses is the same protocol: pass through
+    // unchanged, except Ark-style parameter normalization (thinking/caching) when
+    // the provider is Ark.
     if provider.upstream_api == UpstreamApi::OpenAiResponses
         && dialect == DownstreamApi::OpenAiResponses
     {
+        if caps.ark_style {
+            let mut json = json;
+            if let Some(object) = json.as_object_mut() {
+                codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(
+                    object,
+                );
+            }
+            return serde_json::to_vec(&json)
+                .map(Bytes::from)
+                .map_err(|_| RequestConversionRejected::invalid("failed to serialize request"));
+        }
         return Ok(body);
     }
     let (converted, report) = match dialect {

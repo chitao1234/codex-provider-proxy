@@ -36,6 +36,9 @@ pub struct Provider {
     /// HTTP header name carrying the API key (default "authorization").
     /// Anthropic-compatible endpoints use "x-api-key".
     pub auth_header_name: String,
+    /// Optional override for the upstream conversion path (e.g. Ark uses
+    /// "/responses" without the /v1 prefix). Empty = default per upstream protocol.
+    pub upstream_path: Option<String>,
     /// Upstream API dialect. Passthrough by default (existing configs unchanged).
     pub upstream_api: UpstreamApi,
     /// Downstream dialects this provider converts from. Empty = no conversion.
@@ -71,6 +74,7 @@ impl Default for Provider {
             api_key: String::new(),
             authorization_header: None,
             auth_header_name: default_auth_header_name(),
+            upstream_path: None,
             upstream_api: UpstreamApi::Passthrough,
             accept_downstream_apis: Vec::new(),
             default_capabilities: None,
@@ -450,6 +454,8 @@ struct ProviderFile {
     #[serde(default = "default_auth_header_name")]
     auth_header_name: String,
     #[serde(default)]
+    upstream_path: Option<String>,
+    #[serde(default)]
     upstream_api: UpstreamApi,
     #[serde(default)]
     accept_downstream_apis: Vec<DownstreamApi>,
@@ -478,6 +484,7 @@ impl Config {
                     api_key: provider.api_key,
                     authorization_header: provider.authorization_header,
                     auth_header_name: provider.auth_header_name,
+                    upstream_path: provider.upstream_path,
                     upstream_api: provider.upstream_api,
                     accept_downstream_apis: provider.accept_downstream_apis,
                     default_capabilities: provider.capabilities,

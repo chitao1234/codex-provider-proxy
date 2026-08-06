@@ -504,16 +504,10 @@ pub fn convert_responses_response_to_responses(body: &Value) -> Result<Value, Co
             }
         }
     }
-    // Strip non-standard fields that third parties add (Qwen x_details, MiniMax
-    // output_text / safety_identifier / conversation).
-    for field in [
-        "x_details",
-        "output_text",
-        "safety_identifier",
-        "conversation",
-    ] {
-        object.remove(field);
-    }
+    // Third-party extra fields (Qwen x_details, MiniMax output_text /
+    // safety_identifier / conversation) are intentionally preserved: the downstream
+    // client receives the upstream's full response, and unknown fields are harmless
+    // to standard parsers.
     Ok(out)
 }
 
@@ -729,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_responses_response_id_and_strips_extra_fields() {
+    fn normalizes_responses_id_and_preserves_extra_fields() {
         let body = json!({
             "id": "06c38eca53023d7eb041ff0a2c8fcf5c",
             "object": "response",
@@ -741,9 +735,10 @@ mod tests {
         });
         let out = convert_responses_response_to_responses(&body).unwrap();
         assert_eq!(out["id"], "resp_06c38eca53023d7eb041ff0a2c8fcf5c");
-        assert!(out.get("output_text").is_none());
-        assert!(out.get("x_details").is_none());
-        assert!(out.get("safety_identifier").is_none());
+        // Extra third-party fields are preserved by default.
+        assert_eq!(out["output_text"], "Hello");
+        assert_eq!(out["x_details"], json!([1, 2]));
+        assert!(out.get("safety_identifier").is_some());
     }
 
     #[test]

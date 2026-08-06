@@ -134,11 +134,9 @@ fn apply_ark_style(out: &mut Map<String, Value>) {
         out.insert("thinking".to_string(), json!({"type": thinking_type}));
         out.remove("reasoning_effort");
     }
-    // Enable prefix caching explicitly (Ark requires >=256 input tokens to create).
-    out.insert(
-        "caching".to_string(),
-        json!({"type": "enabled", "prefix": true}),
-    );
+    // Ark does not support the caching parameter in codex flow (tested:
+    // 400 "caching is not supported in coding plan / agent plan / codex flow"),
+    // so no caching injection here.
     // Normalize web_search tools: max_keyword instead of search_context_size.
     if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
@@ -167,8 +165,58 @@ fn apply_ark_style(out: &mut Map<String, Value>) {
     }
 }
 
-// Report of what the request conversion did (shared with the Messages path via
-// `crate::dialect::RequestConversionReport`).
+/// Apply Ark-style parameter normalization directly to a Responses request object
+/// (for same-protocol passthrough where the downstream already speaks Responses).
+///
+/// - `reasoning.effort` -> Ark `thinking: {"type": "enabled"|"disabled"}`.
+/// - Adds `caching: {"type": "enabled", "prefix": true}`.
+/// - web_search tools: `search_context_size` -> `max_keyword`.
+pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
+    // reasoning.effort -> Ark thinking.type.
+    let effort = request
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(effort) = &effort {
+        let thinking_type = if matches!(effort.as_str(), "none" | "minimal") {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        request.insert("thinking".to_string(), json!({"type": thinking_type}));
+    }
+    // Ark does not support the caching parameter in codex flow (tested:
+    // 400 "caching is not supported in coding plan / agent plan / codex flow"),
+    // so no caching injection here.
+    // Normalize web_search tools: max_keyword instead of search_context_size.
+    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            let Some(object) = tool.as_object_mut() else {
+                continue;
+            };
+            if object.get("type").and_then(Value::as_str) != Some("web_search") {
+                continue;
+            }
+            let search = object
+                .entry("web_search".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(search) = search.as_object_mut() {
+                if let Some(context) = search.remove("search_context_size") {
+                    search.insert(
+                        "max_keyword".to_string(),
+                        match context.as_str() {
+                            Some("low") => json!(1),
+                            Some("medium") => json!(3),
+                            _ => json!(5),
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
 
 fn max_tokens_field(field: crate::dialect::MaxTokensField) -> &'static str {
     match field {
@@ -1077,7 +1125,8 @@ mod tests {
         let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
         assert_eq!(out["thinking"]["type"], "enabled");
         assert!(out.get("reasoning_effort").is_none());
-        assert_eq!(out["caching"]["type"], "enabled");
+        // Ark does not support caching in codex flow; nothing injected.
+        assert!(out.get("caching").is_none());
         // web_search tool: search_context_size -> max_keyword.
         let tools = out["tools"].as_array().unwrap();
         let search = tools
@@ -1099,6 +1148,22 @@ mod tests {
         });
         let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
         assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn ark_style_to_responses_object_mutates_in_place() {
+        let mut request = json!({
+            "model": "doubao-seed-2-1-pro-260628",
+            "input": "hi",
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "web_search", "web_search": {"search_context_size": "low"}}]
+        });
+        let obj = request.as_object_mut().unwrap();
+        apply_ark_style_to_responses(obj);
+        assert_eq!(request["thinking"]["type"], "enabled");
+        // Ark does not support caching in codex flow; nothing injected.
+        assert!(request.get("caching").is_none());
+        assert_eq!(request["tools"][0]["web_search"]["max_keyword"], 1);
     }
 
     #[test]

@@ -809,7 +809,7 @@ fn prepare_upstream_attempt(
 ) -> Result<PreparedUpstreamAttempt> {
     let upstream_path =
         crate::api_conversion::conversion_upstream_path(&route.provider, forwarded_path);
-    let url = build_outgoing_url(&route.provider, upstream_path, incoming_query)?;
+    let url = build_outgoing_url(&route.provider, &upstream_path, incoming_query)?;
     let mut headers = base_headers.clone();
     let auth_header = http::HeaderName::from_bytes(route.provider.auth_header_name.as_bytes())
         .unwrap_or(header::AUTHORIZATION);

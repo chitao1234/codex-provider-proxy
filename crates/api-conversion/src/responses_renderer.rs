@@ -421,10 +421,7 @@ pub fn responses_usage(usage: ChatUsage) -> Value {
         .prompt_tokens
         .zip(usage.completion_tokens)
         .map(|(input, output)| input + output);
-    out.insert(
-        "total_tokens".to_string(),
-        json!(total.unwrap_or_default()),
-    );
+    out.insert("total_tokens".to_string(), json!(total.unwrap_or_default()));
     let mut input_details = serde_json::Map::new();
     if let Some(cached) = usage.cached_tokens {
         input_details.insert("cached_tokens".to_string(), json!(cached));
