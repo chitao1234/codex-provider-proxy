@@ -24,6 +24,7 @@ config.toml
 config.toml.*
 config.*.toml
 !config.example.toml
+.mcp.json
 .DS_Store
 logs/
 data/
