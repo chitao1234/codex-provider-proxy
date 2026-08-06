@@ -1502,40 +1502,58 @@ fn maybe_convert_request_body(
     } else {
         None
     };
-    let previous_messages = previous_state
-        .as_ref()
-        .map(|previous| previous.chat_messages.as_slice());
+    let previous_messages = previous_state.as_ref().and_then(|previous| {
+        previous
+            .request_ir
+            .render(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
+            )
+            .ok()
+            .and_then(|value| value.get("messages").cloned())
+            .and_then(|value| value.as_array().cloned())
+    });
     let last_reasoning = previous_state
         .as_ref()
         .and_then(|previous| previous.last_reasoning.as_deref());
+    let request_ir = if is_responses {
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "responses request body is not valid JSON",
+            )
+        })?;
+        Some(
+            codex_provider_proxy_api_conversion::request_ir::RequestIr::parse_with_context(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                &value,
+                previous_messages.as_deref(),
+                last_reasoning,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        )
+    } else {
+        None
+    };
     let converted = crate::api_conversion::convert_request_body(
         cfg,
         &attempt.provider_name,
         forwarded_path,
         body,
-        previous_messages,
+        previous_messages.as_deref(),
         last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
     if is_responses {
         // Hold the transcript recorder for the response side of this attempt so the
         // synthesized response can be continued with previous_response_id.
-        if let Ok(json) = serde_json::from_slice::<Value>(&converted) {
-            let model = json
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let messages = json
-                .get("messages")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+        if let Some(request_ir) = request_ir {
+            let model = request_ir.model.clone().unwrap_or_default();
             attempt.response_recorder = Some(crate::api_conversion::ResponseRecorder::new(
                 state.runtime.response_states(),
                 attempt.provider_name.clone(),
                 model,
-                messages,
+                request_ir,
             ));
         }
     }

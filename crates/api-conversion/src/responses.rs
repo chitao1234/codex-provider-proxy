@@ -941,6 +941,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unknown_provider_parameters() {
+        let body = json!({
+            "model": "custom-model",
+            "input": "hello",
+            "provider_budget": {"tokens": 123},
+            "vendor_sampling_mode": "adaptive"
+        });
+        let (out, _) = convert_responses_request(&body, &caps(), None, None).unwrap();
+        assert_eq!(out["provider_budget"]["tokens"], 123);
+        assert_eq!(out["vendor_sampling_mode"], "adaptive");
+    }
+
+    #[test]
     fn maps_max_tokens_field_per_capability() {
         let mut caps = caps();
         caps.max_tokens_field = crate::dialect::MaxTokensField::MaxCompletionTokens;

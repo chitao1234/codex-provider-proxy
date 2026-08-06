@@ -1061,6 +1061,20 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unknown_provider_parameters() {
+        let body = json!({
+            "model": "custom-model",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider_budget": {"tokens": 123},
+            "vendor_sampling_mode": "adaptive"
+        });
+        let (out, _) = convert_messages_request(&body, &caps()).unwrap();
+        assert_eq!(out["provider_budget"]["tokens"], 123);
+        assert_eq!(out["vendor_sampling_mode"], "adaptive");
+    }
+
+    #[test]
     fn converts_tool_loop_messages() {
         let body = json!({
             "model": "deepseek-v4-pro",

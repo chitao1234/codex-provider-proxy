@@ -13,22 +13,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use codex_provider_proxy_api_conversion::request_ir::RequestIr;
 
 /// Default time-to-live for stored response transcripts.
 pub const DEFAULT_RESPONSE_STATE_TTL_SECS: u64 = 3600;
 /// Default cap on stored transcripts (oldest evicted first).
 pub const DEFAULT_RESPONSE_STATE_MAX_ENTRIES: usize = 1024;
 
-/// Chat transcript stored for one synthesized Responses response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Protocol-neutral transcript stored for one synthesized Responses response.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResponseState {
     pub response_id: String,
     pub provider_name: String,
     pub model: String,
-    /// The complete chat transcript for this response, in Chat Completions
-    /// message shape (system/assistant/tool), ready to prepend to a continuation.
-    pub chat_messages: Vec<Value>,
+    /// The complete protocol-neutral request transcript, ready to render for a continuation.
+    pub request_ir: RequestIr,
     /// Reasoning from the assistant turn that produced this response.
     pub last_reasoning: Option<String>,
     pub created_at_unix: u64,
@@ -40,7 +39,7 @@ impl ResponseState {
         response_id: String,
         provider_name: String,
         model: String,
-        chat_messages: Vec<Value>,
+        request_ir: RequestIr,
         last_reasoning: Option<String>,
         now_unix: u64,
         ttl_secs: u64,
@@ -49,7 +48,7 @@ impl ResponseState {
             response_id,
             provider_name,
             model,
-            chat_messages,
+            request_ir,
             last_reasoning,
             created_at_unix: now_unix,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
@@ -144,7 +143,11 @@ mod tests {
             id.to_string(),
             "ds".to_string(),
             "deepseek-v4-pro".to_string(),
-            vec![],
+            RequestIr::parse(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                &serde_json::json!({"messages": []}),
+            )
+            .unwrap(),
             None,
             created,
             100,
@@ -158,7 +161,11 @@ mod tests {
             "resp_1".to_string(),
             "ds".to_string(),
             "m".to_string(),
-            vec![json!({"role": "user", "content": "hi"})],
+            RequestIr::parse(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                &json!({"messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .unwrap(),
             Some("think".to_string()),
             now_unix(),
             100,
@@ -166,7 +173,7 @@ mod tests {
         store.put(state.clone());
         let got = store.get("resp_1").expect("stored state retrievable");
         assert_eq!(got.response_id, "resp_1");
-        assert_eq!(got.chat_messages, state.chat_messages);
+        assert_eq!(got.request_ir, state.request_ir);
         assert_eq!(got.last_reasoning, state.last_reasoning);
         assert_eq!(store.get("resp_missing"), None);
     }
@@ -178,7 +185,11 @@ mod tests {
             "resp_old".to_string(),
             "ds".to_string(),
             "m".to_string(),
-            vec![],
+            RequestIr::parse(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                &serde_json::json!({"messages": []}),
+            )
+            .unwrap(),
             None,
             now_unix().saturating_sub(100), // created long ago, already expired
             10,

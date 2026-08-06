@@ -46,11 +46,30 @@ pub enum RequestParserKind {
     OpenAIResponses,
 }
 
+impl RequestParserKind {
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::AnthropicMessages => Protocol::AnthropicMessages,
+            Self::OpenAIResponses => Protocol::OpenAiResponses,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRendererKind {
     OpenAIChatCompletions,
     AnthropicMessages,
     OpenAIResponses,
+}
+
+impl RequestRendererKind {
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::OpenAIChatCompletions => Protocol::OpenAiChatCompletions,
+            Self::AnthropicMessages => Protocol::AnthropicMessages,
+            Self::OpenAIResponses => Protocol::OpenAiResponses,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,76 +288,30 @@ pub fn convert_request_body(
         RequestAction::Passthrough {
             normalizer: Some(RequestNormalizerKind::ArkResponses),
         } => (json, Default::default()),
-        RequestAction::Transform(RequestPipeline {
-            parser: RequestParserKind::AnthropicMessages,
-            renderer: RequestRendererKind::OpenAIChatCompletions,
-        }) => {
-            let request = RequestIr::parse(Protocol::AnthropicMessages, &json).map_err(|err| {
-                RequestConversionRejected::from_conversion_error(err, plan.downstream)
-            })?;
-            request
-                .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?
-        }
-        RequestAction::Transform(RequestPipeline {
-            parser: RequestParserKind::OpenAIResponses,
-            renderer: RequestRendererKind::OpenAIChatCompletions,
-        }) => {
-            let request = RequestIr::parse_with_context(
-                Protocol::OpenAiResponses,
-                &json,
-                previous_messages,
-                last_reasoning,
-            )
+        RequestAction::Transform(pipeline) => {
+            let source = pipeline.parser.protocol();
+            let request = if source == Protocol::OpenAiResponses {
+                RequestIr::parse_with_context(source, &json, previous_messages, last_reasoning)
+            } else {
+                RequestIr::parse(source, &json)
+            }
             .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            request
-                .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?
-        }
-        RequestAction::Transform(RequestPipeline {
-            parser: RequestParserKind::OpenAIResponses,
-            renderer: RequestRendererKind::AnthropicMessages,
-        }) => {
-            let request = RequestIr::parse_with_context(
-                Protocol::OpenAiResponses,
-                &json,
-                previous_messages,
-                last_reasoning,
-            )
-            .map_err(|err| {
-                RequestConversionRejected::from_conversion_error(err, plan.downstream)
-            })?;
-            let rendered = request
-                .render(Protocol::AnthropicMessages, &caps)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?;
-            (rendered, Default::default())
-        }
-        RequestAction::Transform(RequestPipeline {
-            parser: RequestParserKind::AnthropicMessages,
-            renderer: RequestRendererKind::OpenAIResponses,
-        }) => {
-            let request = RequestIr::parse(Protocol::AnthropicMessages, &json).map_err(|err| {
-                RequestConversionRejected::from_conversion_error(err, plan.downstream)
-            })?;
-            let rendered = request
-                .render(Protocol::OpenAiResponses, &caps)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?;
-            (rendered, Default::default())
-        }
-        RequestAction::Transform(_) => {
-            return Err(RequestConversionRejected::openai_invalid(
-                "request conversion pipeline is not implemented",
-            ));
+            if pipeline.renderer == RequestRendererKind::OpenAIChatCompletions {
+                request
+                    .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?
+            } else {
+                let rendered = request
+                    .render(pipeline.renderer.protocol(), &caps)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?;
+                (rendered, Default::default())
+            }
         }
     };
     let mut converted = converted;
@@ -422,9 +395,8 @@ pub struct ResponseRecorder {
     store: crate::response_state::ResponseStateStore,
     provider_name: String,
     model: String,
-    /// The converted request's messages: previous transcript (if any) plus the
-    /// messages produced from the current `input`.
-    request_messages: Vec<Value>,
+    /// The protocol-neutral request transcript for this response chain.
+    request_ir: RequestIr,
 }
 
 impl ResponseRecorder {
@@ -432,13 +404,13 @@ impl ResponseRecorder {
         store: crate::response_state::ResponseStateStore,
         provider_name: impl Into<String>,
         model: impl Into<String>,
-        request_messages: Vec<Value>,
+        request_ir: RequestIr,
     ) -> Self {
         Self {
             store,
             provider_name: provider_name.into(),
             model: model.into(),
-            request_messages,
+            request_ir,
         }
     }
 
@@ -451,16 +423,16 @@ impl ResponseRecorder {
             .and_then(Value::as_str)
             .filter(|reasoning| !reasoning.trim().is_empty())
             .map(str::to_owned);
-        let mut messages = self.request_messages.clone();
+        let mut request_ir = self.request_ir.clone();
         if let Some(turn) = assistant_turn {
-            messages.push(turn);
+            request_ir.append_chat_assistant_turn(&turn);
         }
         let now = crate::response_state::now_unix();
         self.store.put(crate::response_state::ResponseState::new(
             response_id.to_string(),
             self.provider_name.clone(),
             self.model.clone(),
-            messages,
+            request_ir,
             last_reasoning,
             now,
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,

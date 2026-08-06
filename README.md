@@ -242,8 +242,10 @@ Conversion behavior (see `docs/messages-to-chat-completions-conversion.md` for t
 
 Providers without `upstream_api`/`accept_downstream_apis` proxy transparently, unchanged.
 The request-conversion matrix supports all three dialects: Messages, Chat Completions, and
-Responses. Messages↔Responses cross-conversion uses the shared request renderer and is subject
-to the target protocol's representable feature set. For an Ark/Volcengine Responses upstream,
+Responses. Cross-protocol requests are parsed into a protocol-neutral request IR; Chat Completions
+JSON is never used as the shared Messages↔Responses intermediate. Unknown provider/client request
+parameters are preserved unless they are known source-protocol structural fields. For an
+Ark/Volcengine Responses upstream,
 set `capabilities.ark_style = true` (or the corresponding model override) to opt into request
 normalization; this applies both to native Responses passthrough and to converted Messages requests.
 Converted exchanges still record the upstream bytes in exchange logs and statistics; token

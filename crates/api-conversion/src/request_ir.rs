@@ -37,11 +37,33 @@ pub struct RequestIr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrMessage {
     pub role: String,
-    pub content: Vec<Value>,
+    pub content: Vec<IrContent>,
     pub item_id: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Vec<IrToolCall>,
     pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrContent {
+    Text {
+        text: String,
+        extra: Map<String, Value>,
+    },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+        extra: Map<String, Value>,
+    },
+    Image(Value),
+    ToolUse(IrToolCall),
+    ToolResult {
+        call_id: String,
+        content: Value,
+        is_error: bool,
+        extra: Map<String, Value>,
+    },
+    Raw(Value),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +145,16 @@ impl RequestIr {
         Ok(ir)
     }
 
+    pub fn append_chat_assistant_turn(&mut self, turn: &Value) {
+        let Ok(parsed) = Self::parse(
+            Protocol::OpenAiChatCompletions,
+            &serde_json::json!({"messages": [turn]}),
+        ) else {
+            return;
+        };
+        self.messages.extend(parsed.messages);
+    }
+
     fn parse_messages(&mut self) {
         if let Some(system) = self.original.get("system") {
             self.instructions.push(system.clone());
@@ -190,7 +222,10 @@ impl RequestIr {
             if let Some(text) = input.as_str() {
                 self.messages.push(IrMessage {
                     role: "user".to_owned(),
-                    content: vec![serde_json::json!({"type":"text", "text":text})],
+                    content: vec![IrContent::Text {
+                        text: text.to_owned(),
+                        extra: Map::new(),
+                    }],
                     item_id: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
@@ -213,7 +248,9 @@ impl RequestIr {
                     Some("reasoning") => self.reasoning.push(value.clone()),
                     Some("function_call_output") => self.messages.push(IrMessage {
                         role: "tool".to_owned(),
-                        content: vec![value.get("output").cloned().unwrap_or(Value::Null)],
+                        content: vec![IrContent::Raw(
+                            value.get("output").cloned().unwrap_or(Value::Null),
+                        )],
                         item_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
                         tool_call_id: value
                             .get("call_id")
@@ -257,15 +294,10 @@ impl RequestIr {
             tool_calls: Vec::new(),
             extra: object.clone(),
         };
-        if protocol == Protocol::AnthropicMessages {
-            message.tool_calls = message
-                .content
-                .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-                .map(IrToolCall::from_messages_block)
-                .collect();
-        } else if let Some(calls) = object.get("tool_calls").and_then(Value::as_array) {
-            message.tool_calls = calls.iter().map(IrToolCall::from_chat).collect();
+        if protocol != Protocol::AnthropicMessages {
+            if let Some(calls) = object.get("tool_calls").and_then(Value::as_array) {
+                message.tool_calls = calls.iter().map(IrToolCall::from_chat).collect();
+            }
         }
         self.messages.push(message);
     }
@@ -468,11 +500,14 @@ impl RequestIr {
     }
 }
 
-fn normalize_content(content: Option<&Value>) -> Vec<Value> {
+fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
     match content {
-        Some(Value::Array(values)) => values.clone(),
-        Some(Value::String(text)) => vec![serde_json::json!({"type":"text", "text":text})],
-        Some(value) if !value.is_null() => vec![value.clone()],
+        Some(Value::Array(values)) => values.iter().map(IrContent::parse).collect(),
+        Some(Value::String(text)) => vec![IrContent::Text {
+            text: text.clone(),
+            extra: Map::new(),
+        }],
+        Some(value) if !value.is_null() => vec![IrContent::Raw(value.clone())],
         _ => Vec::new(),
     }
 }
@@ -512,11 +547,141 @@ fn normalize_responses_parameters(out: &mut Map<String, Value>, _caps: &ModelCap
     }
 }
 
+impl IrContent {
+    fn parse(value: &Value) -> Self {
+        let Some(object) = value.as_object() else {
+            return Self::Raw(value.clone());
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text" | "output_text") => Self::Text {
+                text: object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                extra: object.clone(),
+            },
+            Some("thinking" | "reasoning_text") => Self::Thinking {
+                text: object
+                    .get("thinking")
+                    .or_else(|| object.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                signature: object
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                extra: object.clone(),
+            },
+            Some("image" | "input_image" | "image_url") => Self::Image(value.clone()),
+            Some("tool_use") => Self::ToolUse(IrToolCall::from_messages_block(value)),
+            Some("tool_result") => Self::ToolResult {
+                call_id: object
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                content: object.get("content").cloned().unwrap_or(Value::Null),
+                is_error: object
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                extra: object.clone(),
+            },
+            _ => Self::Raw(value.clone()),
+        }
+    }
+
+    fn raw_value(&self) -> Value {
+        match self {
+            Self::Text { text, extra } => {
+                let mut object = extra.clone();
+                object.insert("type".to_owned(), Value::String("text".to_owned()));
+                object.insert("text".to_owned(), Value::String(text.clone()));
+                Value::Object(object)
+            }
+            Self::Thinking {
+                text,
+                signature,
+                extra,
+            } => {
+                let mut object = extra.clone();
+                object.insert("type".to_owned(), Value::String("thinking".to_owned()));
+                object.insert("thinking".to_owned(), Value::String(text.clone()));
+                if let Some(signature) = signature {
+                    object.insert("signature".to_owned(), Value::String(signature.clone()));
+                }
+                Value::Object(object)
+            }
+            Self::Image(value) | Self::Raw(value) => value.clone(),
+            Self::ToolUse(call) => call.to_messages_block(),
+            Self::ToolResult {
+                call_id,
+                content,
+                is_error,
+                extra,
+            } => {
+                let mut object = extra.clone();
+                object.insert("type".to_owned(), Value::String("tool_result".to_owned()));
+                object.insert("tool_use_id".to_owned(), Value::String(call_id.clone()));
+                object.insert("content".to_owned(), content.clone());
+                object.insert("is_error".to_owned(), Value::Bool(*is_error));
+                Value::Object(object)
+            }
+        }
+    }
+
+    fn to_chat(&self) -> Value {
+        match self {
+            Self::Text { text, extra } => {
+                let mut object = extra.clone();
+                object.insert("type".to_owned(), Value::String("text".to_owned()));
+                object.insert("text".to_owned(), Value::String(text.clone()));
+                Value::Object(object)
+            }
+            Self::Thinking { text, .. } => serde_json::json!({"type":"text", "text":text}),
+            other => other.raw_value(),
+        }
+    }
+
+    fn to_messages(&self) -> Value {
+        self.raw_value()
+    }
+
+    fn to_responses(&self, role: &str) -> Value {
+        match self {
+            Self::Text { text, extra } => {
+                let mut object = extra.clone();
+                object.insert(
+                    "type".to_owned(),
+                    Value::String(
+                        if role == "assistant" {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        }
+                        .to_owned(),
+                    ),
+                );
+                object.insert("text".to_owned(), Value::String(text.clone()));
+                Value::Object(object)
+            }
+            Self::Image(value) => {
+                let mut object = value.as_object().cloned().unwrap_or_default();
+                object.insert("type".to_owned(), Value::String("input_image".to_owned()));
+                Value::Object(object)
+            }
+            other => other.raw_value(),
+        }
+    }
+}
+
 impl IrMessage {
     fn custom(value: Value) -> Self {
         Self {
             role: "custom".to_owned(),
-            content: vec![value],
+            content: vec![IrContent::Raw(value)],
             item_id: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
@@ -537,7 +702,7 @@ impl IrMessage {
 
     fn to_chat_values(&self) -> Vec<Value> {
         if self.role == "custom" {
-            return self.content.clone();
+            return self.content.iter().map(IrContent::raw_value).collect();
         }
         let mut object = self.extra.clone();
         for key in ["role", "content", "tool_calls", "tool_call_id", "id"] {
@@ -572,7 +737,11 @@ impl IrMessage {
                 "content":[{"type":"tool_result", "tool_use_id":self.tool_call_id.clone().unwrap_or_default(), "content":content_as_chat(&self.content)}]
             })];
         }
-        let mut blocks = self.content.clone();
+        let mut blocks = self
+            .content
+            .iter()
+            .map(IrContent::to_messages)
+            .collect::<Vec<_>>();
         if self.role == "assistant" {
             blocks.extend(self.tool_calls.iter().map(IrToolCall::to_messages_block));
         }
@@ -587,7 +756,7 @@ impl IrMessage {
 
     fn to_responses_values(&self) -> Vec<Value> {
         if self.role == "custom" {
-            return self.content.clone();
+            return self.content.iter().map(IrContent::raw_value).collect();
         }
         let mut values = Vec::new();
         if self.role == "tool" {
@@ -598,24 +767,33 @@ impl IrMessage {
             }));
             return values;
         }
-        if !self.content.is_empty() {
-            values.push(
-                serde_json::json!({"type":"message", "role":self.role, "content":self.content}),
-            );
+        let mut content = Vec::new();
+        for part in &self.content {
+            match part {
+                IrContent::ToolResult {
+                    call_id, content, ..
+                } => values.push(serde_json::json!({
+                    "type":"function_call_output",
+                    "call_id":call_id,
+                    "output":content
+                })),
+                IrContent::ToolUse(call) => values.push(call.to_responses()),
+                _ => content.push(part.to_responses(&self.role)),
+            }
+        }
+        if !content.is_empty() {
+            values.push(serde_json::json!({"type":"message", "role":self.role, "content":content}));
         }
         values.extend(self.tool_calls.iter().map(IrToolCall::to_responses));
         values
     }
 }
 
-fn content_as_chat(content: &[Value]) -> Value {
-    if content.len() == 1 && content[0].get("type").and_then(Value::as_str) == Some("text") {
-        return content[0]
-            .get("text")
-            .cloned()
-            .unwrap_or(Value::String(String::new()));
+fn content_as_chat(content: &[IrContent]) -> Value {
+    if let [IrContent::Text { text, .. }] = content {
+        return Value::String(text.clone());
     }
-    Value::Array(content.to_vec())
+    Value::Array(content.iter().map(IrContent::to_chat).collect())
 }
 
 fn reasoning_to_messages_blocks(reasoning: &Value) -> Vec<Value> {
@@ -855,6 +1033,7 @@ mod tests {
             .unwrap();
         assert_eq!(responses["provider_budget"]["reasoning"], 7);
         assert_eq!(responses["tools"][0]["vendor_extension"]["x"], true);
+        assert_eq!(responses["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(
             responses["input"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
@@ -904,6 +1083,15 @@ mod tests {
                 message["content"]
                     .as_array()
                     .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"))
+            }));
+        assert!(messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "text"))
             }));
     }
 }
