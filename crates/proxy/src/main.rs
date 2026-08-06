@@ -4,6 +4,7 @@ mod content_encoding;
 mod exchange_log;
 mod log_capture;
 mod proxy;
+mod response_state;
 mod rewrite;
 mod rpc;
 mod runtime;

@@ -21,9 +21,15 @@ use crate::sse::encode_sse_event;
 ///
 /// Shares the upstream parameter mapping with the Messages path via `ChatRequestBuilder`,
 /// but expands the Responses `input` item array instead of Messages content blocks.
+///
+/// `previous_messages` carries the chat transcript stored for an earlier synthesized
+/// `response_id` when the client continues with `previous_response_id`; it is prepended
+/// to the messages converted from the current `input`, so the stateless upstream sees
+/// the full conversation.
 pub fn convert_responses_request(
     body: &Value,
     caps: &ModelCapabilities,
+    previous_messages: Option<&[Value]>,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
     let Some(request) = body.as_object() else {
         return Err(ConversionError::invalid(
@@ -64,10 +70,16 @@ pub fn convert_responses_request(
     let messages = expand_input(request.get("input"), caps)?;
     let (tools, report) = convert_tools(request.get("tools"), caps)?;
 
-    let mut chat_messages: Vec<Value> =
-        Vec::with_capacity(messages.len() + usize::from(instructions.is_some()));
+    let mut chat_messages: Vec<Value> = Vec::with_capacity(
+        messages.len()
+            + usize::from(instructions.is_some())
+            + previous_messages.map_or(0, |previous| previous.len()),
+    );
     if let Some(instructions) = instructions.filter(|s| !s.trim().is_empty()) {
         chat_messages.push(json!({"role": "system", "content": instructions}));
+    }
+    if let Some(previous) = previous_messages {
+        chat_messages.extend_from_slice(previous);
     }
     chat_messages.extend(messages);
     out.insert("messages".to_string(), Value::Array(chat_messages));
@@ -671,6 +683,25 @@ pub fn convert_chat_response_to_responses(body: &Value) -> Result<Value, Convers
     }))
 }
 
+/// Extract the assistant chat message from an upstream Chat Completions body,
+/// for transcript storage (non-streaming path; the streaming path exposes the
+/// same shape via `ResponsesStreamConverter::assistant_turn`).
+pub fn chat_response_assistant_turn(body: &Value) -> Option<Value> {
+    let message = first_choice_message(body)?;
+    let has_text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty());
+    let has_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    if !has_text && !has_calls {
+        return None;
+    }
+    Some(message.clone())
+}
+
 fn synth_response_id(upstream_id: Option<&str>) -> String {
     match upstream_id {
         Some(id) if id.starts_with("resp_") => id.to_string(),
@@ -748,6 +779,7 @@ pub struct ResponsesStreamConverter {
     message_item: Option<usize>,
     message_text: String,
     function_calls: HashMap<usize, FunctionCallState>,
+    assistant_turn: Option<Value>,
     usage: ChatUsage,
     finished: bool,
 }
@@ -770,9 +802,21 @@ impl ResponsesStreamConverter {
             message_item: None,
             message_text: String::new(),
             function_calls: HashMap::new(),
+            assistant_turn: None,
             usage: ChatUsage::default(),
             finished: false,
         }
+    }
+
+    /// The synthesized downstream `response_id`, available once the stream started.
+    pub fn response_id(&self) -> Option<&str> {
+        self.started.then_some(self.response_id.as_str())
+    }
+
+    /// The assistant chat message produced by this stream (text and/or tool calls),
+    /// for transcript storage. Available after `finish`.
+    pub fn assistant_turn(&self) -> Option<&Value> {
+        self.assistant_turn.as_ref()
     }
 
     /// Process one upstream SSE `data:` payload; appends Responses events to `out`.
@@ -1028,8 +1072,12 @@ impl ResponsesStreamConverter {
                 },
             }));
         }
+        // Build the assistant chat turn for transcript storage as items close.
+        let mut assistant = json!({"role": "assistant", "content": ""});
+        let mut tool_calls: Vec<Value> = Vec::new();
         if let Some(index) = self.message_item.take() {
             let text = std::mem::take(&mut self.message_text);
+            assistant["content"] = json!(text);
             items_done.push(json!({
                 "type": "response.output_item.done",
                 "output_index": index,
@@ -1050,6 +1098,11 @@ impl ResponsesStreamConverter {
             let Some(state) = self.function_calls.remove(&index) else {
                 continue;
             };
+            tool_calls.push(json!({
+                "id": state.call_id,
+                "type": "function",
+                "function": {"name": state.name, "arguments": state.arguments},
+            }));
             args_done.push(json!({
                 "type": "response.function_call_arguments.done",
                 "item_id": state.item_id,
@@ -1068,6 +1121,13 @@ impl ResponsesStreamConverter {
                     "arguments": state.arguments,
                 },
             }));
+        }
+        if !tool_calls.is_empty() {
+            assistant["tool_calls"] = json!(tool_calls);
+        }
+        // A turn is worth recording when the assistant said something or called tools.
+        if !assistant["content"].as_str().is_none_or(str::is_empty) || !tool_calls.is_empty() {
+            self.assistant_turn = Some(assistant);
         }
         for event in args_done {
             self.emit("response.function_call_arguments.done", &event, out);
@@ -1121,7 +1181,7 @@ mod tests {
             "stream": true,
             "instructions": "You are helpful"
         });
-        let (out, _) = convert_responses_request(&body, &caps()).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
         assert_eq!(out["model"], "gpt-5.6");
         assert_eq!(out["max_tokens"], 100);
         assert_eq!(out["messages"][0]["role"], "system");
@@ -1136,7 +1196,7 @@ mod tests {
         let mut caps = caps();
         caps.max_tokens_field = crate::dialect::MaxTokensField::MaxCompletionTokens;
         let body = json!({"model": "m", "max_output_tokens": 1000, "input": "hi"});
-        let (out, _) = convert_responses_request(&body, &caps).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps, None).unwrap();
         assert_eq!(out["max_completion_tokens"], 1000);
     }
 
@@ -1152,7 +1212,7 @@ mod tests {
                 {"type": "message", "role": "user", "content": "thanks"}
             ]
         });
-        let (out, _) = convert_responses_request(&body, &caps()).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "user");
@@ -1185,10 +1245,48 @@ mod tests {
             "reasoning": {"effort": "xhigh"},
             "text": {"format": {"type": "json_object"}}
         });
-        let (out, _) = convert_responses_request(&body, &caps).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps, None).unwrap();
         assert_eq!(out["thinking"]["type"], "enabled");
         assert_eq!(out["reasoning_effort"], "high");
         assert_eq!(out["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn prepends_previous_messages_before_current_input() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+                {"type": "message", "role": "user", "content": "thanks"}
+            ]
+        });
+        let previous = vec![
+            json!({"role": "user", "content": "weather in Paris?"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]}),
+        ];
+        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "weather in Paris?");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1].get("tool_calls").is_some());
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "thanks");
+    }
+
+    #[test]
+    fn prepends_previous_after_instructions() {
+        let body = json!({"model": "m", "input": "hi", "instructions": "You are helpful"});
+        let previous = vec![json!({"role": "user", "content": "earlier"})];
+        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "earlier");
+        assert_eq!(messages[2]["content"], "hi");
     }
 
     #[test]
@@ -1284,6 +1382,62 @@ mod tests {
         assert!(text.contains("\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
         assert!(text.contains("\"name\":\"get_weather\""));
         assert!(text.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn stream_exposes_response_id_and_assistant_turn() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut out = Vec::new();
+        converter
+            .on_chunk(
+                r#"{"id":"chatcmpl-9","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter
+            .on_chunk(
+                r#"{"id":"chatcmpl-9","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter
+            .on_chunk(
+                r#"{"id":"chatcmpl-9","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter.on_chunk("[DONE]", &mut out).unwrap();
+
+        assert_eq!(converter.response_id(), Some("resp_chatcmpl-9"));
+        let turn = converter.assistant_turn().expect("assistant turn recorded");
+        assert_eq!(turn["role"], "assistant");
+        assert_eq!(turn["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            turn["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+    }
+
+    #[test]
+    fn stream_assistant_turn_carries_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut out = Vec::new();
+        converter
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi "},"finish_reason":null}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"there"},"finish_reason":"stop"}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter.finish(&mut out);
+        let turn = converter.assistant_turn().expect("assistant turn recorded");
+        assert_eq!(turn["content"], "Hi there");
+        assert!(turn.get("tool_calls").is_none());
     }
 
     #[test]

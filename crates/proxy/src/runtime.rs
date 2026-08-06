@@ -78,6 +78,7 @@ struct RuntimeInner {
     request_seq: AtomicU64,
     log_reload: LogReloadHandle,
     statistics: StatisticsManager,
+    response_states: crate::response_state::ResponseStateStore,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,9 @@ impl RuntimeState {
                 request_seq: AtomicU64::new(1),
                 log_reload,
                 statistics,
+                response_states: crate::response_state::ResponseStateStore::new(
+                    crate::response_state::DEFAULT_RESPONSE_STATE_MAX_ENTRIES,
+                ),
             }),
         }
     }
@@ -153,6 +157,11 @@ impl RuntimeState {
 
     pub fn statistics(&self) -> StatisticsManager {
         self.inner.statistics.clone()
+    }
+
+    /// Shared store of Responses transcripts for `previous_response_id` continuation.
+    pub fn response_states(&self) -> crate::response_state::ResponseStateStore {
+        self.inner.response_states.clone()
     }
 
     pub async fn apply_config(&self, config: Arc<Config>) -> Result<ApplyConfigSummary> {

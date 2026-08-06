@@ -68,6 +68,9 @@ struct PreparedUpstreamAttempt {
     provider_name: String,
     url: Url,
     headers: HeaderMap,
+    /// Transcript recorder for Responses downstream requests, set when the request
+    /// was converted from `/v1/responses`; records the response when its stream ends.
+    response_recorder: Option<crate::api_conversion::ResponseRecorder>,
 }
 
 #[derive(Clone)]
@@ -495,18 +498,23 @@ async fn handle_proxy_inner(
                     crate::api_conversion::ChatToMessagesStream::new(resp_stream),
                 )
                     as BoxRespStream,
-                Some(crate::api_conversion::DownstreamApi::OpenAiResponses) => Box::pin(
-                    crate::api_conversion::ChatToResponsesStream::new(resp_stream),
-                )
-                    as BoxRespStream,
+                Some(crate::api_conversion::DownstreamApi::OpenAiResponses) => {
+                    Box::pin(crate::api_conversion::ChatToResponsesStream::with_recorder(
+                        resp_stream,
+                        final_attempt.response_recorder.clone(),
+                    )) as BoxRespStream
+                }
                 None => resp_stream,
             }
         } else {
-            Box::pin(crate::api_conversion::NonStreamingConversionStream::new(
-                resp_stream,
-                cfg.request_body_buffer_max_bytes,
-                forwarded_path.to_string(),
-            )) as BoxRespStream
+            Box::pin(
+                crate::api_conversion::NonStreamingConversionStream::with_recorder(
+                    resp_stream,
+                    cfg.request_body_buffer_max_bytes,
+                    forwarded_path.to_string(),
+                    final_attempt.response_recorder.clone(),
+                ),
+            ) as BoxRespStream
         }
     } else {
         resp_stream
@@ -732,6 +740,7 @@ fn prepare_upstream_attempt(
         provider_name: route.provider_name,
         url,
         headers,
+        response_recorder: None,
     })
 }
 
@@ -802,6 +811,7 @@ async fn send_upstream_request(
         ) || conversion_may_apply
         {
             SingleAttemptRequestBody::Buffered(prepare_request_body_for_attempt(
+                state,
                 cfg,
                 &method,
                 &forwarded_path,
@@ -1312,7 +1322,9 @@ fn rewrite_request_body_for_attempt(
 
 /// Model-mapping rewrite followed by API format conversion when the provider converts
 /// Anthropic Messages traffic.
+#[allow(clippy::too_many_arguments)]
 fn prepare_request_body_for_attempt(
+    state: &ProxyState,
     cfg: &crate::config::Config,
     method: &http::Method,
     forwarded_path: &str,
@@ -1331,6 +1343,7 @@ fn prepare_request_body_for_attempt(
         attempt_number,
     );
     maybe_convert_request_body(
+        state,
         cfg,
         method,
         forwarded_path,
@@ -1341,7 +1354,9 @@ fn prepare_request_body_for_attempt(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_convert_request_body(
+    state: &ProxyState,
     cfg: &crate::config::Config,
     method: &http::Method,
     forwarded_path: &str,
@@ -1358,13 +1373,45 @@ fn maybe_convert_request_body(
     ) {
         return Ok(body);
     }
+    let is_responses = matches!(
+        crate::api_conversion::downstream_api_for_path(forwarded_path),
+        Some(crate::api_conversion::DownstreamApi::OpenAiResponses)
+    );
+    let previous_messages = if is_responses {
+        resolve_previous_response_messages(state, &attempt.provider_name, &body)?
+    } else {
+        None
+    };
     let converted = crate::api_conversion::convert_request_body(
         cfg,
         &attempt.provider_name,
         forwarded_path,
         body,
+        previous_messages.as_deref(),
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
+    if is_responses {
+        // Hold the transcript recorder for the response side of this attempt so the
+        // synthesized response can be continued with previous_response_id.
+        if let Ok(json) = serde_json::from_slice::<Value>(&converted) {
+            let model = json
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let messages = json
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            attempt.response_recorder = Some(crate::api_conversion::ResponseRecorder::new(
+                state.runtime.response_states(),
+                attempt.provider_name.clone(),
+                model,
+                messages,
+            ));
+        }
+    }
     attempt.headers.remove(header::CONTENT_LENGTH);
     attempt.headers.remove(ANTHROPIC_BETA_HEADER);
     attempt.headers.insert(
@@ -1380,6 +1427,59 @@ fn maybe_convert_request_body(
         "request converted from messages to chat completions"
     );
     Ok(converted)
+}
+
+/// Resolve the stored chat transcript for the request's `previous_response_id`,
+/// rejecting unknown/expired ids and continuations across providers.
+fn resolve_previous_response_messages(
+    state: &ProxyState,
+    provider_name: &str,
+    body: &[u8],
+) -> std::result::Result<Option<Vec<Value>>, std::io::Error> {
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "responses request body is not valid JSON",
+        ));
+    };
+    let Some(previous_id) = json
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let store = state.runtime.response_states();
+    let Some(previous) = store.get(previous_id) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown or expired previous_response_id {previous_id:?}"),
+        ));
+    };
+    if previous.provider_name != provider_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "previous_response_id {previous_id:?} belongs to provider {:?}, not {provider_name:?}",
+                previous.provider_name
+            ),
+        ));
+    }
+    if let Ok(model) = serde_json::from_slice::<Value>(body) {
+        let model = model
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !previous.model.is_empty() && previous.model != model {
+            warn!(
+                previous_response_id = %previous_id,
+                previous_model = %previous.model,
+                model = %model,
+                "continuing a conversation with a different model"
+            );
+        }
+    }
+    Ok(Some(previous.chat_messages))
 }
 
 fn apply_anthropic_beta_updates(headers: &mut HeaderMap, updates: &[AnthropicBetaUpdate]) {
@@ -2291,6 +2391,7 @@ where
         let attempt_started = Instant::now();
         let attempt_number = attempt.saturating_add(1);
         let request_body = prepare_request_body_for_attempt(
+            &args.state,
             &cfg,
             &args.request.method,
             &args.request.forwarded_path,
@@ -4476,10 +4577,11 @@ mod tests {
         let inner = futures_util::stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}")),
         ]);
-        let mut stream = crate::api_conversion::NonStreamingConversionStream::new(
+        let mut stream = crate::api_conversion::NonStreamingConversionStream::with_recorder(
             inner,
             1024 * 1024,
             "/v1/messages".to_string(),
+            None,
         );
         let mut delivered = BytesMut::new();
         while let Some(item) = stream.next().await {
@@ -4537,6 +4639,138 @@ mod tests {
 
         let captured_headers = headers.lock().unwrap();
         assert!(captured_headers[0].get("anthropic-beta").is_none());
+        let _ = shutdown_tx.send(());
+    }
+
+    fn responses_provider(base_url: Url) -> Provider {
+        Provider {
+            accept_downstream_apis: vec![
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAiResponses,
+            ],
+            ..converting_provider(base_url)
+        }
+    }
+
+    fn responses_request(body: serde_json::Value) -> Request<Body> {
+        let body = serde_json::to_vec(&body).unwrap();
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn responses_continuation_prepends_previous_transcript() {
+        let (url, bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"id": "chatcmpl-1", "object": "chat.completion", "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), responses_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        // First request starts the conversation; the response id is stored.
+        let req = responses_request(json!({
+            "model": "m",
+            "input": "hi",
+            "stream": false
+        }));
+        let resp = handle_proxy_inner(state.clone(), "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let converted: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(converted["id"], "resp_chatcmpl-1");
+
+        // Second request continues with previous_response_id; the stored assistant
+        // turn is prepended to the messages the upstream sees.
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"id": "chatcmpl-2", "object": "chat.completion", "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi there"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+        let req = responses_request(json!({
+            "model": "m",
+            "previous_response_id": "resp_chatcmpl-1",
+            "input": "how are you?",
+            "stream": false
+        }));
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let captured = bodies.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let second: serde_json::Value = serde_json::from_slice(&captured[1]).unwrap();
+        let messages = second["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hi");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "hello");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "how are you?");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn responses_continuation_rejects_unknown_previous_id() {
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/chat/completions").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"id": "chatcmpl-1", "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), responses_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = responses_request(json!({
+            "model": "m",
+            "previous_response_id": "resp_missing",
+            "input": "hi",
+            "stream": false
+        }));
+        let err = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .expect_err("unknown previous_response_id should fail");
+        let chain: Vec<String> = err.chain().map(|cause| cause.to_string()).collect();
+        assert!(
+            chain
+                .iter()
+                .any(|msg| msg.contains("unknown or expired previous_response_id")),
+            "unexpected error chain: {chain:?}"
+        );
         let _ = shutdown_tx.send(());
     }
 

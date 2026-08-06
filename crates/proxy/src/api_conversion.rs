@@ -20,7 +20,8 @@ use codex_provider_proxy_api_conversion::messages_to_chat::{
     convert_chat_response, convert_messages_request, ChatStreamConverter,
 };
 use codex_provider_proxy_api_conversion::responses::{
-    convert_chat_response_to_responses, convert_responses_request, ResponsesStreamConverter,
+    chat_response_assistant_turn, convert_chat_response_to_responses, convert_responses_request,
+    ResponsesStreamConverter,
 };
 use codex_provider_proxy_api_conversion::{sse, ConversionError};
 use futures_util::Stream;
@@ -83,11 +84,15 @@ pub fn request_conversion_enabled(
 
 /// Convert a (model-mapped) downstream request body into Chat Completions form using the
 /// provider's per-model capabilities, dispatching on the downstream dialect.
+///
+/// `previous_messages` carries the chat transcript stored for `previous_response_id`
+/// when the downstream request continues a Responses conversation.
 pub fn convert_request_body(
     cfg: &Config,
     provider_name: &str,
     path: &str,
     body: Bytes,
+    previous_messages: Option<&[Value]>,
 ) -> Result<Bytes, RequestConversionRejected> {
     let provider = cfg
         .providers
@@ -114,8 +119,10 @@ pub fn convert_request_body(
     let (converted, report) = match dialect {
         DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
             .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
-        DownstreamApi::OpenAiResponses => convert_responses_request(&json, &caps)
-            .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
+        DownstreamApi::OpenAiResponses => {
+            convert_responses_request(&json, &caps, previous_messages)
+                .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?
+        }
     };
     if !report.dropped_server_tools.is_empty() {
         warn!(
@@ -183,6 +190,51 @@ pub fn response_conversion_enabled(
     forwarded_path: &str,
 ) -> bool {
     request_conversion_enabled(cfg, method, provider_name, forwarded_path)
+}
+
+/// Records the chat transcript for a synthesized Responses response when its stream
+/// (or non-streaming body) finishes, so a later `previous_response_id` can continue it.
+#[derive(Clone)]
+pub struct ResponseRecorder {
+    store: crate::response_state::ResponseStateStore,
+    provider_name: String,
+    model: String,
+    /// The converted request's messages: previous transcript (if any) plus the
+    /// messages produced from the current `input`.
+    request_messages: Vec<Value>,
+}
+
+impl ResponseRecorder {
+    pub fn new(
+        store: crate::response_state::ResponseStateStore,
+        provider_name: impl Into<String>,
+        model: impl Into<String>,
+        request_messages: Vec<Value>,
+    ) -> Self {
+        Self {
+            store,
+            provider_name: provider_name.into(),
+            model: model.into(),
+            request_messages,
+        }
+    }
+
+    /// Store the transcript for `response_id` (appending the assistant turn when present).
+    pub fn record(&self, response_id: &str, assistant_turn: Option<Value>) {
+        let mut messages = self.request_messages.clone();
+        if let Some(turn) = assistant_turn {
+            messages.push(turn);
+        }
+        let now = crate::response_state::now_unix();
+        self.store.put(crate::response_state::ResponseState::new(
+            response_id.to_string(),
+            self.provider_name.clone(),
+            self.model.clone(),
+            messages,
+            now,
+            crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
+        ));
+    }
 }
 
 /// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
@@ -314,6 +366,7 @@ pin_project! {
         #[pin]
         inner: S,
         converter: ResponsesStreamConverter,
+        recorder: Option<ResponseRecorder>,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         finished: bool,
@@ -321,10 +374,13 @@ pin_project! {
 }
 
 impl<S> ChatToResponsesStream<S> {
-    pub fn new(inner: S) -> Self {
+    /// Create the stream with an optional transcript recorder invoked when the
+    /// upstream stream ends.
+    pub fn with_recorder(inner: S, recorder: Option<ResponseRecorder>) -> Self {
         Self {
             inner,
             converter: ResponsesStreamConverter::new(),
+            recorder,
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             finished: false,
@@ -378,6 +434,11 @@ where
                     *this.finished = true;
                     let mut events = Vec::new();
                     this.converter.finish(&mut events);
+                    if let Some(recorder) = &this.recorder {
+                        if let Some(response_id) = this.converter.response_id() {
+                            recorder.record(response_id, this.converter.assistant_turn().cloned());
+                        }
+                    }
                     if events.is_empty() {
                         return Poll::Ready(None);
                     }
@@ -401,6 +462,7 @@ pin_project! {
         inner: S,
         max_bytes: usize,
         path: String,
+        recorder: Option<ResponseRecorder>,
         buffered: BytesMut,
         result: Option<Result<Bytes, std::io::Error>>,
         finished: bool,
@@ -408,11 +470,19 @@ pin_project! {
 }
 
 impl<S> NonStreamingConversionStream<S> {
-    pub fn new(inner: S, max_bytes: usize, path: String) -> Self {
+    /// Create the stream with an optional transcript recorder invoked once the
+    /// whole upstream body has been buffered and converted.
+    pub fn with_recorder(
+        inner: S,
+        max_bytes: usize,
+        path: String,
+        recorder: Option<ResponseRecorder>,
+    ) -> Self {
         Self {
             inner,
             max_bytes,
             path,
+            recorder,
             buffered: BytesMut::new(),
             result: None,
             finished: false,
@@ -455,6 +525,21 @@ where
                 Poll::Ready(None) => {
                     *this.finished = true;
                     let buffered = std::mem::take(this.buffered).freeze();
+                    if let Some(recorder) = &this.recorder {
+                        if let Ok(json) = serde_json::from_slice::<Value>(&buffered) {
+                            let turn = chat_response_assistant_turn(&json);
+                            let converted = convert_non_streaming_body(buffered.clone(), this.path);
+                            if let Ok(converted) = converted {
+                                if let Ok(body) = serde_json::from_slice::<Value>(&converted) {
+                                    if let Some(response_id) =
+                                        body.get("id").and_then(Value::as_str)
+                                    {
+                                        recorder.record(response_id, turn);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     *this.result = Some(convert_non_streaming_body(buffered, this.path));
                     return Poll::Ready(this.result.take());
                 }
