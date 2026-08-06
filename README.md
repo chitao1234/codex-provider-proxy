@@ -248,6 +248,9 @@ parameters are preserved unless they are known source-protocol structural fields
 Ark/Volcengine Responses upstream,
 set `capabilities.ark_style = true` (or the corresponding model override) to opt into request
 normalization; this applies both to native Responses passthrough and to converted Messages requests.
+Responses continuation state stores the neutral transcript together with conversation/user identity,
+provider session keys, metadata, and prompt-cache directives. A continued request inherits these
+values unless it supplies an explicit replacement, so API conversion does not break cache affinity.
 Converted exchanges still record the upstream bytes in exchange logs and statistics; token
 usage extraction already understands Chat Completions shapes.
 

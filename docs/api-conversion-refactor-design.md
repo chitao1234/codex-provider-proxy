@@ -38,6 +38,8 @@ provider selection, retries, and PID routing.
 - tool calls and tool results;
 - tool definitions and tool choice;
 - continuation data;
+- stateful request context (conversation, end-user identity, safety identity, metadata, storage,
+  truncation, include selectors, prompt-cache identity and retention);
 - arbitrary top-level parameters.
 
 Messages, tool calls, and tool definitions retain their original object data in addition to the
@@ -138,6 +140,24 @@ Responses continuation state is scoped to a response chain. `previous_response_i
 the previous transcript and the reasoning associated with that exact response state. It never uses
 provider-global reasoning state.
 
+The stored transcript is `RequestIr`, not Chat Completions messages. A continued request inherits
+stateful context from that IR when the new request does not override it. This includes:
+
+- OpenAI `conversation` and `previous_response_id` chain semantics;
+- OpenAI `user` / `safety_identifier` and Anthropic `metadata.user_id` identity mapping;
+- `metadata` and recognized provider session identifiers such as `session_id`;
+- `prompt_cache_key`, `prompt_cache_retention`, and Anthropic `cache_control` directives;
+- Responses `store`, `include`, and `truncation` state-affecting options.
+
+Nested cache directives remain attached to their semantic instruction, content, or tool objects.
+Unknown provider-specific identity/cache fields remain in the lossless extension data. Provider
+normalizers may add explicit spellings later, but a missing mapping must not make parsing fail or
+erase the field from continuation state.
+
+`previous_response_id` itself is not blindly forwarded during cross-protocol rendering because a
+proxy-synthesized response id is meaningful only to the proxy's local state store. The restored
+transcript and context are rendered instead.
+
 ## Validation Requirements
 
 Changes to the conversion layer must keep these checks passing:
@@ -145,6 +165,7 @@ Changes to the conversion layer must keep these checks passing:
 - all configured protocol pairs resolve to one request and response plan;
 - unknown top-level parameters survive each cross-protocol route;
 - tool-call identifiers remain correlated with tool results;
+- conversation, user, session, and prompt-cache identifiers survive conversion and continuation;
 - exact-limit request buffering succeeds and over-limit buffering returns 413;
 - retries re-resolve the conversion plan with the selected provider;
 - Ark normalization works for native and converted Responses requests;

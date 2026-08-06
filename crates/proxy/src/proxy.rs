@@ -1502,17 +1502,6 @@ fn maybe_convert_request_body(
     } else {
         None
     };
-    let previous_messages = previous_state.as_ref().and_then(|previous| {
-        previous
-            .request_ir
-            .render(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
-                &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
-            )
-            .ok()
-            .and_then(|value| value.get("messages").cloned())
-            .and_then(|value| value.as_array().cloned())
-    });
     let last_reasoning = previous_state
         .as_ref()
         .and_then(|previous| previous.last_reasoning.as_deref());
@@ -1527,7 +1516,7 @@ fn maybe_convert_request_body(
             codex_provider_proxy_api_conversion::request_ir::RequestIr::parse_with_context(
                 codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                 &value,
-                previous_messages.as_deref(),
+                previous_state.as_ref().map(|previous| &previous.request_ir),
                 last_reasoning,
             )
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
@@ -1540,7 +1529,7 @@ fn maybe_convert_request_body(
         &attempt.provider_name,
         forwarded_path,
         body,
-        previous_messages.as_deref(),
+        previous_state.as_ref().map(|previous| &previous.request_ir),
         last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
@@ -5083,6 +5072,9 @@ mod tests {
         let req = responses_request(json!({
             "model": "m",
             "input": "hi",
+            "user": "user-42",
+            "prompt_cache_key": "conversation-cache-7",
+            "session_id": "provider-session-9",
             "stream": false
         }));
         let resp = handle_proxy_inner(state.clone(), "127.0.0.1:50021".parse().unwrap(), req)
@@ -5128,6 +5120,9 @@ mod tests {
         assert_eq!(messages[1]["content"], "hello");
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "how are you?");
+        assert_eq!(second["user"], "user-42");
+        assert_eq!(second["prompt_cache_key"], "conversation-cache-7");
+        assert_eq!(second["session_id"], "provider-session-9");
         let _ = shutdown_tx.send(());
     }
 

@@ -32,6 +32,28 @@ pub struct RequestIr {
     pub tool_choice: Option<Value>,
     pub parameters: BTreeMap<String, Value>,
     pub continuation: BTreeMap<String, Value>,
+    pub context: RequestContext,
+}
+
+/// Stateful request context shared by protocols and provider dialects.
+///
+/// These fields affect conversation affinity, abuse attribution, or prompt-cache reuse. They are
+/// modeled separately from sampling parameters so continuation can inherit them intentionally.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestContext {
+    pub previous_response_id: Option<String>,
+    pub conversation: Option<Value>,
+    pub end_user_id: Option<String>,
+    pub safety_identifier: Option<String>,
+    pub metadata: Option<Value>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<Value>,
+    pub cache_control: Option<Value>,
+    pub store: Option<Value>,
+    pub include: Option<Value>,
+    pub truncation: Option<Value>,
+    /// Provider-specific identity/session/cache keys that have no portable spelling yet.
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +129,7 @@ impl RequestIr {
             tool_choice: None,
             parameters: BTreeMap::new(),
             continuation: BTreeMap::new(),
+            context: RequestContext::default(),
         };
 
         match protocol {
@@ -114,6 +137,7 @@ impl RequestIr {
             Protocol::OpenAiChatCompletions => ir.parse_chat(),
             Protocol::OpenAiResponses => ir.parse_responses(),
         }
+        ir.parse_context();
         ir.collect_parameters();
         Ok(ir)
     }
@@ -121,17 +145,19 @@ impl RequestIr {
     pub fn parse_with_context(
         protocol: Protocol,
         body: &Value,
-        previous_messages: Option<&[Value]>,
+        previous_request: Option<&RequestIr>,
         last_reasoning: Option<&str>,
     ) -> Result<Self, ConversionError> {
         let mut ir = Self::parse(protocol, body)?;
         if protocol == Protocol::OpenAiResponses {
-            if let Some(previous_messages) = previous_messages {
-                let previous = serde_json::json!({"messages": previous_messages});
-                let previous_ir = Self::parse(Protocol::OpenAiChatCompletions, &previous)?;
-                let mut messages = previous_ir.messages;
+            if let Some(previous_request) = previous_request {
+                let mut messages = previous_request.messages.clone();
                 messages.extend(ir.messages);
                 ir.messages = messages;
+                if ir.reasoning.is_empty() {
+                    ir.reasoning = previous_request.reasoning.clone();
+                }
+                ir.inherit_context(&previous_request.context);
             }
             if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
                 if ir.reasoning.is_empty() {
@@ -143,6 +169,97 @@ impl RequestIr {
             }
         }
         Ok(ir)
+    }
+
+    fn parse_context(&mut self) {
+        self.context.previous_response_id = self
+            .original
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.context.conversation = self.original.get("conversation").cloned();
+        self.context.metadata = self.original.get("metadata").cloned();
+        self.context.end_user_id = self
+            .original
+            .get("user")
+            .or_else(|| self.original.get("user_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.original
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("user_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        self.context.safety_identifier = self
+            .original
+            .get("safety_identifier")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.context.prompt_cache_key = self
+            .original
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.context.prompt_cache_retention = self.original.get("prompt_cache_retention").cloned();
+        self.context.cache_control = self.original.get("cache_control").cloned();
+        self.context.store = self.original.get("store").cloned();
+        self.context.include = self.original.get("include").cloned();
+        self.context.truncation = self.original.get("truncation").cloned();
+
+        for key in [
+            "session_id",
+            "conversation_id",
+            "cache_key",
+            "request_cache_key",
+            "tenant_id",
+            "project_id",
+        ] {
+            if let Some(value) = self.original.get(key) {
+                self.context
+                    .extensions
+                    .insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+
+    fn inherit_context(&mut self, previous: &RequestContext) {
+        if self.context.conversation.is_none() {
+            self.context.conversation.clone_from(&previous.conversation);
+        }
+        if self.context.end_user_id.is_none() {
+            self.context.end_user_id.clone_from(&previous.end_user_id);
+        }
+        if self.context.safety_identifier.is_none() {
+            self.context
+                .safety_identifier
+                .clone_from(&previous.safety_identifier);
+        }
+        if self.context.metadata.is_none() {
+            self.context.metadata.clone_from(&previous.metadata);
+        }
+        if self.context.prompt_cache_key.is_none() {
+            self.context
+                .prompt_cache_key
+                .clone_from(&previous.prompt_cache_key);
+        }
+        if self.context.prompt_cache_retention.is_none() {
+            self.context
+                .prompt_cache_retention
+                .clone_from(&previous.prompt_cache_retention);
+        }
+        if self.context.cache_control.is_none() {
+            self.context
+                .cache_control
+                .clone_from(&previous.cache_control);
+        }
+        self.context.extensions = previous
+            .extensions
+            .iter()
+            .chain(&self.context.extensions)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
     }
 
     pub fn append_chat_assistant_turn(&mut self, turn: &Value) {
@@ -342,7 +459,7 @@ impl RequestIr {
         previous_messages: Option<&[Value]>,
         last_reasoning: Option<&str>,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        match self.protocol {
+        let (mut rendered, report) = match self.protocol {
             Protocol::AnthropicMessages => crate::messages_to_chat::convert_messages_request(
                 &Value::Object(self.original.clone()),
                 caps,
@@ -357,7 +474,11 @@ impl RequestIr {
                 Value::Object(self.original.clone()),
                 RequestConversionReport::default(),
             )),
+        }?;
+        if let Some(object) = rendered.as_object_mut() {
+            self.apply_context(Protocol::OpenAiChatCompletions, object);
         }
+        Ok((rendered, report))
     }
 
     fn base_output(&self, target: Protocol) -> Map<String, Value> {
@@ -393,6 +514,7 @@ impl RequestIr {
 
     fn render_chat(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
         let mut out = self.base_output(Protocol::OpenAiChatCompletions);
+        self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
         let mut messages = Vec::new();
         for instruction in &self.instructions {
             if let Some(text) = instruction.as_str() {
@@ -418,6 +540,7 @@ impl RequestIr {
 
     fn render_messages(&self, _caps: &ModelCapabilities) -> Result<Value, ConversionError> {
         let mut out = self.base_output(Protocol::AnthropicMessages);
+        self.apply_context(Protocol::AnthropicMessages, &mut out);
         if let Some(value) = out.remove("max_completion_tokens") {
             out.insert("max_tokens".to_owned(), value);
         }
@@ -469,6 +592,7 @@ impl RequestIr {
 
     fn render_responses(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
         let mut out = self.base_output(Protocol::OpenAiResponses);
+        self.apply_context(Protocol::OpenAiResponses, &mut out);
         if !self.instructions.is_empty() {
             out.insert(
                 "instructions".to_owned(),
@@ -497,6 +621,72 @@ impl RequestIr {
         }
         normalize_responses_parameters(&mut out, caps);
         Ok(Value::Object(out))
+    }
+
+    fn apply_context(&self, target: Protocol, out: &mut Map<String, Value>) {
+        for (key, value) in &self.context.extensions {
+            out.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        if let Some(metadata) = &self.context.metadata {
+            out.entry("metadata".to_owned())
+                .or_insert_with(|| metadata.clone());
+        }
+        if let Some(cache_control) = &self.context.cache_control {
+            out.entry("cache_control".to_owned())
+                .or_insert_with(|| cache_control.clone());
+        }
+        if let Some(conversation) = &self.context.conversation {
+            out.entry("conversation".to_owned())
+                .or_insert_with(|| conversation.clone());
+        }
+        if let Some(identifier) = &self.context.safety_identifier {
+            out.entry("safety_identifier".to_owned())
+                .or_insert_with(|| Value::String(identifier.clone()));
+        }
+        if let Some(key) = &self.context.prompt_cache_key {
+            out.entry("prompt_cache_key".to_owned())
+                .or_insert_with(|| Value::String(key.clone()));
+        }
+        if let Some(retention) = &self.context.prompt_cache_retention {
+            out.entry("prompt_cache_retention".to_owned())
+                .or_insert_with(|| retention.clone());
+        }
+        for (key, value) in [
+            ("store", self.context.store.as_ref()),
+            ("include", self.context.include.as_ref()),
+            ("truncation", self.context.truncation.as_ref()),
+        ] {
+            if let Some(value) = value {
+                out.entry(key.to_owned()).or_insert_with(|| value.clone());
+            }
+        }
+
+        match target {
+            Protocol::AnthropicMessages => {
+                if let Some(user_id) = &self.context.end_user_id {
+                    let metadata = out
+                        .entry("metadata".to_owned())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if let Some(metadata) = metadata.as_object_mut() {
+                        metadata
+                            .entry("user_id".to_owned())
+                            .or_insert_with(|| Value::String(user_id.clone()));
+                    }
+                }
+            }
+            Protocol::OpenAiChatCompletions => {
+                if let Some(user_id) = &self.context.end_user_id {
+                    out.entry("user".to_owned())
+                        .or_insert_with(|| Value::String(user_id.clone()));
+                }
+            }
+            Protocol::OpenAiResponses => {
+                if let Some(user_id) = &self.context.end_user_id {
+                    out.entry("user".to_owned())
+                        .or_insert_with(|| Value::String(user_id.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -1053,7 +1243,11 @@ mod tests {
             ],
             "provider_budget": 9
         });
-        let previous = vec![json!({"role":"user","content":"earlier"})];
+        let previous = RequestIr::parse(
+            Protocol::OpenAiChatCompletions,
+            &json!({"messages":[{"role":"user","content":"earlier"}]}),
+        )
+        .unwrap();
         let ir = RequestIr::parse_with_context(
             Protocol::OpenAiResponses,
             &request,
@@ -1093,5 +1287,67 @@ mod tests {
                     .as_array()
                     .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "text"))
             }));
+    }
+
+    #[test]
+    fn maps_user_identity_and_preserves_cache_affinity() {
+        let request = json!({
+            "model": "m",
+            "metadata": {"user_id": "user-42", "client": "codex"},
+            "cache_control": {"type": "ephemeral"},
+            "session_id": "session-7",
+            "messages": [{"role":"user", "content":"hello"}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+
+        assert_eq!(responses["user"], "user-42");
+        assert_eq!(responses["metadata"]["client"], "codex");
+        assert_eq!(responses["cache_control"]["type"], "ephemeral");
+        assert_eq!(responses["session_id"], "session-7");
+    }
+
+    #[test]
+    fn continuation_inherits_conversation_and_prompt_cache_context() {
+        let previous = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "input": "first",
+                "conversation": {"id": "conv-1"},
+                "user": "user-1",
+                "safety_identifier": "safe-1",
+                "prompt_cache_key": "cache-1",
+                "prompt_cache_retention": "24h",
+                "metadata": {"trace": "root"},
+                "session_id": "vendor-session-1"
+            }),
+        )
+        .unwrap();
+        let continued = RequestIr::parse_with_context(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "previous_response_id": "resp-1",
+                "input": "second"
+            }),
+            Some(&previous),
+            None,
+        )
+        .unwrap();
+        let messages = continued
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+
+        assert_eq!(messages["metadata"]["user_id"], "user-1");
+        assert_eq!(messages["metadata"]["trace"], "root");
+        assert_eq!(messages["conversation"]["id"], "conv-1");
+        assert_eq!(messages["safety_identifier"], "safe-1");
+        assert_eq!(messages["prompt_cache_key"], "cache-1");
+        assert_eq!(messages["prompt_cache_retention"], "24h");
+        assert_eq!(messages["session_id"], "vendor-session-1");
+        assert!(messages.get("previous_response_id").is_none());
     }
 }

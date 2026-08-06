@@ -246,7 +246,7 @@ pub fn request_conversion_enabled(
 /// Convert a (model-mapped) downstream request body into Chat Completions form using the
 /// provider's per-model capabilities, dispatching on the downstream dialect.
 ///
-/// `previous_messages` carries the chat transcript stored for `previous_response_id`
+/// `previous_request` carries the protocol-neutral transcript stored for `previous_response_id`
 /// when the downstream request continues a Responses conversation. `last_reasoning`
 /// carries the most recent upstream reasoning, reattached when the client echoes an
 /// empty reasoning item (Codex sends `{"summary": []}`) — required by MiMo/DeepSeek
@@ -256,7 +256,7 @@ pub fn convert_request_body(
     provider_name: &str,
     path: &str,
     body: Bytes,
-    previous_messages: Option<&[Value]>,
+    previous_request: Option<&RequestIr>,
     last_reasoning: Option<&str>,
 ) -> Result<Bytes, RequestConversionRejected> {
     let provider = cfg
@@ -280,6 +280,16 @@ pub fn convert_request_body(
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
+    let previous_messages = previous_request.and_then(|request| {
+        request
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .ok()
+            .and_then(|value| value.get("messages").cloned())
+            .and_then(|value| value.as_array().cloned())
+    });
     let plan = resolve_conversion_plan(provider, &Method::POST, path)
         .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
         .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
@@ -291,7 +301,7 @@ pub fn convert_request_body(
         RequestAction::Transform(pipeline) => {
             let source = pipeline.parser.protocol();
             let request = if source == Protocol::OpenAiResponses {
-                RequestIr::parse_with_context(source, &json, previous_messages, last_reasoning)
+                RequestIr::parse_with_context(source, &json, previous_request, last_reasoning)
             } else {
                 RequestIr::parse(source, &json)
             }
@@ -300,7 +310,11 @@ pub fn convert_request_body(
             })?;
             if pipeline.renderer == RequestRendererKind::OpenAIChatCompletions {
                 request
-                    .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
+                    .render_chat_with_capabilities(
+                        &caps,
+                        previous_messages.as_deref(),
+                        last_reasoning,
+                    )
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?
