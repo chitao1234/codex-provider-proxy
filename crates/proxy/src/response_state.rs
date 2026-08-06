@@ -61,6 +61,9 @@ pub struct ResponseStateStore {
 
 struct StoreInner {
     states: HashMap<String, ResponseState>,
+    /// Last upstream reasoning per provider, reattached on the next request when the
+    /// client echoes an empty reasoning item (Codex sends `{"summary": []}`).
+    last_reasoning: HashMap<String, String>,
     max_entries: usize,
 }
 
@@ -69,9 +72,28 @@ impl ResponseStateStore {
         Self {
             inner: Arc::new(Mutex::new(StoreInner {
                 states: HashMap::new(),
+                last_reasoning: HashMap::new(),
                 max_entries,
             })),
         }
+    }
+
+    /// Remember the last upstream reasoning for a provider (for reattachment).
+    pub fn set_last_reasoning(&self, provider_name: &str, reasoning: String) {
+        let mut inner = self.inner.lock().expect("response state mutex poisoned");
+        inner
+            .last_reasoning
+            .insert(provider_name.to_string(), reasoning);
+    }
+
+    /// The last upstream reasoning remembered for a provider.
+    pub fn last_reasoning(&self, provider_name: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("response state mutex poisoned")
+            .last_reasoning
+            .get(provider_name)
+            .cloned()
     }
 
     /// Store a transcript for `response_id` (replacing any existing entry).

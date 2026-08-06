@@ -86,13 +86,17 @@ pub fn request_conversion_enabled(
 /// provider's per-model capabilities, dispatching on the downstream dialect.
 ///
 /// `previous_messages` carries the chat transcript stored for `previous_response_id`
-/// when the downstream request continues a Responses conversation.
+/// when the downstream request continues a Responses conversation. `last_reasoning`
+/// carries the most recent upstream reasoning, reattached when the client echoes an
+/// empty reasoning item (Codex sends `{"summary": []}`) — required by MiMo/DeepSeek
+/// on tool-call turns, else 400.
 pub fn convert_request_body(
     cfg: &Config,
     provider_name: &str,
     path: &str,
     body: Bytes,
     previous_messages: Option<&[Value]>,
+    last_reasoning: Option<&str>,
 ) -> Result<Bytes, RequestConversionRejected> {
     let provider = cfg
         .providers
@@ -120,7 +124,7 @@ pub fn convert_request_body(
         DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
             .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
         DownstreamApi::OpenAiResponses => {
-            convert_responses_request(&json, &caps, previous_messages)
+            convert_responses_request(&json, &caps, previous_messages, last_reasoning)
                 .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?
         }
     };
@@ -201,6 +205,9 @@ pub fn response_conversion_enabled(
 
 /// Records the chat transcript for a synthesized Responses response when its stream
 /// (or non-streaming body) finishes, so a later `previous_response_id` can continue it.
+/// Also remembers the last upstream reasoning so a subsequent request whose client
+/// echoes an empty reasoning item (Codex sends `{"summary": []}`) can reattach the
+/// full reasoning_content — required by MiMo/DeepSeek on tool-call turns, else 400.
 #[derive(Clone)]
 pub struct ResponseRecorder {
     store: crate::response_state::ResponseStateStore,
@@ -226,8 +233,22 @@ impl ResponseRecorder {
         }
     }
 
-    /// Store the transcript for `response_id` (appending the assistant turn when present).
+    /// The last upstream reasoning for this provider, for reattaching on the next turn.
+    pub fn last_reasoning(&self) -> Option<String> {
+        self.store.last_reasoning(&self.provider_name)
+    }
+
+    /// Store the transcript for `response_id` (appending the assistant turn when present)
+    /// and remember the turn's reasoning for the next request.
     pub fn record(&self, response_id: &str, assistant_turn: Option<Value>) {
+        if let Some(turn) = &assistant_turn {
+            if let Some(reasoning) = turn.get("reasoning_content").and_then(Value::as_str) {
+                if !reasoning.trim().is_empty() {
+                    self.store
+                        .set_last_reasoning(&self.provider_name, reasoning.to_string());
+                }
+            }
+        }
         let mut messages = self.request_messages.clone();
         if let Some(turn) = assistant_turn {
             messages.push(turn);

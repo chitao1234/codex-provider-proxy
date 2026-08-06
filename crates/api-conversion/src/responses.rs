@@ -30,6 +30,7 @@ pub fn convert_responses_request(
     body: &Value,
     caps: &ModelCapabilities,
     previous_messages: Option<&[Value]>,
+    last_reasoning: Option<&str>,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
     let Some(request) = body.as_object() else {
         return Err(ConversionError::invalid(
@@ -68,7 +69,7 @@ pub fn convert_responses_request(
     convert_tool_choice(request, &mut out);
 
     let instructions = request.get("instructions").and_then(Value::as_str);
-    let messages = expand_input(request.get("input"), caps)?;
+    let messages = expand_input(request.get("input"), caps, last_reasoning)?;
     let (tools, mut report) = convert_tools(request.get("tools"), caps)?;
 
     // Force-enable configured server tools even when the client did not declare them
@@ -313,6 +314,7 @@ fn convert_tool_choice(request: &Map<String, Value>, out: &mut Map<String, Value
 fn expand_input(
     input: Option<&Value>,
     caps: &ModelCapabilities,
+    last_reasoning: Option<&str>,
 ) -> Result<Vec<Value>, ConversionError> {
     let Some(input) = input else {
         return Ok(Vec::new());
@@ -456,8 +458,9 @@ fn expand_input(
                                     .and_then(Value::as_str)
                                     .map(str::to_owned)
                             })
-                            .unwrap_or_default();
-                        if !reasoning.trim().is_empty() {
+                            .filter(|text| !text.trim().is_empty())
+                            .or_else(|| last_reasoning.map(str::to_owned));
+                        if let Some(reasoning) = reasoning {
                             pending_reasoning = Some(reasoning);
                         }
                     }
@@ -892,6 +895,7 @@ pub struct ResponsesStreamConverter {
     output_index: usize,
     sequence_number: u64,
     reasoning_item: Option<usize>,
+    reasoning_text: String,
     message_item: Option<usize>,
     message_text: String,
     function_calls: HashMap<usize, FunctionCallState>,
@@ -915,6 +919,7 @@ impl ResponsesStreamConverter {
             output_index: 0,
             sequence_number: 0,
             reasoning_item: None,
+            reasoning_text: String::new(),
             message_item: None,
             message_text: String::new(),
             function_calls: HashMap::new(),
@@ -1041,6 +1046,7 @@ impl ResponsesStreamConverter {
     fn process_delta(&mut self, delta: &Value, out: &mut Vec<Bytes>) {
         if let Some(reasoning) = delta_string(delta, "reasoning_content") {
             self.ensure_reasoning_item(out);
+            self.reasoning_text.push_str(reasoning);
             let index = self.reasoning_item.unwrap_or(0);
             self.emit(
                 "response.reasoning_text.delta",
@@ -1219,6 +1225,7 @@ impl ResponsesStreamConverter {
         }
         // Build the assistant chat turn for transcript storage as items close.
         let mut assistant = json!({"role": "assistant", "content": ""});
+        let reasoning_text = std::mem::take(&mut self.reasoning_text);
         let mut tool_calls: Vec<Value> = Vec::new();
         if let Some(index) = self.message_item.take() {
             let text = std::mem::take(&mut self.message_text);
@@ -1234,6 +1241,11 @@ impl ResponsesStreamConverter {
                     "content": [{"type": "output_text", "text": text, "annotations": []}],
                 },
             }));
+        }
+        // Carry the upstream reasoning so a later turn can reattach it as
+        // reasoning_content (MiMo requires it on tool-call turns, else 400).
+        if !reasoning_text.trim().is_empty() {
+            assistant["reasoning_content"] = json!(reasoning_text);
         }
         // Function call items: close each with the accumulated arguments
         // (function_call_arguments.done), then emit the completed item carrying
@@ -1326,7 +1338,7 @@ mod tests {
             "stream": true,
             "instructions": "You are helpful"
         });
-        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None, None).unwrap();
         assert_eq!(out["model"], "gpt-5.6");
         assert_eq!(out["max_tokens"], 100);
         assert_eq!(out["messages"][0]["role"], "system");
@@ -1341,7 +1353,7 @@ mod tests {
         let mut caps = caps();
         caps.max_tokens_field = crate::dialect::MaxTokensField::MaxCompletionTokens;
         let body = json!({"model": "m", "max_output_tokens": 1000, "input": "hi"});
-        let (out, _) = convert_responses_request(&body, &caps, None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
         assert_eq!(out["max_completion_tokens"], 1000);
     }
 
@@ -1357,7 +1369,7 @@ mod tests {
                 {"type": "message", "role": "user", "content": "thanks"}
             ]
         });
-        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None, None).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "user");
@@ -1389,7 +1401,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
             ]
         });
-        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None, None).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         // The assistant message carries the echoed reasoning as reasoning_content.
@@ -1416,10 +1428,28 @@ mod tests {
                 {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
             ]
         });
-        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), None, None).unwrap();
         let assistant = &out["messages"].as_array().unwrap()[0];
         assert_eq!(assistant["role"], "assistant");
         assert_eq!(assistant["reasoning_content"], "Think first");
+        assert_eq!(assistant["tool_calls"][0]["id"], "c1");
+    }
+
+    #[test]
+    fn reattaches_last_reasoning_when_client_echoes_empty() {
+        // Codex echoes reasoning as `{"summary": []}` (empty); the converter must
+        // fall back to the remembered upstream reasoning.
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "reasoning", "summary": [], "content": null},
+                {"type": "function_call", "call_id": "c1", "name": "exec_command", "arguments": "{}"}
+            ]
+        });
+        let (out, _) =
+            convert_responses_request(&body, &caps(), None, Some("remembered thinking")).unwrap();
+        let assistant = &out["messages"].as_array().unwrap()[0];
+        assert_eq!(assistant["reasoning_content"], "remembered thinking");
         assert_eq!(assistant["tool_calls"][0]["id"], "c1");
     }
 
@@ -1438,7 +1468,7 @@ mod tests {
             "reasoning": {"effort": "xhigh"},
             "text": {"format": {"type": "json_object"}}
         });
-        let (out, _) = convert_responses_request(&body, &caps, None).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
         assert_eq!(out["thinking"]["type"], "enabled");
         assert_eq!(out["reasoning_effort"], "high");
         assert_eq!(out["response_format"]["type"], "json_object");
@@ -1459,7 +1489,7 @@ mod tests {
             "stream": false,
             "tools": [{"type": "web_search_preview"}]
         });
-        let (out, report) = convert_responses_request(&body, &caps, None).unwrap();
+        let (out, report) = convert_responses_request(&body, &caps, None, None).unwrap();
         assert_eq!(out["web_search"]["enable"], true);
         assert!(out["web_search"]["search_query"]
             .as_str()
@@ -1480,7 +1510,7 @@ mod tests {
             "input": "hi",
             "tools": [{"type": "web_search_preview"}, {"type": "file_search"}]
         });
-        let (out, report) = convert_responses_request(&body, &caps(), None).unwrap();
+        let (out, report) = convert_responses_request(&body, &caps(), None, None).unwrap();
         assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
         assert_eq!(
             report.dropped_server_tools,
@@ -1501,7 +1531,7 @@ mod tests {
             json!({"role": "user", "content": "weather in Paris?"}),
             json!({"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]}),
         ];
-        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous)).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous), None).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "user");
@@ -1518,7 +1548,7 @@ mod tests {
     fn prepends_previous_after_instructions() {
         let body = json!({"model": "m", "input": "hi", "instructions": "You are helpful"});
         let previous = vec![json!({"role": "user", "content": "earlier"})];
-        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous)).unwrap();
+        let (out, _) = convert_responses_request(&body, &caps(), Some(&previous), None).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
