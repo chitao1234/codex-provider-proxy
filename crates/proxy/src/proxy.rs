@@ -3784,7 +3784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_compressed_downstream_response_and_decodes_exchange_reconstruction() {
+    async fn decompresses_upstream_encoding_and_decodes_exchange_reconstruction() {
         let (url, shutdown_tx) = spawn_compressed_response_server().await;
         let mut providers = HashMap::new();
         providers.insert(
@@ -3820,14 +3820,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
-            "zstd"
-        );
+        // reqwest auto-decompresses zstd upstream bodies (and drops Content-Encoding),
+        // so the downstream sees the decoded body with no encoding header.
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
         let downstream_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let decoded_downstream = zstd::stream::decode_all(downstream_body.as_ref()).unwrap();
         assert_eq!(
-            decoded_downstream,
+            downstream_body.as_ref(),
             br#"{"error":{"message":"decoded upstream response"},"type":"error"}"#
         );
 

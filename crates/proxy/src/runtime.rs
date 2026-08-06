@@ -56,10 +56,18 @@ impl ConfigOverrides {
 }
 
 pub fn build_http_client(config: &Config) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().user_agent(format!(
-        "codex-provider-proxy/{}",
-        env!("CARGO_PKG_VERSION")
-    ));
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!(
+            "codex-provider-proxy/{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        // Auto-decompress upstream responses (MiniMax returns brotli-encoded bodies;
+        // DeepSeek/qwen may gzip). Without this the converter would receive raw
+        // compressed bytes and fail to parse the JSON/SSE.
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
+        .zstd(true);
     if let Some(timeout) = config.upstream_connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
