@@ -672,7 +672,7 @@ mod tests {
 
         assert_eq!(
             config.providers["provider_a"].accept_downstream_apis,
-            vec![DownstreamApi::OpenAIResponses]
+            vec![DownstreamApi::OpenAiResponses]
         );
     }
 

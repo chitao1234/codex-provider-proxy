@@ -23,7 +23,7 @@ pub enum UpstreamApi {
     /// OpenAI Responses (`POST /v1/responses`), possibly a third-party implementation
     /// with deviations (Qwen reasoning_summary_text, DeepSeek/MiniMax id prefixes).
     #[serde(rename = "openai_responses")]
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 /// API dialects a downstream client may speak that this proxy converts from.
@@ -34,7 +34,7 @@ pub enum DownstreamApi {
     AnthropicMessages,
     /// OpenAI Responses API (`POST /v1/responses`), e.g. Codex CLI.
     #[serde(rename = "openai_responses", alias = "openai_responses")]
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 /// Which output-token field the upstream expects.

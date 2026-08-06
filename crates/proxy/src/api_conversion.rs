@@ -43,31 +43,31 @@ const RESPONSES_PATH: &str = "responses";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestParserKind {
     AnthropicMessages,
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 impl RequestParserKind {
     fn protocol(self) -> Protocol {
         match self {
             Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAIResponses => Protocol::OpenAiResponses,
+            Self::OpenAiResponses => Protocol::OpenAiResponses,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRendererKind {
-    OpenAIChatCompletions,
+    OpenAiChatCompletions,
     AnthropicMessages,
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 impl RequestRendererKind {
     fn protocol(self) -> Protocol {
         match self {
-            Self::OpenAIChatCompletions => Protocol::OpenAiChatCompletions,
+            Self::OpenAiChatCompletions => Protocol::OpenAiChatCompletions,
             Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAIResponses => Protocol::OpenAiResponses,
+            Self::OpenAiResponses => Protocol::OpenAiResponses,
         }
     }
 }
@@ -93,15 +93,15 @@ pub enum RequestAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseParserKind {
-    OpenAIChatCompletions,
+    OpenAiChatCompletions,
     AnthropicMessages,
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseRendererKind {
     AnthropicMessages,
-    OpenAIResponses,
+    OpenAiResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ pub struct UnsupportedConversion {
 pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
     match path.trim_matches('/').rsplit('/').next() {
         Some(MESSAGES_PATH) => Some(DownstreamApi::AnthropicMessages),
-        Some(RESPONSES_PATH) => Some(DownstreamApi::OpenAIResponses),
+        Some(RESPONSES_PATH) => Some(DownstreamApi::OpenAiResponses),
         _ => None,
     }
 }
@@ -154,16 +154,16 @@ pub fn resolve_conversion_plan(
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::AnthropicMessages,
-                renderer: RequestRendererKind::OpenAIChatCompletions,
+                renderer: RequestRendererKind::OpenAiChatCompletions,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
-        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAIResponses) => ConversionPlan {
+        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAiResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::OpenAIResponses,
-                renderer: RequestRendererKind::OpenAIChatCompletions,
+                parser: RequestParserKind::OpenAiResponses,
+                renderer: RequestRendererKind::OpenAiChatCompletions,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -173,16 +173,16 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Passthrough { normalizer: None },
             response: response_pipeline(provider.upstream_api, downstream),
         },
-        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAIResponses) => ConversionPlan {
+        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAiResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::OpenAIResponses,
+                parser: RequestParserKind::OpenAiResponses,
                 renderer: RequestRendererKind::AnthropicMessages,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
-        (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => ConversionPlan {
+        (UpstreamApi::OpenAiResponses, DownstreamApi::OpenAiResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Passthrough {
@@ -190,12 +190,12 @@ pub fn resolve_conversion_plan(
             },
             response: response_pipeline(provider.upstream_api, downstream),
         },
-        (UpstreamApi::OpenAIResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
+        (UpstreamApi::OpenAiResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::AnthropicMessages,
-                renderer: RequestRendererKind::OpenAIResponses,
+                renderer: RequestRendererKind::OpenAiResponses,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -226,7 +226,7 @@ pub fn conversion_upstream_path<'a>(
     match provider.upstream_api {
         UpstreamApi::OpenAiChatCompletions => std::borrow::Cow::Borrowed(CHAT_COMPLETIONS_PATH),
         UpstreamApi::AnthropicMessages => std::borrow::Cow::Borrowed(MESSAGES_UPSTREAM_PATH),
-        UpstreamApi::OpenAIResponses => std::borrow::Cow::Borrowed(RESPONSES_UPSTREAM_PATH),
+        UpstreamApi::OpenAiResponses => std::borrow::Cow::Borrowed(RESPONSES_UPSTREAM_PATH),
         UpstreamApi::Passthrough => std::borrow::Cow::Borrowed(forwarded_path),
     }
 }
@@ -308,7 +308,7 @@ pub fn convert_request_body(
             .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            if pipeline.renderer == RequestRendererKind::OpenAIChatCompletions {
+            if pipeline.renderer == RequestRendererKind::OpenAiChatCompletions {
                 request
                     .render_chat_with_capabilities(
                         &caps,
@@ -329,7 +329,7 @@ pub fn convert_request_body(
         }
     };
     let mut converted = converted;
-    if provider.upstream_api == UpstreamApi::OpenAIResponses && caps.ark_style {
+    if provider.upstream_api == UpstreamApi::OpenAiResponses && caps.ark_style {
         if let Some(object) = converted.as_object_mut() {
             codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
         }
@@ -367,7 +367,7 @@ impl RequestConversionRejected {
         Self {
             error_body: match dialect {
                 DownstreamApi::AnthropicMessages => err.to_anthropic_error_body(),
-                DownstreamApi::OpenAIResponses => err.to_openai_error_body(),
+                DownstreamApi::OpenAiResponses => err.to_openai_error_body(),
             },
         }
     }
@@ -375,7 +375,7 @@ impl RequestConversionRejected {
     pub(crate) fn openai_invalid(message: impl Into<String>) -> Self {
         Self::from_conversion_error(
             ConversionError::invalid(message),
-            DownstreamApi::OpenAIResponses,
+            DownstreamApi::OpenAiResponses,
         )
     }
 
@@ -458,7 +458,7 @@ impl ResponseRecorder {
 pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value {
     match downstream_api_for_path(path) {
         Some(DownstreamApi::AnthropicMessages) => convert_chat_error_body(status, body),
-        Some(DownstreamApi::OpenAIResponses) => body.clone(),
+        Some(DownstreamApi::OpenAiResponses) => body.clone(),
         None => body.clone(),
     }
 }
@@ -488,22 +488,22 @@ pub fn convert_non_streaming_body_with_pipeline(
         )
     })?;
     let converted = match (pipeline.parser, pipeline.renderer) {
-        (ResponseParserKind::OpenAIChatCompletions, ResponseRendererKind::AnthropicMessages) => {
+        (ResponseParserKind::OpenAiChatCompletions, ResponseRendererKind::AnthropicMessages) => {
             convert_chat_response(&json)
         }
-        (ResponseParserKind::OpenAIChatCompletions, ResponseRendererKind::OpenAIResponses) => {
+        (ResponseParserKind::OpenAiChatCompletions, ResponseRendererKind::OpenAiResponses) => {
             convert_chat_response_to_responses(&json)
         }
         (ResponseParserKind::AnthropicMessages, ResponseRendererKind::AnthropicMessages) => {
             return Ok(body);
         }
-        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::OpenAIResponses) => {
+        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::OpenAiResponses) => {
             codex_provider_proxy_api_conversion::responses_renderer::convert_messages_response_to_responses(&json)
         }
-        (ResponseParserKind::OpenAIResponses, ResponseRendererKind::AnthropicMessages) => {
+        (ResponseParserKind::OpenAiResponses, ResponseRendererKind::AnthropicMessages) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_messages(&json)
         }
-        (ResponseParserKind::OpenAIResponses, ResponseRendererKind::OpenAIResponses) => {
+        (ResponseParserKind::OpenAiResponses, ResponseRendererKind::OpenAiResponses) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_responses(&json)
         }
     }
@@ -522,14 +522,14 @@ pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> Re
     ResponsePipeline {
         parser: match upstream {
             UpstreamApi::AnthropicMessages => ResponseParserKind::AnthropicMessages,
-            UpstreamApi::OpenAIResponses => ResponseParserKind::OpenAIResponses,
+            UpstreamApi::OpenAiResponses => ResponseParserKind::OpenAiResponses,
             UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough => {
-                ResponseParserKind::OpenAIChatCompletions
+                ResponseParserKind::OpenAiChatCompletions
             }
         },
         renderer: match downstream {
             DownstreamApi::AnthropicMessages => ResponseRendererKind::AnthropicMessages,
-            DownstreamApi::OpenAIResponses => ResponseRendererKind::OpenAIResponses,
+            DownstreamApi::OpenAiResponses => ResponseRendererKind::OpenAiResponses,
         },
     }
 }
@@ -832,24 +832,24 @@ mod tests {
                 "/v1/messages",
                 RequestAction::Transform(RequestPipeline {
                     parser: RequestParserKind::AnthropicMessages,
-                    renderer: RequestRendererKind::OpenAIChatCompletions,
+                    renderer: RequestRendererKind::OpenAiChatCompletions,
                 }),
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAIChatCompletions,
+                    parser: ResponseParserKind::OpenAiChatCompletions,
                     renderer: ResponseRendererKind::AnthropicMessages,
                 },
             ),
             (
                 UpstreamApi::OpenAiChatCompletions,
-                DownstreamApi::OpenAIResponses,
+                DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
-                    parser: RequestParserKind::OpenAIResponses,
-                    renderer: RequestRendererKind::OpenAIChatCompletions,
+                    parser: RequestParserKind::OpenAiResponses,
+                    renderer: RequestRendererKind::OpenAiChatCompletions,
                 }),
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAIChatCompletions,
-                    renderer: ResponseRendererKind::OpenAIResponses,
+                    parser: ResponseParserKind::OpenAiChatCompletions,
+                    renderer: ResponseRendererKind::OpenAiResponses,
                 },
             ),
             (
@@ -863,15 +863,15 @@ mod tests {
                 },
             ),
             (
-                UpstreamApi::OpenAIResponses,
-                DownstreamApi::OpenAIResponses,
+                UpstreamApi::OpenAiResponses,
+                DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Passthrough {
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
                 },
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAIResponses,
-                    renderer: ResponseRendererKind::OpenAIResponses,
+                    parser: ResponseParserKind::OpenAiResponses,
+                    renderer: ResponseRendererKind::OpenAiResponses,
                 },
             ),
         ];
@@ -891,11 +891,11 @@ mod tests {
         for (upstream, downstream, path) in [
             (
                 UpstreamApi::AnthropicMessages,
-                DownstreamApi::OpenAIResponses,
+                DownstreamApi::OpenAiResponses,
                 "/v1/responses",
             ),
             (
-                UpstreamApi::OpenAIResponses,
+                UpstreamApi::OpenAiResponses,
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
             ),
@@ -949,7 +949,7 @@ reasoning_effort = { enabled = true, levels = ["high"], default = "high" }
     fn ignores_non_post_and_unaccepted_paths() {
         let provider = provider(
             UpstreamApi::OpenAiChatCompletions,
-            DownstreamApi::OpenAIResponses,
+            DownstreamApi::OpenAiResponses,
         );
         assert_eq!(
             resolve_conversion_plan(&provider, &Method::GET, "/v1/responses").unwrap(),
