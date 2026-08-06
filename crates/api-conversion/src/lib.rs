@@ -13,6 +13,7 @@ pub mod chat_parser;
 pub mod dialect;
 pub mod error;
 pub mod messages;
+pub mod messages_parser;
 pub mod messages_renderer;
 pub mod messages_to_chat;
 pub mod responses;

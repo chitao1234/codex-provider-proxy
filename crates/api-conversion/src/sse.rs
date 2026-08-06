@@ -33,6 +33,15 @@ pub fn first_data_payload(event: &[u8]) -> Option<&str> {
     event.lines().find_map(data_payload)
 }
 
+/// Extract the `event:` type from a complete SSE event, if present.
+pub fn first_event_type(event: &[u8]) -> Option<&str> {
+    let event = std::str::from_utf8(event).ok()?;
+    event
+        .lines()
+        .find_map(|line| line.strip_prefix("event:"))
+        .map(str::trim)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

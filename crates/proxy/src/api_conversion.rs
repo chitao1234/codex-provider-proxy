@@ -17,6 +17,7 @@ use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
+use codex_provider_proxy_api_conversion::messages_parser::MessagesParser;
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::messages_to_chat::{
     convert_chat_response, convert_messages_request,
@@ -36,6 +37,7 @@ use crate::config::{Config, Provider};
 
 /// Upstream path a converted request is sent to.
 pub const CHAT_COMPLETIONS_PATH: &str = "chat/completions";
+const MESSAGES_UPSTREAM_PATH: &str = "v1/messages";
 const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
 
@@ -60,13 +62,16 @@ pub fn provider_converts_path(provider: &Provider, path: &str) -> bool {
         && provider.accept_downstream_apis.contains(&api)
 }
 
-/// The upstream path to use for a provider/forwarded-path pair: `/chat/completions` when the
-/// provider converts that path, otherwise the forwarded path unchanged.
+/// The upstream path to use for a provider/forwarded-path pair: the provider's upstream
+/// protocol endpoint when conversion applies, otherwise the forwarded path unchanged.
 pub fn conversion_upstream_path<'a>(provider: &Provider, forwarded_path: &'a str) -> &'a str {
-    if provider_converts_path(provider, forwarded_path) {
-        CHAT_COMPLETIONS_PATH
-    } else {
-        forwarded_path
+    if !provider_converts_path(provider, forwarded_path) {
+        return forwarded_path;
+    }
+    match provider.upstream_api {
+        UpstreamApi::OpenAiChatCompletions => CHAT_COMPLETIONS_PATH,
+        UpstreamApi::AnthropicMessages => MESSAGES_UPSTREAM_PATH,
+        UpstreamApi::Passthrough => forwarded_path,
     }
 }
 
@@ -122,6 +127,14 @@ pub fn convert_request_body(
     );
     let dialect =
         downstream_api_for_path(path).expect("request conversion requires a known downstream path");
+    // Upstream Anthropic Messages: the request is already in Messages form when the
+    // downstream speaks Messages (near-passthrough); Responses downstream converts
+    // to Messages via the chat intermediate. The model rewrite handles model mapping.
+    if provider.upstream_api == UpstreamApi::AnthropicMessages
+        && dialect == DownstreamApi::AnthropicMessages
+    {
+        return Ok(body);
+    }
     let (converted, report) = match dialect {
         DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
             .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
@@ -310,6 +323,217 @@ pin_project! {
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         finished: bool,
+    }
+}
+
+// A generic stream that pipes an upstream SSE parser into a downstream SSE renderer.
+// The parser's `on_event` receives the SSE `event:` type plus the `data:` payload;
+// the renderer turns the resulting semantic events into downstream SSE bytes.
+pin_project! {
+    pub struct MessagesToMessagesStream<S> {
+        #[pin]
+        inner: S,
+        parser: MessagesParser,
+        renderer: MessagesRenderer,
+        pending: BytesMut,
+        out_events: VecDeque<Bytes>,
+        finished: bool,
+    }
+}
+
+impl<S> MessagesToMessagesStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            parser: MessagesParser::new(),
+            renderer: MessagesRenderer::new(),
+            pending: BytesMut::new(),
+            out_events: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<S> Stream for MessagesToMessagesStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(event) = this.out_events.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+        let mut events = Vec::new();
+        let mut rendered = Vec::new();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending.extend_from_slice(&chunk);
+                    while let Some(boundary_end) =
+                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
+                    {
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        let event_type = sse::first_event_type(&event_bytes).unwrap_or("");
+                        if let Some(payload) = sse::first_data_payload(&event_bytes) {
+                            let parsed: Result<Value, _> = serde_json::from_str(payload);
+                            if let Ok(parsed) = parsed {
+                                if let Err(err) =
+                                    this.parser.on_event(event_type, &parsed, &mut events)
+                                {
+                                    return Poll::Ready(Some(Err(std::io::Error::other(err))));
+                                }
+                            }
+                        }
+                    }
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    events.clear();
+                    if !rendered.is_empty() {
+                        this.out_events.extend(std::mem::take(&mut rendered));
+                        return Poll::Ready(Some(Ok(this
+                            .out_events
+                            .pop_front()
+                            .expect("events were just pushed"))));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    *this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    *this.finished = true;
+                    let mut final_events = Vec::new();
+                    this.parser.finish(&mut final_events);
+                    for event in &final_events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    this.renderer.finish(&mut rendered);
+                    if rendered.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    this.out_events.extend(rendered);
+                    return Poll::Ready(Some(Ok(this
+                        .out_events
+                        .pop_front()
+                        .expect("events were just pushed"))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+// Upstream Messages SSE -> downstream Responses SSE.
+pin_project! {
+    pub struct MessagesToResponsesStream<S> {
+        #[pin]
+        inner: S,
+        parser: MessagesParser,
+        renderer: ResponsesRenderer,
+        recorder: Option<ResponseRecorder>,
+        pending: BytesMut,
+        out_events: VecDeque<Bytes>,
+        finished: bool,
+    }
+}
+
+impl<S> MessagesToResponsesStream<S> {
+    pub fn with_recorder(inner: S, recorder: Option<ResponseRecorder>) -> Self {
+        Self {
+            inner,
+            parser: MessagesParser::new(),
+            renderer: ResponsesRenderer::new(),
+            recorder,
+            pending: BytesMut::new(),
+            out_events: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<S> Stream for MessagesToResponsesStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(event) = this.out_events.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+        let mut events = Vec::new();
+        let mut rendered = Vec::new();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending.extend_from_slice(&chunk);
+                    while let Some(boundary_end) =
+                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
+                    {
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        let event_type = sse::first_event_type(&event_bytes).unwrap_or("");
+                        if let Some(payload) = sse::first_data_payload(&event_bytes) {
+                            let parsed: Result<Value, _> = serde_json::from_str(payload);
+                            if let Ok(parsed) = parsed {
+                                if let Err(err) =
+                                    this.parser.on_event(event_type, &parsed, &mut events)
+                                {
+                                    return Poll::Ready(Some(Err(std::io::Error::other(err))));
+                                }
+                            }
+                        }
+                    }
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    events.clear();
+                    if !rendered.is_empty() {
+                        this.out_events.extend(std::mem::take(&mut rendered));
+                        return Poll::Ready(Some(Ok(this
+                            .out_events
+                            .pop_front()
+                            .expect("events were just pushed"))));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    *this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    *this.finished = true;
+                    let mut final_events = Vec::new();
+                    this.parser.finish(&mut final_events);
+                    for event in &final_events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    this.renderer.finish(&mut rendered);
+                    if let Some(recorder) = &this.recorder {
+                        if let Some(response_id) = this.renderer.response_id() {
+                            recorder.record(response_id, this.renderer.assistant_turn().cloned());
+                        }
+                    }
+                    if rendered.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    this.out_events.extend(rendered);
+                    return Poll::Ready(Some(Ok(this
+                        .out_events
+                        .pop_front()
+                        .expect("events were just pushed"))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 

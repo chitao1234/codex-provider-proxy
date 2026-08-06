@@ -514,16 +514,43 @@ async fn handle_proxy_inner(
     );
     let resp_stream = if conversion_applies {
         if is_text_event_stream(&resp_headers) {
+            // Choose the upstream parser by the provider's upstream protocol, then the
+            // downstream renderer by the forwarded path.
+            let upstream_api = cfg
+                .providers
+                .get(&final_attempt.provider_name)
+                .map(|provider| provider.upstream_api)
+                .unwrap_or_default();
             match crate::api_conversion::downstream_api_for_path(forwarded_path) {
-                Some(crate::api_conversion::DownstreamApi::AnthropicMessages) => Box::pin(
-                    crate::api_conversion::ChatToMessagesStream::new(resp_stream),
-                )
-                    as BoxRespStream,
+                Some(crate::api_conversion::DownstreamApi::AnthropicMessages) => {
+                    match upstream_api {
+                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages => {
+                            Box::pin(
+                                crate::api_conversion::MessagesToMessagesStream::new(resp_stream),
+                            ) as BoxRespStream
+                        }
+                        _ => Box::pin(
+                            crate::api_conversion::ChatToMessagesStream::new(resp_stream),
+                        ) as BoxRespStream,
+                    }
+                }
                 Some(crate::api_conversion::DownstreamApi::OpenAiResponses) => {
-                    Box::pin(crate::api_conversion::ChatToResponsesStream::with_recorder(
-                        resp_stream,
-                        final_attempt.response_recorder.clone(),
-                    )) as BoxRespStream
+                    match upstream_api {
+                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages => {
+                            Box::pin(
+                                crate::api_conversion::MessagesToResponsesStream::with_recorder(
+                                    resp_stream,
+                                    final_attempt.response_recorder.clone(),
+                                ),
+                            ) as BoxRespStream
+                        }
+                        _ => Box::pin(
+                            crate::api_conversion::ChatToResponsesStream::with_recorder(
+                                resp_stream,
+                                final_attempt.response_recorder.clone(),
+                            ),
+                        ) as BoxRespStream,
+                    }
                 }
                 None => resp_stream,
             }
@@ -4770,6 +4797,108 @@ mod tests {
             ],
             ..converting_provider(base_url)
         }
+    }
+
+    fn messages_upstream_provider(base_url: Url) -> Provider {
+        Provider {
+            base_url,
+            api_key: "token-a".to_string(),
+            authorization_header: None,
+            upstream_api:
+                codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages,
+            accept_downstream_apis: vec![
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAiResponses,
+            ],
+            ..Provider::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_upstream_streams_to_messages_downstream() {
+        // Upstream serves Messages SSE; downstream Messages client receives it converted
+        // through the semantic IR (near-passthrough).
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/v1/messages").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+                     event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                     event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello!\"}}\n\n\
+                     event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                     event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n\
+                     event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), messages_upstream_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = messages_request(
+            json!({"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("\"text\":\"Hello!\""));
+        assert!(text.contains("\"stop_reason\":\"end_turn\""));
+        assert!(text.contains("event: message_stop"));
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn messages_upstream_streams_to_responses_downstream() {
+        // Upstream serves Messages SSE; downstream Responses (Codex) receives official
+        // Responses SSE converted through the semantic IR.
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/v1/messages").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+                     event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                     event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"We\"}}\n\n\
+                     event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                     event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                     event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+                     event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+                     event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n\
+                     event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), messages_upstream_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = responses_request(json!({"model": "m", "input": "hi", "stream": true}));
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: response.created"));
+        assert!(text.contains("\"type\":\"response.reasoning_text.delta\""));
+        assert!(text.contains("\"delta\":\"We\""));
+        assert!(text.contains("\"type\":\"response.output_text.delta\""));
+        assert!(text.contains("\"delta\":\"Hi\""));
+        assert!(text.contains("event: response.completed"));
+        let _ = shutdown_tx.send(());
     }
 
     fn responses_request(body: serde_json::Value) -> Request<Body> {

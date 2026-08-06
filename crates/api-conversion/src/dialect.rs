@@ -15,6 +15,11 @@ pub enum UpstreamApi {
     /// OpenAI Chat Completions (`POST /chat/completions`).
     #[serde(rename = "openai_chat_completions")]
     OpenAiChatCompletions,
+    /// Anthropic Messages (`POST /v1/messages`), e.g. DeepSeek/MiniMax/MiMo /anthropic
+    /// endpoints. Downstream Messages is near-passthrough; downstream Responses is
+    /// converted via the Messages parser.
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
 }
 
 /// API dialects a downstream client may speak that this proxy converts from.
