@@ -112,7 +112,7 @@ impl ResponsesRenderer {
                     "response.reasoning_text.delta",
                     &json!({
                         "type": "response.reasoning_text.delta",
-                        "item_id": format!("rs_{}", &self.response_id[5..]),
+                        "item_id": format!("rs_{}", self.response_id_suffix()),
                         "output_index": index,
                         "content_index": 0,
                         "delta": text,
@@ -128,7 +128,7 @@ impl ResponsesRenderer {
                     "response.output_text.delta",
                     &json!({
                         "type": "response.output_text.delta",
-                        "item_id": format!("msg_{}", &self.response_id[5..]),
+                        "item_id": format!("msg_{}", self.response_id_suffix()),
                         "output_index": index,
                         "content_index": 0,
                         "delta": text,
@@ -137,7 +137,7 @@ impl ResponsesRenderer {
                 );
             }
             StreamEvent::ToolCallStart { index, id, name } => {
-                let item_id = format!("fc_{}_{}", &self.response_id[5..], index);
+                let item_id = format!("fc_{}_{}", self.response_id_suffix(), index);
                 let output_index = self.output_index;
                 self.output_index += 1;
                 self.function_calls.insert(
@@ -237,7 +237,7 @@ impl ResponsesRenderer {
                 "type": "response.output_item.added",
                 "output_index": index,
                 "item": {
-                    "id": format!("rs_{}", &self.response_id[5..]),
+                    "id": format!("rs_{}", self.response_id_suffix()),
                     "type": "reasoning",
                     "status": "in_progress",
                     "summary": [],
@@ -260,7 +260,7 @@ impl ResponsesRenderer {
                 "type": "response.output_item.added",
                 "output_index": index,
                 "item": {
-                    "id": format!("msg_{}", &self.response_id[5..]),
+                    "id": format!("msg_{}", self.response_id_suffix()),
                     "type": "message",
                     "status": "in_progress",
                     "role": "assistant",
@@ -281,7 +281,7 @@ impl ResponsesRenderer {
                 "type": "response.output_item.done",
                 "output_index": index,
                 "item": {
-                    "id": format!("rs_{}", &self.response_id[5..]),
+                    "id": format!("rs_{}", self.response_id_suffix()),
                     "type": "reasoning",
                     "status": "completed",
                     "summary": [],
@@ -299,7 +299,7 @@ impl ResponsesRenderer {
                 "type": "response.output_item.done",
                 "output_index": index,
                 "item": {
-                    "id": format!("msg_{}", &self.response_id[5..]),
+                    "id": format!("msg_{}", self.response_id_suffix()),
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
@@ -393,6 +393,12 @@ impl ResponsesRenderer {
             obj.insert("sequence_number".to_string(), json!(self.sequence_number));
         }
         out.push(encode_sse_event(event_type, &event));
+    }
+
+    fn response_id_suffix(&self) -> &str {
+        self.response_id
+            .strip_prefix("resp_")
+            .unwrap_or(&self.response_id)
     }
 }
 
@@ -511,7 +517,7 @@ pub fn convert_messages_response_to_responses(body: &Value) -> Result<Value, Con
     }
     if !reasoning_summary.trim().is_empty() {
         output.push(json!({
-            "id": format!("rs_{}", &response_id[5..]),
+            "id": format!("rs_{}", response_id.strip_prefix("resp_").unwrap_or(&response_id)),
             "type": "reasoning",
             "status": "completed",
             "summary": [{"type": "summary_text", "text": reasoning_summary}],
@@ -521,7 +527,10 @@ pub fn convert_messages_response_to_responses(body: &Value) -> Result<Value, Con
         let mut msg = serde_json::Map::new();
         msg.insert(
             "id".to_string(),
-            json!(format!("msg_{}", &response_id[5..])),
+            json!(format!(
+                "msg_{}",
+                response_id.strip_prefix("resp_").unwrap_or(&response_id)
+            )),
         );
         msg.insert("type".to_string(), json!("message"));
         msg.insert("status".to_string(), json!("completed"));
@@ -695,6 +704,26 @@ mod tests {
         assert!(text.contains("\"code\":\"upstream_error\""));
         assert!(text.contains("\"message\":\"upstream exploded\""));
         assert!(!text.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn missing_upstream_id_does_not_panic() {
+        let text = render(vec![
+            StreamEvent::Start {
+                id: String::new(),
+                model: "m".to_string(),
+            },
+            StreamEvent::TextDelta {
+                text: "Hi".to_string(),
+            },
+            StreamEvent::End {
+                stop_reason: StopReason::Stop,
+                usage: ChatUsage::default(),
+            },
+        ]);
+
+        assert!(text.contains("event: response.completed"));
+        assert!(text.contains("\"id\":\"msg_\""));
     }
 
     #[test]

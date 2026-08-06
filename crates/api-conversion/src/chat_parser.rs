@@ -92,6 +92,10 @@ impl ChatParser {
         if let Some(delta) = first_choice_delta(&chunk) {
             self.process_delta(delta, out);
         }
+        let usage = extract_usage(&chunk);
+        if !usage.is_empty() {
+            self.usage = usage;
+        }
         if let Some(finish_reason) = first_choice_finish_reason(&chunk) {
             let saw_tool_call = self.tools.values().any(|tool| tool.name.is_some());
             out.push(StreamEvent::End {
@@ -102,10 +106,6 @@ impl ChatParser {
             // usage-only chunks are absorbed by finish().
             self.finish(out);
             return Ok(());
-        }
-        let usage = extract_usage(&chunk);
-        if !usage.is_empty() {
-            self.usage = usage;
         }
         if is_usage_only_chunk(&chunk) {
             // Final usage chunk (`choices: []`): the stream is complete.
@@ -303,6 +303,24 @@ mod tests {
         assert!(
             matches!(&events[3], StreamEvent::End { stop_reason, .. } if *stop_reason == crate::stream::StopReason::Stop)
         );
+    }
+
+    #[test]
+    fn captures_usage_from_finish_chunk() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        parser
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":9}}"#,
+                &mut events,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::End { usage, .. })
+                if usage.prompt_tokens == Some(6) && usage.completion_tokens == Some(9)
+        ));
     }
 
     #[test]
