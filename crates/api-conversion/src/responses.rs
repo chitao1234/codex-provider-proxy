@@ -727,6 +727,15 @@ fn chrono_now() -> u64 {
 // Streaming state machine
 // ---------------------------------------------------------------------------
 
+/// Accumulated state of one upstream tool call, for the closing events.
+struct FunctionCallState {
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    output_index: usize,
+}
+
 /// Incremental converter from upstream Chat Completions SSE chunks to downstream
 /// Responses API SSE events.
 pub struct ResponsesStreamConverter {
@@ -737,7 +746,8 @@ pub struct ResponsesStreamConverter {
     sequence_number: u64,
     reasoning_item: Option<usize>,
     message_item: Option<usize>,
-    function_calls: HashMap<usize, (String, String)>, // index -> (item_id, call_id)
+    message_text: String,
+    function_calls: HashMap<usize, FunctionCallState>,
     usage: ChatUsage,
     finished: bool,
 }
@@ -758,6 +768,7 @@ impl ResponsesStreamConverter {
             sequence_number: 0,
             reasoning_item: None,
             message_item: None,
+            message_text: String::new(),
             function_calls: HashMap::new(),
             usage: ChatUsage::default(),
             finished: false,
@@ -856,6 +867,7 @@ impl ResponsesStreamConverter {
         }
         if let Some(text) = delta_string(delta, "content") {
             self.ensure_message_item(out);
+            self.message_text.push_str(text);
             let index = self.message_item.unwrap_or(0);
             self.emit(
                 "response.output_text.delta",
@@ -935,37 +947,64 @@ impl ResponsesStreamConverter {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
 
-        if !self.function_calls.contains_key(&index) {
+        if let Some(state) = self.function_calls.get_mut(&index) {
+            // First delta carries id/name; later deltas only carry argument increments.
+            if !name.is_empty() {
+                state.name = name.to_string();
+            }
+            if !new_args.is_empty() {
+                state.arguments.push_str(new_args);
+            }
+        } else {
             let item_id = format!("fc_{}_{}", &self.response_id[5..], index);
             let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
             let output_index = self.output_index;
             self.output_index += 1;
-            self.function_calls
-                .insert(index, (item_id.clone(), call_id.to_string()));
-            self.emit("response.output_item.added", &json!({
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": {
-                    "id": item_id,
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or_default(),
-                    "arguments": "",
+            self.function_calls.insert(
+                index,
+                FunctionCallState {
+                    item_id: item_id.clone(),
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: new_args.to_string(),
+                    output_index,
                 },
-            }), out);
-        }
+            );
+            self.emit(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "",
+                    },
+                }),
+                out,
+            );
+        };
 
         if !new_args.is_empty() {
-            let (item_id, _) = &self.function_calls[&index];
-            let output_index = self.output_index - 1;
+            let (item_id, delta_index) = self
+                .function_calls
+                .get(&index)
+                .map(|state| (state.item_id.clone(), state.output_index))
+                .unwrap_or_default();
             self.emit(
                 "response.function_call_arguments.delta",
                 &json!({
                     "type": "response.function_call_arguments.delta",
                     "item_id": item_id,
-                    "output_index": output_index,
+                    "output_index": delta_index,
                     "delta": new_args,
                 }),
                 out,
@@ -975,9 +1014,10 @@ impl ResponsesStreamConverter {
 
     fn emit_completed(&mut self, out: &mut Vec<Bytes>) {
         // Close open items.
-        let mut done_items: Vec<Value> = Vec::new();
+        let mut args_done: Vec<Value> = Vec::new();
+        let mut items_done: Vec<Value> = Vec::new();
         if let Some(index) = self.reasoning_item.take() {
-            done_items.push(json!({
+            items_done.push(json!({
                 "type": "response.output_item.done",
                 "output_index": index,
                 "item": {
@@ -989,7 +1029,8 @@ impl ResponsesStreamConverter {
             }));
         }
         if let Some(index) = self.message_item.take() {
-            done_items.push(json!({
+            let text = std::mem::take(&mut self.message_text);
+            items_done.push(json!({
                 "type": "response.output_item.done",
                 "output_index": index,
                 "item": {
@@ -997,29 +1038,41 @@ impl ResponsesStreamConverter {
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "", "annotations": []}],
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
                 },
             }));
         }
-        // Function call items are completed by function_call_arguments.done in real streams;
-        // emit done for any open ones.
+        // Function call items: close each with the accumulated arguments
+        // (function_call_arguments.done), then emit the completed item carrying
+        // the full name/arguments for clients that rebuild calls from done events.
         let fc_indices: Vec<usize> = self.function_calls.keys().copied().collect();
         for index in fc_indices {
-            let (item_id, call_id) = self.function_calls.remove(&index).unwrap_or_default();
-            done_items.push(json!({
+            let Some(state) = self.function_calls.remove(&index) else {
+                continue;
+            };
+            args_done.push(json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": state.item_id,
+                "output_index": state.output_index,
+                "arguments": state.arguments,
+            }));
+            items_done.push(json!({
                 "type": "response.output_item.done",
-                "output_index": index,
+                "output_index": state.output_index,
                 "item": {
-                    "id": item_id,
+                    "id": state.item_id,
                     "type": "function_call",
                     "status": "completed",
-                    "call_id": call_id,
-                    "name": "",
-                    "arguments": "",
+                    "call_id": state.call_id,
+                    "name": state.name,
+                    "arguments": state.arguments,
                 },
             }));
         }
-        for event in done_items {
+        for event in args_done {
+            self.emit("response.function_call_arguments.done", &event, out);
+        }
+        for event in items_done {
             self.emit("response.output_item.done", &event, out);
         }
 
@@ -1226,6 +1279,10 @@ mod tests {
         assert!(text.contains("\"type\":\"function_call\""));
         assert!(text.contains("\"call_id\":\"call_1\""));
         assert!(text.contains("\"type\":\"response.function_call_arguments.delta\""));
+        // Closing events carry the accumulated arguments and name.
+        assert!(text.contains("\"type\":\"response.function_call_arguments.done\""));
+        assert!(text.contains("\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
+        assert!(text.contains("\"name\":\"get_weather\""));
         assert!(text.contains("event: response.completed"));
     }
 
