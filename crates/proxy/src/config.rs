@@ -474,6 +474,7 @@ impl Config {
         let upstream_idle_timeout = timeout_from_secs(file.upstream_idle_timeout_secs);
         let mut providers = HashMap::new();
         for (name, provider) in file.providers {
+            validate_provider_conversion(&name, &provider)?;
             if provider.base_url.cannot_be_a_base() {
                 return Err(anyhow!("provider {name} base_url cannot be a base url"));
             }
@@ -571,6 +572,24 @@ impl Config {
     }
 }
 
+fn validate_provider_conversion(name: &str, provider: &ProviderFile) -> Result<()> {
+    let unsupported_downstream = match provider.upstream_api {
+        UpstreamApi::AnthropicMessages => Some(DownstreamApi::OpenAIResponses),
+        UpstreamApi::OpenAIResponses => Some(DownstreamApi::AnthropicMessages),
+        UpstreamApi::Passthrough | UpstreamApi::OpenAiChatCompletions => None,
+    };
+    if let Some(downstream) =
+        unsupported_downstream.filter(|api| provider.accept_downstream_apis.contains(api))
+    {
+        return Err(anyhow!(
+            "provider {name} advertises unsupported conversion: upstream {:?} cannot accept downstream {:?} requests yet",
+            provider.upstream_api,
+            downstream,
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_rewrite_config(
     rewrite: RewriteFile,
     providers: &HashMap<String, Provider>,
@@ -650,6 +669,44 @@ mod tests {
 
         assert_eq!(cfg.listen_addrs.len(), 1);
         assert_eq!(cfg.listen_addrs[0].to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn rejects_messages_upstream_with_responses_downstream() {
+        let error = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+                upstream_api = "anthropic_messages"
+                accept_downstream_apis = ["openai_responses"]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported conversion"));
+    }
+
+    #[test]
+    fn rejects_responses_upstream_with_messages_downstream() {
+        let error = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+                upstream_api = "openai_responses"
+                accept_downstream_apis = ["anthropic_messages"]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported conversion"));
     }
 
     #[test]

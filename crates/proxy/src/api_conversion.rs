@@ -45,7 +45,7 @@ const RESPONSES_PATH: &str = "responses";
 pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
     match path.trim_matches('/').rsplit('/').next() {
         Some(MESSAGES_PATH) => Some(DownstreamApi::AnthropicMessages),
-        Some(RESPONSES_PATH) => Some(DownstreamApi::OpenAiResponses),
+        Some(RESPONSES_PATH) => Some(DownstreamApi::OpenAIResponses),
         _ => None,
     }
 }
@@ -74,7 +74,7 @@ pub fn conversion_upstream_path<'a>(
     match provider.upstream_api {
         UpstreamApi::OpenAiChatCompletions => std::borrow::Cow::Borrowed(CHAT_COMPLETIONS_PATH),
         UpstreamApi::AnthropicMessages => std::borrow::Cow::Borrowed(MESSAGES_UPSTREAM_PATH),
-        UpstreamApi::OpenAiResponses => std::borrow::Cow::Borrowed(RESPONSES_UPSTREAM_PATH),
+        UpstreamApi::OpenAIResponses => std::borrow::Cow::Borrowed(RESPONSES_UPSTREAM_PATH),
         UpstreamApi::Passthrough => std::borrow::Cow::Borrowed(forwarded_path),
     }
 }
@@ -143,8 +143,8 @@ pub fn convert_request_body(
     // Upstream Responses + downstream Responses is the same protocol: pass through
     // unchanged, except Ark-style parameter normalization (thinking/caching) when
     // the provider is Ark.
-    if provider.upstream_api == UpstreamApi::OpenAiResponses
-        && dialect == DownstreamApi::OpenAiResponses
+    if provider.upstream_api == UpstreamApi::OpenAIResponses
+        && dialect == DownstreamApi::OpenAIResponses
     {
         if caps.ark_style {
             let mut json = json;
@@ -162,7 +162,7 @@ pub fn convert_request_body(
     let (converted, report) = match dialect {
         DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
             .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
-        DownstreamApi::OpenAiResponses => {
+        DownstreamApi::OpenAIResponses => {
             convert_responses_request(&json, &caps, previous_messages, last_reasoning)
                 .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?
         }
@@ -200,7 +200,7 @@ impl RequestConversionRejected {
         Self {
             error_body: match dialect {
                 DownstreamApi::AnthropicMessages => err.to_anthropic_error_body(),
-                DownstreamApi::OpenAiResponses => err.to_openai_error_body(),
+                DownstreamApi::OpenAIResponses => err.to_openai_error_body(),
             },
         }
     }
@@ -208,7 +208,7 @@ impl RequestConversionRejected {
     pub(crate) fn openai_invalid(message: impl Into<String>) -> Self {
         Self::from_conversion_error(
             ConversionError::invalid(message),
-            DownstreamApi::OpenAiResponses,
+            DownstreamApi::OpenAIResponses,
         )
     }
 
@@ -303,7 +303,7 @@ impl ResponseRecorder {
 pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value {
     match downstream_api_for_path(path) {
         Some(DownstreamApi::AnthropicMessages) => convert_chat_error_body(status, body),
-        Some(DownstreamApi::OpenAiResponses) => body.clone(),
+        Some(DownstreamApi::OpenAIResponses) => body.clone(),
         None => body.clone(),
     }
 }
@@ -329,7 +329,7 @@ pub fn convert_non_streaming_body(
         (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::AnthropicMessages) => {
             convert_chat_response(&json)
         }
-        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::OpenAiResponses) => {
+        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::OpenAIResponses) => {
             convert_chat_response_to_responses(&json)
         }
         // Messages upstream (Anthropic message JSON): render downstream directly.
@@ -337,14 +337,14 @@ pub fn convert_non_streaming_body(
             // The body is already Anthropic Messages; pass through as-is.
             return Ok(body);
         }
-        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAiResponses) => {
+        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAIResponses) => {
             codex_provider_proxy_api_conversion::responses_renderer::convert_messages_response_to_responses(&json)
         }
         // Responses upstream: normalize to downstream.
-        (UpstreamApi::OpenAiResponses, DownstreamApi::AnthropicMessages) => {
+        (UpstreamApi::OpenAIResponses, DownstreamApi::AnthropicMessages) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_messages(&json)
         }
-        (UpstreamApi::OpenAiResponses, DownstreamApi::OpenAiResponses) => {
+        (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_responses(&json)
         }
     }

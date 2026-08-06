@@ -102,12 +102,17 @@ api_key = "replace-me"
 # Optional API format conversion (per provider). Providers without these fields proxy
 # transparently, exactly as before.
 #
-# `upstream_api` declares the dialect the provider speaks. Supported: "passthrough"
-# (default) and "openai_chat_completions".
+# `upstream_api` declares the dialect the provider speaks. Supported values are
+# "passthrough" (default), "openai_chat_completions", "anthropic_messages", and
+# "openai_responses".
 #
-# `accept_downstream_apis` lists downstream dialects to convert FROM. Supported:
-# "anthropic_messages" (Claude Code's Messages API). When set, POST /v1/messages requests
-# are converted to POST /chat/completions, and responses are converted back.
+# `accept_downstream_apis` lists downstream dialects to convert FROM. Current request
+# conversions are supported for:
+#   - upstream "openai_chat_completions" + downstream "anthropic_messages" or "openai_responses"
+#   - upstream "anthropic_messages" + downstream "anthropic_messages" (passthrough)
+#   - upstream "openai_responses" + downstream "openai_responses" (passthrough/normalization)
+# Cross-conversion between Messages and Responses is intentionally rejected until its
+# request renderer is implemented.
 #
 # `capabilities` sets provider-level conversion defaults; `models."<model>"` overrides them
 # per upstream model name (matched after [[rewrite.model_mappings]] rewrites). Available

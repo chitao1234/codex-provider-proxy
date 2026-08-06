@@ -531,7 +531,7 @@ async fn handle_proxy_inner(
                                 codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
                             )) as BoxRespStream
                         }
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiResponses => {
+                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAIResponses => {
                             Box::pin(crate::streams::ParserRendererStream::new(
                                 resp_stream,
                                 codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
@@ -543,7 +543,7 @@ async fn handle_proxy_inner(
                         ) as BoxRespStream,
                     }
                 }
-                Some(crate::api_conversion::DownstreamApi::OpenAiResponses) => {
+                Some(crate::api_conversion::DownstreamApi::OpenAIResponses) => {
                     match upstream_api {
                         codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages => {
                             Box::pin(crate::streams::ParserRendererStream::with_recorder(
@@ -553,7 +553,7 @@ async fn handle_proxy_inner(
                                 final_attempt.response_recorder.clone(),
                             )) as BoxRespStream
                         }
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiResponses => {
+                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAIResponses => {
                             Box::pin(crate::streams::ParserRendererStream::with_recorder(
                                 resp_stream,
                                 codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
@@ -1495,7 +1495,7 @@ fn maybe_convert_request_body(
     }
     let is_responses = matches!(
         crate::api_conversion::downstream_api_for_path(forwarded_path),
-        Some(crate::api_conversion::DownstreamApi::OpenAiResponses)
+        Some(crate::api_conversion::DownstreamApi::OpenAIResponses)
     );
     let previous_messages = if is_responses {
         resolve_previous_response_messages(state, &attempt.provider_name, &body)
@@ -4822,7 +4822,7 @@ mod tests {
         Provider {
             accept_downstream_apis: vec![
                 codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
-                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAiResponses,
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAIResponses,
             ],
             ..converting_provider(base_url)
         }
@@ -4834,10 +4834,10 @@ mod tests {
             api_key: "token-a".to_string(),
             authorization_header: None,
             upstream_api:
-                codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiResponses,
+                codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAIResponses,
             accept_downstream_apis: vec![
                 codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
-                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAiResponses,
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAIResponses,
             ],
             ..Provider::default()
         }
@@ -4931,7 +4931,7 @@ mod tests {
                 codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages,
             accept_downstream_apis: vec![
                 codex_provider_proxy_api_conversion::dialect::DownstreamApi::AnthropicMessages,
-                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAiResponses,
+                codex_provider_proxy_api_conversion::dialect::DownstreamApi::OpenAIResponses,
             ],
             ..Provider::default()
         }
