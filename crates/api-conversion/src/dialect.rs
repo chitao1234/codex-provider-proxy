@@ -47,6 +47,9 @@ pub enum ThinkingParam {
     TopLevel,
     /// `enable_thinking: true|false` boolean (qwen / DashScope).
     EnableThinking,
+    /// `thinking: {"type": "adaptive"|"disabled"}` (MiniMax: adaptive is the only
+    /// "on" value; `enabled` is rejected).
+    Adaptive,
     /// No top-level thinking parameter (OpenAI, Grok); effort maps to `reasoning_effort` only.
     None,
 }
@@ -169,6 +172,13 @@ pub struct ModelCapabilities {
     /// available"), so conversion drops `stop_sequences` when this is false.
     #[serde(default = "default_true")]
     pub accept_stop: bool,
+    /// Force upstream `reasoning_split` (MiniMax): split thinking out of `content`
+    /// (where it is embedded as `<think>` tags by default) into the dedicated
+    /// `reasoning_content`/`reasoning_details` fields. The converter needs this to
+    /// map thinking to downstream Anthropic thinking blocks instead of leaking it
+    /// into visible text.
+    #[serde(default)]
+    pub reasoning_split: Option<bool>,
 }
 
 impl Default for ModelCapabilities {
@@ -189,6 +199,7 @@ impl Default for ModelCapabilities {
             code_interpreter_request_params: None,
             always_enable_tools: Vec::new(),
             accept_stop: true,
+            reasoning_split: None,
         }
     }
 }

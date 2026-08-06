@@ -54,6 +54,7 @@ pub fn convert_responses_request(
         out.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
     apply_max_tokens_cap(caps, &mut out);
+    crate::messages_to_chat::apply_reasoning_split(caps, &mut out);
     copy_value(request, &mut out, "temperature", "temperature");
     copy_value(request, &mut out, "top_p", "top_p");
     copy_value(
@@ -183,6 +184,16 @@ fn convert_reasoning_effort(
                     "disabled"
                 } else {
                     "enabled"
+                };
+                out.insert("thinking".to_string(), json!({"type": thinking_type}));
+            }
+        }
+        crate::dialect::ThinkingParam::Adaptive => {
+            if let Some(effort) = &effort {
+                let thinking_type = if effort == "none" || effort == "minimal" {
+                    "disabled"
+                } else {
+                    "adaptive"
                 };
                 out.insert("thinking".to_string(), json!({"type": thinking_type}));
             }

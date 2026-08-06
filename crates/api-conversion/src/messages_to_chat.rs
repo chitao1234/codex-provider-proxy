@@ -50,6 +50,7 @@ pub fn convert_messages_request(
         out.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
     apply_max_tokens_cap(caps, &mut out);
+    apply_reasoning_split(caps, &mut out);
     copy_value(request, &mut out, "temperature", "temperature");
     copy_user(request, &mut out);
     convert_stop_sequences(request, caps, &mut out);
@@ -167,6 +168,14 @@ fn apply_max_tokens_cap(caps: &ModelCapabilities, out: &mut Map<String, Value>) 
     }
 }
 
+/// Force the upstream `reasoning_split` flag (MiniMax) when configured, so thinking
+/// is returned in `reasoning_content` instead of embedded `<think>` tags in `content`.
+pub fn apply_reasoning_split(caps: &ModelCapabilities, out: &mut Map<String, Value>) {
+    if let Some(split) = caps.reasoning_split {
+        out.insert("reasoning_split".to_string(), json!(split));
+    }
+}
+
 fn copy_bool(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
     if let Some(value) = request.get(from).and_then(Value::as_bool) {
         out.insert(to.to_string(), Value::Bool(value));
@@ -248,6 +257,21 @@ fn convert_effort_and_thinking(
             }
             Some("adaptive") | Some("enabled") | None if thinking.is_some() => {
                 out.insert("thinking".to_string(), json!({"type": "enabled"}));
+            }
+            _ => {}
+        }
+    } else if caps.thinking_param == ThinkingParam::Adaptive {
+        // MiniMax: the only "on" value is "adaptive"; "enabled" is rejected.
+        let thinking = request.get("thinking");
+        let thinking_type = thinking
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str);
+        match thinking_type {
+            Some("disabled") => {
+                out.insert("thinking".to_string(), json!({"type": "disabled"}));
+            }
+            Some("adaptive") | Some("enabled") | None if thinking.is_some() => {
+                out.insert("thinking".to_string(), json!({"type": "adaptive"}));
             }
             _ => {}
         }
@@ -1387,6 +1411,32 @@ mod tests {
         assert_eq!(out["messages"][0]["role"], "system");
         assert_eq!(out["messages"][1]["role"], "user");
         assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn minimax_adaptive_thinking_and_reasoning_split() {
+        let mut caps = caps();
+        caps.thinking_param = ThinkingParam::Adaptive;
+        caps.reasoning_split = Some(true);
+        let body = json!({
+            "model": "MiniMax-M3",
+            "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert_eq!(out["reasoning_split"], true);
+
+        // disabled thinking maps through unchanged.
+        let body = json!({
+            "model": "MiniMax-M3",
+            "max_tokens": 1000,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_messages_request(&body, &caps).unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
     }
 
     #[test]

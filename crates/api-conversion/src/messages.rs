@@ -130,17 +130,23 @@ pub fn is_known_server_tool_name(name: &str) -> bool {
 /// Short name for an Anthropic server tool, used when mapping to a function tool.
 pub fn server_tool_function_name(tool: &Value) -> Option<String> {
     let object = tool.as_object()?;
-    let name = object.get("name").and_then(Value::as_str)?;
-    if is_known_server_tool_name(name) {
-        // Claude Code's camelCase forms map to their snake_case server names.
-        let normalized = match name {
-            "WebSearch" => "web_search",
-            "WebFetch" => "web_fetch",
-            other => other,
-        };
-        return Some(normalized.to_string());
+    if let Some(name) = object.get("name").and_then(Value::as_str) {
+        if is_known_server_tool_name(name) {
+            // Claude Code's camelCase forms map to their snake_case server names.
+            let normalized = match name {
+                "WebSearch" => "web_search",
+                "WebFetch" => "web_fetch",
+                other => other,
+            };
+            return Some(normalized.to_string());
+        }
     }
     if let Some(tool_type) = object.get("type").and_then(Value::as_str) {
+        // Some upstreams (MiMo) declare flat native tools with the bare type and no
+        // name, e.g. `{"type": "web_search", "max_keyword": 3, ...}`.
+        if is_known_server_tool_name(tool_type) {
+            return Some(tool_type.to_string());
+        }
         for prefix in SERVER_TOOL_TYPE_PREFIXES {
             if let Some(short) = tool_type.strip_prefix(prefix) {
                 return Some(short.to_string());
@@ -268,6 +274,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn recognizes_flat_mimo_web_search_tool() {
+        // MiMo declares search as a flat tool: type only, no name.
+        let tool =
+            json!({"type": "web_search", "max_keyword": 3, "force_search": true, "limit": 1});
+        assert_eq!(
+            server_tool_function_name(&tool).as_deref(),
+            Some("web_search")
+        );
+        assert!(is_server_tool(&tool));
+
+        let tool = json!({"type": "web_fetch", "max_urls": 2});
+        assert_eq!(
+            server_tool_function_name(&tool).as_deref(),
+            Some("web_fetch")
+        );
+    }
 
     #[test]
     fn parses_system_prompt_and_drops_billing_and_empty() {
