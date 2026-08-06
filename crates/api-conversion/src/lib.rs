@@ -9,19 +9,21 @@
 //! crate owns networking, routing, configuration, and logging.
 
 pub mod chat;
+pub mod chat_parser;
 pub mod dialect;
 pub mod error;
 pub mod messages;
+pub mod messages_renderer;
 pub mod messages_to_chat;
 pub mod responses;
+pub mod responses_renderer;
 pub mod sse;
+pub mod stream;
 
 pub use dialect::{
     DownstreamApi, MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
     ServerToolPolicy, ThinkingParam, UpstreamApi,
 };
 pub use error::ConversionError;
-pub use messages_to_chat::{convert_chat_response, convert_messages_request, ChatStreamConverter};
-pub use responses::{
-    convert_chat_response_to_responses, convert_responses_request, ResponsesStreamConverter,
-};
+pub use messages_to_chat::{convert_chat_response, convert_messages_request};
+pub use responses::{convert_chat_response_to_responses, convert_responses_request};

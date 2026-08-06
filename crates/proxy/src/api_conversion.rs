@@ -13,16 +13,18 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
+use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::messages_to_chat::{
-    convert_chat_response, convert_messages_request, ChatStreamConverter,
+    convert_chat_response, convert_messages_request,
 };
 use codex_provider_proxy_api_conversion::responses::{
     chat_response_assistant_turn, convert_chat_response_to_responses, convert_responses_request,
-    ResponsesStreamConverter,
 };
+use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
 use codex_provider_proxy_api_conversion::{sse, ConversionError};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
@@ -303,7 +305,8 @@ pin_project! {
     pub struct ChatToMessagesStream<S> {
         #[pin]
         inner: S,
-        converter: ChatStreamConverter,
+        parser: ChatParser,
+        renderer: MessagesRenderer,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         finished: bool,
@@ -314,7 +317,8 @@ impl<S> ChatToMessagesStream<S> {
     pub fn new(inner: S) -> Self {
         Self {
             inner,
-            converter: ChatStreamConverter::new(),
+            parser: ChatParser::new(),
+            renderer: MessagesRenderer::new(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             finished: false,
@@ -347,13 +351,17 @@ where
                     {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         if let Some(payload) = sse::first_data_payload(&event_bytes) {
-                            if let Err(err) = this.converter.on_chunk(payload, &mut events) {
+                            if let Err(err) = this.parser.on_chunk(payload, &mut events) {
                                 return Poll::Ready(Some(Err(std::io::Error::other(err))));
                             }
                         }
                     }
-                    if !events.is_empty() {
-                        this.out_events.extend(events);
+                    let mut rendered = Vec::new();
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    if !rendered.is_empty() {
+                        this.out_events.extend(rendered);
                         return Poll::Ready(Some(Ok(this
                             .out_events
                             .pop_front()
@@ -367,11 +375,16 @@ where
                 Poll::Ready(None) => {
                     *this.finished = true;
                     let mut events = Vec::new();
-                    this.converter.finish(&mut events);
-                    if events.is_empty() {
+                    this.parser.finish(&mut events);
+                    let mut rendered = Vec::new();
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    this.renderer.finish(&mut rendered);
+                    if rendered.is_empty() {
                         return Poll::Ready(None);
                     }
-                    this.out_events.extend(events);
+                    this.out_events.extend(rendered);
                     return Poll::Ready(Some(Ok(this
                         .out_events
                         .pop_front()
@@ -388,7 +401,8 @@ pin_project! {
     pub struct ChatToResponsesStream<S> {
         #[pin]
         inner: S,
-        converter: ResponsesStreamConverter,
+        parser: ChatParser,
+        renderer: ResponsesRenderer,
         recorder: Option<ResponseRecorder>,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
@@ -402,7 +416,8 @@ impl<S> ChatToResponsesStream<S> {
     pub fn with_recorder(inner: S, recorder: Option<ResponseRecorder>) -> Self {
         Self {
             inner,
-            converter: ResponsesStreamConverter::new(),
+            parser: ChatParser::new(),
+            renderer: ResponsesRenderer::new(),
             recorder,
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
@@ -436,13 +451,17 @@ where
                     {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         if let Some(payload) = sse::first_data_payload(&event_bytes) {
-                            if let Err(err) = this.converter.on_chunk(payload, &mut events) {
+                            if let Err(err) = this.parser.on_chunk(payload, &mut events) {
                                 return Poll::Ready(Some(Err(std::io::Error::other(err))));
                             }
                         }
                     }
-                    if !events.is_empty() {
-                        this.out_events.extend(events);
+                    let mut rendered = Vec::new();
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    if !rendered.is_empty() {
+                        this.out_events.extend(rendered);
                         return Poll::Ready(Some(Ok(this
                             .out_events
                             .pop_front()
@@ -456,16 +475,21 @@ where
                 Poll::Ready(None) => {
                     *this.finished = true;
                     let mut events = Vec::new();
-                    this.converter.finish(&mut events);
+                    this.parser.finish(&mut events);
+                    let mut rendered = Vec::new();
+                    for event in &events {
+                        this.renderer.on_event(event, &mut rendered);
+                    }
+                    this.renderer.finish(&mut rendered);
                     if let Some(recorder) = &this.recorder {
-                        if let Some(response_id) = this.converter.response_id() {
-                            recorder.record(response_id, this.converter.assistant_turn().cloned());
+                        if let Some(response_id) = this.renderer.response_id() {
+                            recorder.record(response_id, this.renderer.assistant_turn().cloned());
                         }
                     }
-                    if events.is_empty() {
+                    if rendered.is_empty() {
                         return Poll::Ready(None);
                     }
-                    this.out_events.extend(events);
+                    this.out_events.extend(rendered);
                     return Poll::Ready(Some(Ok(this
                         .out_events
                         .pop_front()
