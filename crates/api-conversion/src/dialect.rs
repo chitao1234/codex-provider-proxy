@@ -188,6 +188,13 @@ pub struct ModelCapabilities {
     /// into visible text.
     #[serde(default)]
     pub reasoning_split: Option<bool>,
+    /// Ark (Volcengine) Responses-specific request parameter templates, merged into
+    /// the top-level request when the upstream is Ark. `caching`/`expire_at` control
+    /// prefix caching and storage TTL; `thinking` maps the official `reasoning`
+    /// effort to Ark's `thinking.type` (enabled/disabled/auto). Set `ark_style` to
+    /// true to enable Ark parameter normalization.
+    #[serde(default)]
+    pub ark_style: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -209,6 +216,7 @@ impl Default for ModelCapabilities {
             always_enable_tools: Vec::new(),
             accept_stop: true,
             reasoning_split: None,
+            ark_style: false,
         }
     }
 }

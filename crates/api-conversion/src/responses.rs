@@ -107,8 +107,64 @@ pub fn convert_responses_request(
     if !tools.is_empty() {
         out.insert("tools".to_string(), Value::Array(tools));
     }
+    // Ark (Volcengine) Responses-style parameter normalization.
+    if caps.ark_style {
+        apply_ark_style(&mut out);
+    }
 
     Ok((Value::Object(out), report))
+}
+
+/// Normalize request parameters to Ark (Volcengine) Responses style.
+///
+/// Ark deviations from official Responses (PDF research):
+/// - `reasoning.effort` is not used; Ark controls thinking via
+///   `thinking: {"type": "enabled"|"disabled"|"auto"}`.
+/// - `caching: {"type": "enabled"|"disabled", "prefix": true}` explicitly enables
+///   prefix caching (official has none; Ark needs >=256 tokens to create).
+/// - web_search tools use `max_keyword` instead of official `search_context_size`.
+fn apply_ark_style(out: &mut Map<String, Value>) {
+    // reasoning_effort (from downstream reasoning.effort) -> Ark thinking.type.
+    if let Some(effort) = out.get("reasoning_effort").and_then(Value::as_str) {
+        let thinking_type = if matches!(effort, "none" | "minimal") {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        out.insert("thinking".to_string(), json!({"type": thinking_type}));
+        out.remove("reasoning_effort");
+    }
+    // Enable prefix caching explicitly (Ark requires >=256 input tokens to create).
+    out.insert(
+        "caching".to_string(),
+        json!({"type": "enabled", "prefix": true}),
+    );
+    // Normalize web_search tools: max_keyword instead of search_context_size.
+    if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            let Some(object) = tool.as_object_mut() else {
+                continue;
+            };
+            if object.get("type").and_then(Value::as_str) != Some("web_search") {
+                continue;
+            }
+            let search = object
+                .entry("web_search".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(search) = search.as_object_mut() {
+                if let Some(context) = search.remove("search_context_size") {
+                    search.insert(
+                        "max_keyword".to_string(),
+                        match context.as_str() {
+                            Some("low") => json!(1),
+                            Some("medium") => json!(3),
+                            _ => json!(5),
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 
 // Report of what the request conversion did (shared with the Messages path via
@@ -1003,6 +1059,46 @@ mod tests {
         let assistant = &out["messages"].as_array().unwrap()[0];
         assert_eq!(assistant["reasoning_content"], "remembered thinking");
         assert_eq!(assistant["tool_calls"][0]["id"], "c1");
+    }
+
+    #[test]
+    fn ark_style_normalizes_reasoning_and_tools() {
+        let mut caps = caps();
+        caps.ark_style = true;
+        caps.server_tools = crate::dialect::ServerToolPolicy::ProviderNative;
+        caps.search_tool_template =
+            Some(json!({"type": "web_search", "web_search": {"search_context_size": "medium"}}));
+        let body = json!({
+            "model": "doubao-seed-2-1-pro-260628",
+            "input": "hi",
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
+        assert_eq!(out["thinking"]["type"], "enabled");
+        assert!(out.get("reasoning_effort").is_none());
+        assert_eq!(out["caching"]["type"], "enabled");
+        // web_search tool: search_context_size -> max_keyword.
+        let tools = out["tools"].as_array().unwrap();
+        let search = tools
+            .iter()
+            .find(|t| t.get("type") == Some(&json!("web_search")))
+            .expect("web_search tool present");
+        assert_eq!(search["web_search"]["max_keyword"], 3);
+        assert!(search["web_search"].get("search_context_size").is_none());
+    }
+
+    #[test]
+    fn ark_style_disables_thinking_for_minimal() {
+        let mut caps = caps();
+        caps.ark_style = true;
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "minimal"}
+        });
+        let (out, _) = convert_responses_request(&body, &caps, None, None).unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
     }
 
     #[test]
