@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::dialect::RequestConversionReport;
+use crate::dialect::{RequestConversionReport, ResponseFormatCap, ServerToolPolicy, ThinkingParam};
 use crate::{dialect::ModelCapabilities, error::ConversionError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,34 +466,17 @@ impl RequestIr {
         }
     }
 
-    /// Render the IR for a Chat Completions upstream while retaining the mature capability
-    /// policies used by the existing Messages/Responses adapters. This is the compatibility
-    /// renderer used during the migration; it still consumes the IR's lossless source object.
     pub fn render_chat_with_capabilities(
         &self,
         caps: &ModelCapabilities,
-        previous_messages: Option<&[Value]>,
-        last_reasoning: Option<&str>,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        let (mut rendered, report) = match self.protocol {
-            Protocol::AnthropicMessages => crate::messages_to_chat::convert_messages_request(
-                &Value::Object(self.original.clone()),
-                caps,
-            ),
-            Protocol::OpenAiResponses => crate::responses::convert_responses_request(
-                &Value::Object(self.original.clone()),
-                caps,
-                previous_messages,
-                last_reasoning,
-            ),
-            Protocol::OpenAiChatCompletions => Ok((
-                Value::Object(self.original.clone()),
-                RequestConversionReport::default(),
-            )),
-        }?;
-        if let Some(object) = rendered.as_object_mut() {
-            self.apply_context(Protocol::OpenAiChatCompletions, object);
-        }
+        let mut rendered = self.render_chat(caps)?;
+        let report = self.normalize_chat_capabilities(
+            caps,
+            rendered
+                .as_object_mut()
+                .expect("chat renderer always returns an object"),
+        )?;
         Ok((rendered, report))
     }
 
@@ -551,7 +534,168 @@ impl RequestIr {
             out.insert("tool_choice".to_owned(), choice.clone());
         }
         normalize_chat_parameters(&mut out, caps);
+        self.normalize_chat_capabilities(caps, &mut out)?;
         Ok(Value::Object(out))
+    }
+
+    fn normalize_chat_capabilities(
+        &self,
+        caps: &ModelCapabilities,
+        out: &mut Map<String, Value>,
+    ) -> Result<RequestConversionReport, ConversionError> {
+        if self
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|content| matches!(content, IrContent::Image(_)))
+            && !caps.image_input
+        {
+            return Err(ConversionError::unsupported(
+                "messages[].content.image",
+                "upstream does not support image input",
+            ));
+        }
+        if let Some(thinking) = self.original.get("thinking") {
+            let thinking_type = thinking.get("type").and_then(Value::as_str);
+            match caps.thinking_param {
+                ThinkingParam::TopLevel => {
+                    out.insert(
+                        "thinking".to_owned(),
+                        serde_json::json!({
+                            "type": if thinking_type == Some("disabled") { "disabled" } else { "enabled" }
+                        }),
+                    );
+                }
+                ThinkingParam::Adaptive => {
+                    out.insert(
+                        "thinking".to_owned(),
+                        serde_json::json!({
+                            "type": if thinking_type == Some("disabled") { "disabled" } else { "adaptive" }
+                        }),
+                    );
+                }
+                ThinkingParam::EnableThinking => {
+                    out.insert(
+                        "enable_thinking".to_owned(),
+                        Value::Bool(thinking_type != Some("disabled")),
+                    );
+                    out.remove("thinking");
+                }
+                ThinkingParam::None => {
+                    out.remove("thinking");
+                    out.remove("enable_thinking");
+                }
+            }
+        }
+        if let Some(config) = caps
+            .reasoning_effort
+            .as_ref()
+            .filter(|config| config.enabled)
+        {
+            let effort = self
+                .original
+                .get("output_config")
+                .and_then(Value::as_object)
+                .and_then(|config| config.get("effort"))
+                .and_then(Value::as_str)
+                .or(config.default.as_deref())
+                .and_then(|effort| caps.clamp_effort(effort));
+            if let Some(effort) = effort {
+                out.insert("reasoning_effort".to_owned(), Value::String(effort));
+            }
+        }
+        if !caps.accept_stop {
+            out.remove("stop");
+        } else if let Some(sequences) = self
+            .original
+            .get("stop_sequences")
+            .and_then(Value::as_array)
+        {
+            let sequences: Vec<Value> = sequences
+                .iter()
+                .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                .cloned()
+                .collect();
+            if !sequences.is_empty() {
+                out.insert(
+                    "stop".to_owned(),
+                    if sequences.len() == 1 {
+                        sequences[0].clone()
+                    } else {
+                        Value::Array(sequences)
+                    },
+                );
+            }
+        }
+        if let Some(parallel) = self
+            .original
+            .get("parallel_tool_use")
+            .and_then(Value::as_bool)
+        {
+            out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
+        }
+        if let Some(format) = self
+            .original
+            .get("output_config")
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("format"))
+        {
+            match format.get("type").and_then(Value::as_str).unwrap_or("text") {
+                "text" => {}
+                "json_schema" => match caps.response_format {
+                    ResponseFormatCap::JsonSchema => {
+                        out.insert(
+                            "response_format".to_owned(),
+                            serde_json::json!({
+                                "type":"json_schema",
+                                "json_schema":{"name":"output","schema":format.get("schema").cloned().unwrap_or_else(|| serde_json::json!({}))}
+                            }),
+                        );
+                    }
+                    ResponseFormatCap::JsonObject => {
+                        out.insert(
+                            "response_format".to_owned(),
+                            serde_json::json!({"type":"json_object"}),
+                        );
+                    }
+                    ResponseFormatCap::Text => {
+                        return Err(ConversionError::unsupported(
+                            "output_config.format",
+                            "upstream does not support structured output formats",
+                        ));
+                    }
+                },
+                other => {
+                    return Err(ConversionError::unsupported(
+                        "output_config.format",
+                        format!("unknown format type {other:?}"),
+                    ));
+                }
+            }
+        }
+        let mut report = RequestConversionReport::default();
+        let mut rendered_tools = Vec::new();
+        for tool in &self.tools {
+            if is_server_tool_kind(&tool.kind) {
+                let name = tool.name.clone().unwrap_or_else(|| tool.kind.clone());
+                match caps.server_tools {
+                    ServerToolPolicy::Drop => report.dropped_server_tools.push(name),
+                    ServerToolPolicy::MapToFunction => {
+                        report.mapped_server_tools.push(name.clone());
+                        rendered_tools.push(server_tool_as_function(tool));
+                    }
+                    ServerToolPolicy::Passthrough | ServerToolPolicy::ProviderNative => {
+                        rendered_tools.push(tool.raw.clone());
+                    }
+                }
+            } else {
+                rendered_tools.push(tool.to_chat());
+            }
+        }
+        if !self.tools.is_empty() {
+            out.insert("tools".to_owned(), Value::Array(rendered_tools));
+        }
+        Ok(report)
     }
 
     fn render_messages(&self, _caps: &ModelCapabilities) -> Result<Value, ConversionError> {
@@ -769,6 +913,29 @@ fn normalize_chat_parameters(out: &mut Map<String, Value>, caps: &ModelCapabilit
             value,
         );
     }
+}
+
+fn is_server_tool_kind(kind: &str) -> bool {
+    kind.starts_with("web_search")
+        || kind.starts_with("web_fetch")
+        || kind.starts_with("code_execution")
+        || kind.starts_with("tool_search")
+        || kind.starts_with("computer_")
+}
+
+fn server_tool_as_function(tool: &IrTool) -> Value {
+    let name = tool
+        .name
+        .clone()
+        .unwrap_or_else(|| tool.kind.replace('-', "_"));
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": tool.description.clone().unwrap_or_default(),
+            "parameters": tool.parameters.clone().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}))
+        }
+    })
 }
 
 fn normalize_responses_parameters(out: &mut Map<String, Value>, _caps: &ModelCapabilities) {

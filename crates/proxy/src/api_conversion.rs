@@ -280,16 +280,6 @@ pub fn convert_request_body(
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
-    let previous_messages = previous_request.and_then(|request| {
-        request
-            .render(
-                Protocol::OpenAiChatCompletions,
-                &ModelCapabilities::default(),
-            )
-            .ok()
-            .and_then(|value| value.get("messages").cloned())
-            .and_then(|value| value.as_array().cloned())
-    });
     let plan = resolve_conversion_plan(provider, &Method::POST, path)
         .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
         .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
@@ -297,7 +287,11 @@ pub fn convert_request_body(
         RequestAction::Passthrough { normalizer: None } => return Ok(body),
         RequestAction::Passthrough {
             normalizer: Some(RequestNormalizerKind::ArkResponses),
-        } => (json, Default::default()),
+        } => {
+            let mut rendered = json;
+            normalize_rendered_request(RequestRendererKind::OpenAiResponses, &caps, &mut rendered);
+            (rendered, Default::default())
+        }
         RequestAction::Transform(pipeline) => {
             let source = pipeline.parser.protocol();
             let request = if source == Protocol::OpenAiResponses {
@@ -310,30 +304,22 @@ pub fn convert_request_body(
             })?;
             if pipeline.renderer == RequestRendererKind::OpenAiChatCompletions {
                 request
-                    .render_chat_with_capabilities(
-                        &caps,
-                        previous_messages.as_deref(),
-                        last_reasoning,
-                    )
+                    .render_chat_with_capabilities(&caps)
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?
             } else {
-                let rendered = request
+                let mut rendered = request
                     .render(pipeline.renderer.protocol(), &caps)
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?;
+                normalize_rendered_request(pipeline.renderer, &caps, &mut rendered);
                 (rendered, Default::default())
             }
         }
     };
-    let mut converted = converted;
-    if provider.upstream_api == UpstreamApi::OpenAiResponses && caps.ark_style {
-        if let Some(object) = converted.as_object_mut() {
-            codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
-        }
-    }
+    let converted = converted;
     if !report.dropped_server_tools.is_empty() {
         warn!(
             provider = %provider_name,
@@ -353,6 +339,18 @@ pub fn convert_request_body(
     serde_json::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| RequestConversionRejected::invalid("failed to serialize converted request"))
+}
+
+fn normalize_rendered_request(
+    renderer: RequestRendererKind,
+    caps: &ModelCapabilities,
+    request: &mut Value,
+) {
+    if caps.ark_style && renderer == RequestRendererKind::OpenAiResponses {
+        if let Some(object) = request.as_object_mut() {
+            codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
+        }
+    }
 }
 
 /// A request that cannot be converted; carries the Anthropic-style error envelope to return
