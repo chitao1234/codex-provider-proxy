@@ -295,7 +295,10 @@ fn convert_tool_choice(request: &Map<String, Value>, out: &mut Map<String, Value
 /// Rules:
 /// - `function_call` items become tool_calls on the enclosing assistant message.
 /// - `function_call_output` items become `role: "tool"` messages (call_id correlation).
-/// - `reasoning` / `web_search_call` / `item_reference` items are dropped.
+/// - `reasoning` items (echoed thinking from the previous turn) are attached to the
+///   following assistant message as `reasoning_content` — upstreams that require it
+///   (DeepSeek, MiMo, MiniMax) reject the request with 400 otherwise.
+/// - `web_search_call` / `item_reference` items are dropped.
 fn expand_input(
     input: Option<&Value>,
     caps: &ModelCapabilities,
@@ -309,6 +312,8 @@ fn expand_input(
             let mut out: Vec<Value> = Vec::new();
             // Pending tool_calls to attach to the next assistant message.
             let mut pending_assistant: Option<Map<String, Value>> = None;
+            // Echoed reasoning seen before the assistant message it belongs to.
+            let mut pending_reasoning: Option<String> = None;
             for item in items {
                 let Some(object) = item.as_object() else {
                     continue;
@@ -331,6 +336,14 @@ fn expand_input(
                                     msg.insert("content".to_string(), json!(text));
                                 } else {
                                     msg.insert("content".to_string(), json!(""));
+                                }
+                                // Attach echoed reasoning (from the preceding reasoning
+                                // item) to this assistant message.
+                                if let Some(reasoning) = pending_reasoning.take() {
+                                    msg.insert(
+                                        "reasoning_content".to_string(),
+                                        Value::String(reasoning),
+                                    );
                                 }
                                 pending_assistant = Some(msg);
                             }
@@ -356,6 +369,12 @@ fn expand_input(
                             let mut assistant = Map::new();
                             assistant.insert("role".to_string(), json!("assistant"));
                             assistant.insert("content".to_string(), json!(""));
+                            if let Some(reasoning) = pending_reasoning.take() {
+                                assistant.insert(
+                                    "reasoning_content".to_string(),
+                                    Value::String(reasoning),
+                                );
+                            }
                             pending_assistant = Some(assistant);
                         }
                         let call_id = object.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -397,8 +416,42 @@ fn expand_input(
                             json!({"role": "tool", "tool_call_id": call_id, "content": output}),
                         );
                     }
+                    "reasoning" => {
+                        // The client (e.g. Codex) echoes the reasoning it received from
+                        // the previous turn as a reasoning item preceding the assistant
+                        // message it belongs to. Stash it and attach it to that message
+                        // as reasoning_content — upstreams that require it (DeepSeek,
+                        // MiMo, MiniMax) reject the request with 400 otherwise.
+                        let reasoning = object
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .and_then(|summary| {
+                                summary
+                                    .iter()
+                                    .filter_map(|s| {
+                                        s.get("text").and_then(Value::as_str).map(str::to_owned)
+                                    })
+                                    .reduce(|acc, text| format!("{acc}\n{text}"))
+                            })
+                            .or_else(|| {
+                                object
+                                    .get("summary_text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .or_else(|| {
+                                object
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        if !reasoning.trim().is_empty() {
+                            pending_reasoning = Some(reasoning);
+                        }
+                    }
                     _ => {
-                        // reasoning, web_search_call, item_reference, etc.: drop.
+                        // web_search_call, item_reference, etc.: drop.
                     }
                 }
             }
@@ -1309,6 +1362,54 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_1");
         assert_eq!(messages[2]["content"], "sunny");
         assert_eq!(messages[3]["role"], "user");
+    }
+
+    #[test]
+    fn attaches_echoed_reasoning_to_following_assistant_message() {
+        // Codex echoes the previous turn's reasoning as a reasoning item BEFORE the
+        // assistant message it belongs to (real codex input sequence).
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "weather?"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "I should check the weather."}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+            ]
+        });
+        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        // The assistant message carries the echoed reasoning as reasoning_content.
+        let assistant = &messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(
+            assistant["reasoning_content"],
+            "I should check the weather."
+        );
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+    }
+
+    #[test]
+    fn attaches_echoed_reasoning_to_function_call_without_message() {
+        // Some clients only send reasoning + function_call (no assistant message).
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Think first"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+            ]
+        });
+        let (out, _) = convert_responses_request(&body, &caps(), None).unwrap();
+        let assistant = &out["messages"].as_array().unwrap()[0];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["reasoning_content"], "Think first");
+        assert_eq!(assistant["tool_calls"][0]["id"], "c1");
     }
 
     #[test]
