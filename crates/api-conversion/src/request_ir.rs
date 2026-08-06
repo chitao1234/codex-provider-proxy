@@ -163,7 +163,7 @@ impl RequestIr {
     ) -> Result<Self, ConversionError> {
         let mut ir = Self::parse(protocol, body)?;
         if protocol == Protocol::OpenAiResponses {
-            let current_transcript = std::mem::take(&mut ir.transcript);
+            let mut current_transcript = std::mem::take(&mut ir.transcript);
             if let Some(previous_request) = previous_request {
                 ir.transcript = previous_request.transcript.clone();
                 ir.inherit_context(&previous_request.context);
@@ -171,8 +171,11 @@ impl RequestIr {
             if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
                 let current_has_reasoning = current_transcript
                     .iter()
-                    .any(|item| matches!(item, IrConversationItem::Reasoning(_)));
+                    .any(|item| matches!(item, IrConversationItem::Reasoning(value) if reasoning_text(value).is_some()));
                 if !current_has_reasoning {
+                    current_transcript.retain(|item| {
+                        !matches!(item, IrConversationItem::Reasoning(value) if reasoning_text(value).is_none())
+                    });
                     ir.transcript
                         .push(IrConversationItem::Reasoning(serde_json::json!({
                             "type": "reasoning",
@@ -520,39 +523,22 @@ impl RequestIr {
         Ok((rendered, report))
     }
 
-    fn base_output(&self, target: Protocol) -> Map<String, Value> {
-        let mut out = self.original.clone();
-        let keys = match target {
-            Protocol::AnthropicMessages => [
-                "messages",
-                "system",
-                "input",
-                "instructions",
-                "previous_response_id",
-            ],
-            Protocol::OpenAiChatCompletions => [
-                "messages",
-                "system",
-                "input",
-                "instructions",
-                "previous_response_id",
-            ],
-            Protocol::OpenAiResponses => [
-                "messages",
-                "system",
-                "input",
-                "instructions",
-                "previous_response_id",
-            ],
-        };
-        for key in keys {
-            out.remove(key);
+    fn base_output(&self) -> Map<String, Value> {
+        let mut out: Map<String, Value> = self.parameters.clone().into_iter().collect();
+        if let Some(model) = &self.model {
+            out.insert("model".to_owned(), Value::String(model.clone()));
         }
+        if let Some(stream) = self.stream {
+            out.insert("stream".to_owned(), Value::Bool(stream));
+        }
+        // `parameters` intentionally excludes protocol structure, including
+        // `previous_response_id`; translated requests must never leak that source-only
+        // continuation handle to an upstream renderer.
         out
     }
 
     fn render_chat_base(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
-        let mut out = self.base_output(Protocol::OpenAiChatCompletions);
+        let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
         for key in [
             "metadata",
@@ -923,7 +909,7 @@ impl RequestIr {
     }
 
     fn render_messages(&self, _caps: &ModelCapabilities) -> Result<Value, ConversionError> {
-        let mut out = self.base_output(Protocol::AnthropicMessages);
+        let mut out = self.base_output();
         self.apply_context(Protocol::AnthropicMessages, &mut out);
         if let Some(value) = out.remove("max_completion_tokens") {
             out.insert("max_tokens".to_owned(), value);
@@ -977,7 +963,7 @@ impl RequestIr {
     }
 
     fn render_responses(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
-        let mut out = self.base_output(Protocol::OpenAiResponses);
+        let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiResponses, &mut out);
         if !self.instructions.is_empty() {
             out.insert(
@@ -1958,6 +1944,33 @@ mod tests {
             .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
             .unwrap();
         assert_eq!(messages["metadata"]["user_id"], "cache-affinity");
+    }
+
+    #[test]
+    fn empty_responses_reasoning_summary_is_replaced_from_state() {
+        let ir = RequestIr::parse_with_context(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "input": [
+                    {"type":"reasoning","summary":[]},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+                ]
+            }),
+            None,
+            Some("remembered reasoning"),
+        )
+        .unwrap();
+        let chat = ir
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            chat["messages"][1]["reasoning_content"],
+            "remembered reasoning"
+        );
     }
 
     #[test]

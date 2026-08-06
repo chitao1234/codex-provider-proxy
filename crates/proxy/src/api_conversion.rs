@@ -189,9 +189,11 @@ pub fn resolve_conversion_plan(
         (UpstreamApi::OpenAiResponses, DownstreamApi::OpenAiResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::Passthrough {
+            request: RequestAction::Transform(RequestPipeline {
+                parser: RequestParserKind::OpenAiResponses,
+                renderer: RequestRendererKind::OpenAiResponses,
                 normalizer: Some(RequestNormalizerKind::ArkResponses),
-            },
+            }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::OpenAiResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
@@ -884,9 +886,11 @@ mod tests {
                 UpstreamApi::OpenAiResponses,
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
-                RequestAction::Passthrough {
+                RequestAction::Transform(RequestPipeline {
+                    parser: RequestParserKind::OpenAiResponses,
+                    renderer: RequestRendererKind::OpenAiResponses,
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
-                },
+                }),
                 ResponsePipeline {
                     parser: ResponseParserKind::OpenAiResponses,
                     renderer: ResponseRendererKind::OpenAiResponses,
@@ -961,6 +965,38 @@ reasoning_effort = { enabled = true, levels = ["high"], default = "high" }
         let converted: Value = serde_json::from_slice(&converted).unwrap();
         assert_eq!(converted["thinking"]["type"], "enabled");
         assert!(converted.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn strips_previous_response_id_when_responses_translation_is_enabled() {
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "responses"
+listen_addr = "127.0.0.1:0"
+[providers.responses]
+base_url = "https://responses.example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["openai_responses"]
+"#,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "m",
+            "previous_response_id": "resp-local",
+            "input": "continue"
+        });
+        let converted = convert_request_body(
+            &config,
+            "responses",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        assert!(converted.get("previous_response_id").is_none());
     }
 
     #[test]
