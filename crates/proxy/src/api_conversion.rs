@@ -42,19 +42,52 @@ const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestAction {
-    Passthrough,
-    NormalizeResponses,
-    MessagesToChat,
-    ResponsesToChat,
+pub enum RequestParserKind {
+    AnthropicMessages,
+    OpenAIResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseAction {
-    Passthrough,
-    ChatToMessages,
-    ChatToResponses,
-    ResponsesToResponses,
+pub enum RequestRendererKind {
+    OpenAIChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestNormalizerKind {
+    ArkResponses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPipeline {
+    pub parser: RequestParserKind,
+    pub renderer: RequestRendererKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAction {
+    Passthrough {
+        normalizer: Option<RequestNormalizerKind>,
+    },
+    Transform(RequestPipeline),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseParserKind {
+    OpenAIChatCompletions,
+    AnthropicMessages,
+    OpenAIResponses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseRendererKind {
+    AnthropicMessages,
+    OpenAIResponses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponsePipeline {
+    pub parser: ResponseParserKind,
+    pub renderer: ResponseRendererKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +95,7 @@ pub struct ConversionPlan {
     pub downstream: DownstreamApi,
     pub upstream: UpstreamApi,
     pub request: RequestAction,
-    pub response: ResponseAction,
+    pub response: ResponsePipeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,26 +132,46 @@ pub fn resolve_conversion_plan(
         (UpstreamApi::OpenAiChatCompletions, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::MessagesToChat,
-            response: ResponseAction::ChatToMessages,
+            request: RequestAction::Transform(RequestPipeline {
+                parser: RequestParserKind::AnthropicMessages,
+                renderer: RequestRendererKind::OpenAIChatCompletions,
+            }),
+            response: ResponsePipeline {
+                parser: ResponseParserKind::OpenAIChatCompletions,
+                renderer: ResponseRendererKind::AnthropicMessages,
+            },
         },
         (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::ResponsesToChat,
-            response: ResponseAction::ChatToResponses,
+            request: RequestAction::Transform(RequestPipeline {
+                parser: RequestParserKind::OpenAIResponses,
+                renderer: RequestRendererKind::OpenAIChatCompletions,
+            }),
+            response: ResponsePipeline {
+                parser: ResponseParserKind::OpenAIChatCompletions,
+                renderer: ResponseRendererKind::OpenAIResponses,
+            },
         },
         (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::Passthrough,
-            response: ResponseAction::Passthrough,
+            request: RequestAction::Passthrough { normalizer: None },
+            response: ResponsePipeline {
+                parser: ResponseParserKind::AnthropicMessages,
+                renderer: ResponseRendererKind::AnthropicMessages,
+            },
         },
         (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::NormalizeResponses,
-            response: ResponseAction::ResponsesToResponses,
+            request: RequestAction::Passthrough {
+                normalizer: Some(RequestNormalizerKind::ArkResponses),
+            },
+            response: ResponsePipeline {
+                parser: ResponseParserKind::OpenAIResponses,
+                renderer: ResponseRendererKind::OpenAIResponses,
+            },
         },
         (upstream, downstream) => {
             return Err(UnsupportedConversion {
@@ -210,8 +263,10 @@ pub fn convert_request_body(
         .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
         .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
     let (converted, report) = match plan.request {
-        RequestAction::Passthrough => return Ok(body),
-        RequestAction::NormalizeResponses => {
+        RequestAction::Passthrough { normalizer: None } => return Ok(body),
+        RequestAction::Passthrough {
+            normalizer: Some(RequestNormalizerKind::ArkResponses),
+        } => {
             let mut json = json;
             if caps.ark_style {
                 if let Some(object) = json.as_object_mut() {
@@ -226,14 +281,18 @@ pub fn convert_request_body(
             }
             return Ok(body);
         }
-        RequestAction::MessagesToChat => convert_messages_request(&json, &caps).map_err(|err| {
+        RequestAction::Transform(RequestPipeline {
+            parser: RequestParserKind::AnthropicMessages,
+            renderer: RequestRendererKind::OpenAIChatCompletions,
+        }) => convert_messages_request(&json, &caps).map_err(|err| {
             RequestConversionRejected::from_conversion_error(err, plan.downstream)
         })?,
-        RequestAction::ResponsesToChat => {
-            convert_responses_request(&json, &caps, previous_messages, last_reasoning).map_err(
-                |err| RequestConversionRejected::from_conversion_error(err, plan.downstream),
-            )?
-        }
+        RequestAction::Transform(RequestPipeline {
+            parser: RequestParserKind::OpenAIResponses,
+            renderer: RequestRendererKind::OpenAIChatCompletions,
+        }) => convert_responses_request(&json, &caps, previous_messages, last_reasoning).map_err(
+            |err| RequestConversionRejected::from_conversion_error(err, plan.downstream),
+        )?,
     };
     if !report.dropped_server_tools.is_empty() {
         warn!(
@@ -728,29 +787,49 @@ mod tests {
                 UpstreamApi::OpenAiChatCompletions,
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
-                RequestAction::MessagesToChat,
-                ResponseAction::ChatToMessages,
+                RequestAction::Transform(RequestPipeline {
+                    parser: RequestParserKind::AnthropicMessages,
+                    renderer: RequestRendererKind::OpenAIChatCompletions,
+                }),
+                ResponsePipeline {
+                    parser: ResponseParserKind::OpenAIChatCompletions,
+                    renderer: ResponseRendererKind::AnthropicMessages,
+                },
             ),
             (
                 UpstreamApi::OpenAiChatCompletions,
                 DownstreamApi::OpenAIResponses,
                 "/v1/responses",
-                RequestAction::ResponsesToChat,
-                ResponseAction::ChatToResponses,
+                RequestAction::Transform(RequestPipeline {
+                    parser: RequestParserKind::OpenAIResponses,
+                    renderer: RequestRendererKind::OpenAIChatCompletions,
+                }),
+                ResponsePipeline {
+                    parser: ResponseParserKind::OpenAIChatCompletions,
+                    renderer: ResponseRendererKind::OpenAIResponses,
+                },
             ),
             (
                 UpstreamApi::AnthropicMessages,
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
-                RequestAction::Passthrough,
-                ResponseAction::Passthrough,
+                RequestAction::Passthrough { normalizer: None },
+                ResponsePipeline {
+                    parser: ResponseParserKind::AnthropicMessages,
+                    renderer: ResponseRendererKind::AnthropicMessages,
+                },
             ),
             (
                 UpstreamApi::OpenAIResponses,
                 DownstreamApi::OpenAIResponses,
                 "/v1/responses",
-                RequestAction::NormalizeResponses,
-                ResponseAction::ResponsesToResponses,
+                RequestAction::Passthrough {
+                    normalizer: Some(RequestNormalizerKind::ArkResponses),
+                },
+                ResponsePipeline {
+                    parser: ResponseParserKind::OpenAIResponses,
+                    renderer: ResponseRendererKind::OpenAIResponses,
+                },
             ),
         ];
 
