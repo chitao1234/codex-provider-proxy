@@ -400,16 +400,14 @@ impl ResponseRecorder {
     }
 
     /// Store the transcript for `response_id` (appending the assistant turn when present)
-    /// and remember the turn's reasoning for the next request.
+    /// together with reasoning belonging to that response chain.
     pub fn record(&self, response_id: &str, assistant_turn: Option<Value>) {
-        if let Some(turn) = &assistant_turn {
-            if let Some(reasoning) = turn.get("reasoning_content").and_then(Value::as_str) {
-                if !reasoning.trim().is_empty() {
-                    self.store
-                        .set_last_reasoning(&self.provider_name, reasoning.to_string());
-                }
-            }
-        }
+        let last_reasoning = assistant_turn
+            .as_ref()
+            .and_then(|turn| turn.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.trim().is_empty())
+            .map(str::to_owned);
         let mut messages = self.request_messages.clone();
         if let Some(turn) = assistant_turn {
             messages.push(turn);
@@ -420,6 +418,7 @@ impl ResponseRecorder {
             self.provider_name.clone(),
             self.model.clone(),
             messages,
+            last_reasoning,
             now,
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
         ));

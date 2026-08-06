@@ -29,6 +29,8 @@ pub struct ResponseState {
     /// The complete chat transcript for this response, in Chat Completions
     /// message shape (system/assistant/tool), ready to prepend to a continuation.
     pub chat_messages: Vec<Value>,
+    /// Reasoning from the assistant turn that produced this response.
+    pub last_reasoning: Option<String>,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
 }
@@ -39,6 +41,7 @@ impl ResponseState {
         provider_name: String,
         model: String,
         chat_messages: Vec<Value>,
+        last_reasoning: Option<String>,
         now_unix: u64,
         ttl_secs: u64,
     ) -> Self {
@@ -47,6 +50,7 @@ impl ResponseState {
             provider_name,
             model,
             chat_messages,
+            last_reasoning,
             created_at_unix: now_unix,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
         }
@@ -61,9 +65,6 @@ pub struct ResponseStateStore {
 
 struct StoreInner {
     states: HashMap<String, ResponseState>,
-    /// Last upstream reasoning per provider, reattached on the next request when the
-    /// client echoes an empty reasoning item (Codex sends `{"summary": []}`).
-    last_reasoning: HashMap<String, String>,
     max_entries: usize,
 }
 
@@ -72,28 +73,9 @@ impl ResponseStateStore {
         Self {
             inner: Arc::new(Mutex::new(StoreInner {
                 states: HashMap::new(),
-                last_reasoning: HashMap::new(),
                 max_entries,
             })),
         }
-    }
-
-    /// Remember the last upstream reasoning for a provider (for reattachment).
-    pub fn set_last_reasoning(&self, provider_name: &str, reasoning: String) {
-        let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner
-            .last_reasoning
-            .insert(provider_name.to_string(), reasoning);
-    }
-
-    /// The last upstream reasoning remembered for a provider.
-    pub fn last_reasoning(&self, provider_name: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("response state mutex poisoned")
-            .last_reasoning
-            .get(provider_name)
-            .cloned()
     }
 
     /// Store a transcript for `response_id` (replacing any existing entry).
@@ -163,6 +145,7 @@ mod tests {
             "ds".to_string(),
             "deepseek-v4-pro".to_string(),
             vec![],
+            None,
             created,
             100,
         )
@@ -176,6 +159,7 @@ mod tests {
             "ds".to_string(),
             "m".to_string(),
             vec![json!({"role": "user", "content": "hi"})],
+            Some("think".to_string()),
             now_unix(),
             100,
         );
@@ -183,6 +167,7 @@ mod tests {
         let got = store.get("resp_1").expect("stored state retrievable");
         assert_eq!(got.response_id, "resp_1");
         assert_eq!(got.chat_messages, state.chat_messages);
+        assert_eq!(got.last_reasoning, state.last_reasoning);
         assert_eq!(store.get("resp_missing"), None);
     }
 
@@ -194,6 +179,7 @@ mod tests {
             "ds".to_string(),
             "m".to_string(),
             vec![],
+            None,
             now_unix().saturating_sub(100), // created long ago, already expired
             10,
         );

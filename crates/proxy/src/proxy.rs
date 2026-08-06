@@ -1497,23 +1497,25 @@ fn maybe_convert_request_body(
         crate::api_conversion::downstream_api_for_path(forwarded_path),
         Some(crate::api_conversion::DownstreamApi::OpenAIResponses)
     );
-    let previous_messages = if is_responses {
-        resolve_previous_response_messages(state, &attempt.provider_name, &body)
+    let previous_state = if is_responses {
+        resolve_previous_response_state(state, &attempt.provider_name, &body)
             .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?
     } else {
         None
     };
+    let previous_messages = previous_state
+        .as_ref()
+        .map(|previous| previous.chat_messages.as_slice());
+    let last_reasoning = previous_state
+        .as_ref()
+        .and_then(|previous| previous.last_reasoning.as_deref());
     let converted = crate::api_conversion::convert_request_body(
         cfg,
         &attempt.provider_name,
         forwarded_path,
         body,
-        previous_messages.as_deref(),
-        state
-            .runtime
-            .response_states()
-            .last_reasoning(&attempt.provider_name)
-            .as_deref(),
+        previous_messages,
+        last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
     if is_responses {
@@ -1557,11 +1559,14 @@ fn maybe_convert_request_body(
 
 /// Resolve the stored chat transcript for the request's `previous_response_id`,
 /// rejecting unknown/expired ids and continuations across providers.
-fn resolve_previous_response_messages(
+fn resolve_previous_response_state(
     state: &ProxyState,
     provider_name: &str,
     body: &[u8],
-) -> std::result::Result<Option<Vec<Value>>, crate::api_conversion::RequestConversionRejected> {
+) -> std::result::Result<
+    Option<crate::response_state::ResponseState>,
+    crate::api_conversion::RequestConversionRejected,
+> {
     let json: Value = serde_json::from_slice(body).map_err(|_| {
         crate::api_conversion::RequestConversionRejected::openai_invalid(
             "responses request body is not valid JSON",
@@ -1604,7 +1609,7 @@ fn resolve_previous_response_messages(
             );
         }
     }
-    Ok(Some(previous.chat_messages))
+    Ok(Some(previous))
 }
 
 fn apply_anthropic_beta_updates(headers: &mut HeaderMap, updates: &[AnthropicBetaUpdate]) {
