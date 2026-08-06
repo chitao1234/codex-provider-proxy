@@ -513,14 +513,14 @@ async fn handle_proxy_inner(
         resp_stream,
     );
     let resp_stream = if conversion_applies {
+        // The provider's upstream protocol selects the parser (chat / Messages /
+        // Responses); the forwarded path selects the downstream renderer.
+        let upstream_api = cfg
+            .providers
+            .get(&final_attempt.provider_name)
+            .map(|provider| provider.upstream_api)
+            .unwrap_or_default();
         if is_text_event_stream(&resp_headers) {
-            // Choose the upstream parser by the provider's upstream protocol, then the
-            // downstream renderer by the forwarded path.
-            let upstream_api = cfg
-                .providers
-                .get(&final_attempt.provider_name)
-                .map(|provider| provider.upstream_api)
-                .unwrap_or_default();
             match crate::api_conversion::downstream_api_for_path(forwarded_path) {
                 Some(crate::api_conversion::DownstreamApi::AnthropicMessages) => {
                     match upstream_api {
@@ -577,6 +577,7 @@ async fn handle_proxy_inner(
                     resp_stream,
                     cfg.request_body_buffer_max_bytes,
                     forwarded_path.to_string(),
+                    upstream_api,
                     final_attempt.response_recorder.clone(),
                 ),
             ) as BoxRespStream
@@ -810,8 +811,13 @@ fn prepare_upstream_attempt(
         crate::api_conversion::conversion_upstream_path(&route.provider, forwarded_path);
     let url = build_outgoing_url(&route.provider, upstream_path, incoming_query)?;
     let mut headers = base_headers.clone();
+    let auth_header = http::HeaderName::from_bytes(route.provider.auth_header_name.as_bytes())
+        .unwrap_or(header::AUTHORIZATION);
+    // Replace any downstream Authorization with the provider's auth header (e.g.
+    // Anthropic-compatible endpoints use x-api-key and reject a stray Authorization).
+    headers.remove(header::AUTHORIZATION);
     headers.insert(
-        header::AUTHORIZATION,
+        auth_header,
         http::HeaderValue::from_str(&route.provider.authorization_value())
             .context("build Authorization header")?,
     );
@@ -4731,7 +4737,12 @@ mod tests {
     #[test]
     fn convert_non_streaming_body_parses_chat_json() {
         let body = Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}");
-        let out = crate::api_conversion::convert_non_streaming_body(body, "/v1/messages").unwrap();
+        let out = crate::api_conversion::convert_non_streaming_body(
+            body,
+            "/v1/messages",
+            codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["type"], "message");
     }
@@ -4745,6 +4756,7 @@ mod tests {
             inner,
             1024 * 1024,
             "/v1/messages".to_string(),
+            codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
             None,
         );
         let mut delivered = BytesMut::new();

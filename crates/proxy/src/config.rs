@@ -33,6 +33,9 @@ pub struct Provider {
     pub base_url: Url,
     pub api_key: String,
     pub authorization_header: Option<String>,
+    /// HTTP header name carrying the API key (default "authorization").
+    /// Anthropic-compatible endpoints use "x-api-key".
+    pub auth_header_name: String,
     /// Upstream API dialect. Passthrough by default (existing configs unchanged).
     pub upstream_api: UpstreamApi,
     /// Downstream dialects this provider converts from. Empty = no conversion.
@@ -48,8 +51,17 @@ impl Provider {
         if let Some(v) = &self.authorization_header {
             return v.clone();
         }
+        if self.auth_header_name.eq_ignore_ascii_case("x-api-key") {
+            // Anthropic-compatible endpoints expect the bare key in x-api-key,
+            // not a Bearer prefix.
+            return self.api_key.clone();
+        }
         format!("Bearer {}", self.api_key)
     }
+}
+
+fn default_auth_header_name() -> String {
+    "authorization".to_string()
 }
 
 impl Default for Provider {
@@ -58,6 +70,7 @@ impl Default for Provider {
             base_url: Url::parse("https://api.example.com/").expect("static URL is valid"),
             api_key: String::new(),
             authorization_header: None,
+            auth_header_name: default_auth_header_name(),
             upstream_api: UpstreamApi::Passthrough,
             accept_downstream_apis: Vec::new(),
             default_capabilities: None,
@@ -434,6 +447,8 @@ struct ProviderFile {
     api_key: String,
     #[serde(default)]
     authorization_header: Option<String>,
+    #[serde(default = "default_auth_header_name")]
+    auth_header_name: String,
     #[serde(default)]
     upstream_api: UpstreamApi,
     #[serde(default)]
@@ -462,6 +477,7 @@ impl Config {
                     base_url: provider.base_url,
                     api_key: provider.api_key,
                     authorization_header: provider.authorization_header,
+                    auth_header_name: provider.auth_header_name,
                     upstream_api: provider.upstream_api,
                     accept_downstream_apis: provider.accept_downstream_apis,
                     default_capabilities: provider.capabilities,

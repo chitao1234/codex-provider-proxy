@@ -286,21 +286,44 @@ pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value
 }
 
 /// Convert a non-streaming upstream Chat Completions body into the downstream dialect.
-pub fn convert_non_streaming_body(body: Bytes, path: &str) -> Result<Bytes, std::io::Error> {
+/// Convert a non-streaming upstream response body into the downstream dialect,
+/// dispatching on the upstream protocol (chat / Messages / Responses).
+pub fn convert_non_streaming_body(
+    body: Bytes,
+    path: &str,
+    upstream_api: UpstreamApi,
+) -> Result<Bytes, std::io::Error> {
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "upstream chat response is not valid JSON",
+            "upstream response is not valid JSON",
         )
     })?;
-    let converted = match downstream_api_for_path(path) {
-        Some(DownstreamApi::AnthropicMessages) => convert_chat_response(&json),
-        Some(DownstreamApi::OpenAiResponses) => convert_chat_response_to_responses(&json),
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unknown downstream path for response conversion",
-            ));
+    let downstream = downstream_api_for_path(path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown downstream path")
+    })?;
+    let converted = match (upstream_api, downstream) {
+        // Chat upstream: existing conversion.
+        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::AnthropicMessages) => {
+            convert_chat_response(&json)
+        }
+        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::OpenAiResponses) => {
+            convert_chat_response_to_responses(&json)
+        }
+        // Messages upstream (Anthropic message JSON): render downstream directly.
+        (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => {
+            // The body is already Anthropic Messages; pass through as-is.
+            return Ok(body);
+        }
+        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAiResponses) => {
+            codex_provider_proxy_api_conversion::responses_renderer::convert_messages_response_to_responses(&json)
+        }
+        // Responses upstream: normalize to downstream.
+        (UpstreamApi::OpenAiResponses, DownstreamApi::AnthropicMessages) => {
+            codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_messages(&json)
+        }
+        (UpstreamApi::OpenAiResponses, DownstreamApi::OpenAiResponses) => {
+            codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_responses(&json)
         }
     }
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -309,7 +332,7 @@ pub fn convert_non_streaming_body(body: Bytes, path: &str) -> Result<Bytes, std:
         .map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "failed to serialize converted chat response",
+                "failed to serialize converted response",
             )
         })
 }
@@ -522,6 +545,7 @@ pin_project! {
         inner: S,
         max_bytes: usize,
         path: String,
+        upstream_api: UpstreamApi,
         recorder: Option<ResponseRecorder>,
         buffered: BytesMut,
         result: Option<Result<Bytes, std::io::Error>>,
@@ -536,12 +560,14 @@ impl<S> NonStreamingConversionStream<S> {
         inner: S,
         max_bytes: usize,
         path: String,
+        upstream_api: UpstreamApi,
         recorder: Option<ResponseRecorder>,
     ) -> Self {
         Self {
             inner,
             max_bytes,
             path,
+            upstream_api,
             recorder,
             buffered: BytesMut::new(),
             result: None,
@@ -588,7 +614,11 @@ where
                     if let Some(recorder) = &this.recorder {
                         if let Ok(json) = serde_json::from_slice::<Value>(&buffered) {
                             let turn = chat_response_assistant_turn(&json);
-                            let converted = convert_non_streaming_body(buffered.clone(), this.path);
+                            let converted = convert_non_streaming_body(
+                                buffered.clone(),
+                                this.path,
+                                *this.upstream_api,
+                            );
                             if let Ok(converted) = converted {
                                 if let Ok(body) = serde_json::from_slice::<Value>(&converted) {
                                     if let Some(response_id) =
@@ -600,7 +630,11 @@ where
                             }
                         }
                     }
-                    *this.result = Some(convert_non_streaming_body(buffered, this.path));
+                    *this.result = Some(convert_non_streaming_body(
+                        buffered,
+                        this.path,
+                        *this.upstream_api,
+                    ));
                     return Poll::Ready(this.result.take());
                 }
                 Poll::Pending => return Poll::Pending,

@@ -11,6 +11,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 use crate::chat::ChatUsage;
+use crate::error::ConversionError;
 use crate::sse::encode_sse_event;
 use crate::stream::{StopReason, StreamEvent};
 
@@ -438,6 +439,135 @@ pub fn responses_usage(usage: ChatUsage) -> Value {
     Value::Object(out)
 }
 
+/// Convert a non-streaming Anthropic Messages response body into an official
+/// Responses response object (for Messages-upstream providers).
+pub fn convert_messages_response_to_responses(body: &Value) -> Result<Value, ConversionError> {
+    // The Messages response body is the message object itself
+    // ({"id","type":"message","content":[...],...}).
+    let message = body
+        .as_object()
+        .ok_or_else(|| ConversionError::invalid("Messages response is not an object"))?;
+    let response_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let stop_reason = message
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("end_turn");
+
+    let mut output: Vec<Value> = Vec::new();
+    let mut message_content: Vec<Value> = Vec::new();
+    let mut reasoning_summary = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_array) {
+        for block in content {
+            let Some(block) = block.as_object() else {
+                continue;
+            };
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                        reasoning_summary.push_str(text);
+                    }
+                }
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        message_content
+                            .push(json!({"type": "output_text", "text": text, "annotations": []}));
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    if !reasoning_summary.trim().is_empty() {
+        output.push(json!({
+            "id": format!("rs_{}", &response_id[5..]),
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning_summary}],
+        }));
+    }
+    if !message_content.is_empty() || !tool_calls.is_empty() {
+        let mut msg = serde_json::Map::new();
+        msg.insert(
+            "id".to_string(),
+            json!(format!("msg_{}", &response_id[5..])),
+        );
+        msg.insert("type".to_string(), json!("message"));
+        msg.insert("status".to_string(), json!("completed"));
+        msg.insert("role".to_string(), json!("assistant"));
+        msg.insert("content".to_string(), Value::Array(message_content));
+        output.push(Value::Object(msg));
+    }
+    for call in tool_calls {
+        output.push(call);
+    }
+
+    // usage from the Messages message.
+    let usage = message.get("usage").and_then(Value::as_object);
+    let mut usage_out = serde_json::Map::new();
+    if let Some(input) = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert("input_tokens".to_string(), json!(input));
+    }
+    if let Some(output) = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert("output_tokens".to_string(), json!(output));
+    }
+    if let Some(cached) = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert(
+            "input_tokens_details".to_string(),
+            json!({"cached_tokens": cached}),
+        );
+    }
+
+    Ok(json!({
+        "id": format!("resp_{response_id}"),
+        "object": "response",
+        "status": if stop_reason == "max_tokens" { "incomplete" } else { "completed" },
+        "incomplete_details": if stop_reason == "max_tokens" {
+            json!({"reason": "max_output_tokens"})
+        } else {
+            Value::Null
+        },
+        "error": null,
+        "model": model,
+        "output": output,
+        "usage": Value::Object(usage_out),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +734,49 @@ mod tests {
         let turn = renderer.assistant_turn().expect("assistant turn recorded");
         assert_eq!(turn["reasoning_content"], "think");
         assert_eq!(turn["tool_calls"][0]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn converts_messages_response_to_responses_non_streaming() {
+        let body = json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "thinking", "thinking": "let me think", "signature": "s"},
+                {"type": "text", "text": "Hello"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2}
+        });
+        let out = convert_messages_response_to_responses(&body).unwrap();
+        assert_eq!(out["id"], "resp_msg_123");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert_eq!(out["output"][1]["type"], "message");
+        assert_eq!(out["output"][1]["content"][0]["text"], "Hello");
+        assert_eq!(out["output"][2]["type"], "function_call");
+        assert_eq!(out["output"][2]["name"], "get_weather");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 2);
+    }
+
+    #[test]
+    fn converts_messages_response_incomplete_on_max_tokens() {
+        let body = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = convert_messages_response_to_responses(&body).unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
     }
 
     #[test]

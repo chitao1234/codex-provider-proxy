@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use crate::chat::ChatUsage;
+use crate::error::ConversionError;
 use crate::sse::encode_sse_event;
 use crate::stream::{StopReason, StreamEvent};
 
@@ -351,6 +352,154 @@ fn map_stop_reason(reason: StopReason) -> &'static str {
     }
 }
 
+/// Convert a non-streaming OpenAI Responses response object into an Anthropic
+/// Messages response body (for Responses-upstream providers).
+pub fn convert_responses_response_to_messages(body: &Value) -> Result<Value, ConversionError> {
+    let response = body
+        .as_object()
+        .ok_or_else(|| ConversionError::invalid("Responses response is not an object"))?;
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let status = response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+
+    let mut content: Vec<Value> = Vec::new();
+    let mut stop_reason = "end_turn";
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") => {
+                    // Reasoning summary -> thinking block.
+                    if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                        let text: Vec<String> = summary
+                            .iter()
+                            .filter_map(|s| {
+                                s.get("text").and_then(Value::as_str).map(str::to_owned)
+                            })
+                            .collect();
+                        if !text.is_empty() {
+                            content.push(json!({
+                                "type": "thinking",
+                                "thinking": text.join("\n"),
+                                "signature": "",
+                            }));
+                        }
+                    }
+                }
+                Some("message") => {
+                    if let Some(content_parts) = item.get("content").and_then(Value::as_array) {
+                        for part in content_parts {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                content.push(json!({"type": "text", "text": text}));
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(|args| {
+                            serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}))
+                        })
+                        .unwrap_or_else(|| json!({}));
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": arguments,
+                    }));
+                    stop_reason = "tool_use";
+                }
+                _ => {}
+            }
+        }
+    }
+    if status == "incomplete" {
+        stop_reason = "max_tokens";
+    }
+
+    // usage.
+    let usage = response.get("usage").and_then(Value::as_object);
+    let mut usage_out = serde_json::Map::new();
+    if let Some(input) = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert("input_tokens".to_string(), json!(input));
+    }
+    if let Some(output) = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert("output_tokens".to_string(), json!(output));
+    }
+    if let Some(cached) = usage
+        .and_then(|u| u.get("input_tokens_details"))
+        .and_then(Value::as_object)
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage_out.insert("cache_read_input_tokens".to_string(), json!(cached));
+    }
+
+    Ok(json!({
+        "id": format!("msg_{response_id}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": Value::Object(usage_out),
+    }))
+}
+
+/// Normalize a non-streaming third-party Responses response object to the official
+/// shape (strip non-standard fields, ensure resp_ id prefix).
+pub fn convert_responses_response_to_responses(body: &Value) -> Result<Value, ConversionError> {
+    let mut out = body.clone();
+    let Some(object) = out.as_object_mut() else {
+        return Err(ConversionError::invalid(
+            "Responses response is not an object",
+        ));
+    };
+    // Normalize the id prefix.
+    if let Some(id) = object.get("id").and_then(Value::as_str) {
+        if !id.starts_with("resp_") {
+            object.insert("id".to_string(), json!(format!("resp_{id}")));
+        }
+    }
+    // Strip non-standard fields that third parties add (Qwen x_details, MiniMax
+    // output_text / safety_identifier / conversation).
+    for field in [
+        "x_details",
+        "output_text",
+        "safety_identifier",
+        "conversation",
+    ] {
+        object.remove(field);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +681,52 @@ mod tests {
         assert!(text.contains("event: message_delta"));
         assert!(text.contains("event: message_stop"));
         assert_eq!(text.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn converts_responses_response_to_messages_non_streaming() {
+        let body = json!({
+            "id": "resp_123",
+            "object": "response",
+            "status": "completed",
+            "model": "m",
+            "output": [
+                {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": "thinking here"}]},
+                {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "Hello", "annotations": []}]},
+                {"id": "fc_1", "type": "function_call", "status": "completed", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 2}}
+        });
+        let out = convert_responses_response_to_messages(&body).unwrap();
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][0]["thinking"], "thinking here");
+        assert_eq!(out["content"][1]["type"], "text");
+        assert_eq!(out["content"][1]["text"], "Hello");
+        assert_eq!(out["content"][2]["type"], "tool_use");
+        assert_eq!(out["content"][2]["name"], "get_weather");
+        assert_eq!(out["content"][2]["input"]["city"], "Paris");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 2);
+    }
+
+    #[test]
+    fn normalizes_responses_response_id_and_strips_extra_fields() {
+        let body = json!({
+            "id": "06c38eca53023d7eb041ff0a2c8fcf5c",
+            "object": "response",
+            "status": "completed",
+            "output_text": "Hello",
+            "x_details": [1, 2],
+            "safety_identifier": null,
+            "output": []
+        });
+        let out = convert_responses_response_to_responses(&body).unwrap();
+        assert_eq!(out["id"], "resp_06c38eca53023d7eb041ff0a2c8fcf5c");
+        assert!(out.get("output_text").is_none());
+        assert!(out.get("x_details").is_none());
+        assert!(out.get("safety_identifier").is_none());
     }
 
     #[test]
