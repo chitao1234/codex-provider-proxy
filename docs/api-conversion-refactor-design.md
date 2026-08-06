@@ -154,6 +154,11 @@ Unknown provider-specific identity/cache fields remain in the lossless extension
 normalizers may add explicit spellings later, but a missing mapping must not make parsing fail or
 erase the field from continuation state.
 
+Where a target protocol has no separate prompt-cache key, the renderer applies a deliberate
+identity mapping instead of leaking an unsupported source field: a Responses `prompt_cache_key`
+becomes Anthropic `metadata.user_id` (or the Chat `user` field) when no explicit end-user identity
+is present. The source-only cache-key fields are then omitted from that target request.
+
 `previous_response_id` itself is not blindly forwarded during cross-protocol rendering because a
 proxy-synthesized response id is meaningful only to the proxy's local state store. The restored
 transcript and context are rendered instead.

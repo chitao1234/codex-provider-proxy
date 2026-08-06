@@ -5121,7 +5121,7 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "how are you?");
         assert_eq!(second["user"], "user-42");
-        assert_eq!(second["prompt_cache_key"], "conversation-cache-7");
+        assert!(second.get("prompt_cache_key").is_none());
         assert_eq!(second["session_id"], "provider-session-9");
         let _ = shutdown_tx.send(());
     }

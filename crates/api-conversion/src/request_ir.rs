@@ -208,18 +208,9 @@ impl RequestIr {
         self.context.include = self.original.get("include").cloned();
         self.context.truncation = self.original.get("truncation").cloned();
 
-        for key in [
-            "session_id",
-            "conversation_id",
-            "cache_key",
-            "request_cache_key",
-            "tenant_id",
-            "project_id",
-        ] {
-            if let Some(value) = self.original.get(key) {
-                self.context
-                    .extensions
-                    .insert(key.to_owned(), value.clone());
+        for (key, value) in &self.original {
+            if is_context_extension_key(key) {
+                self.context.extensions.insert(key.clone(), value.clone());
             }
         }
     }
@@ -624,7 +615,16 @@ impl RequestIr {
     }
 
     fn apply_context(&self, target: Protocol, out: &mut Map<String, Value>) {
+        if target != Protocol::OpenAiResponses {
+            out.remove("prompt_cache_key");
+            out.remove("prompt_cache_retention");
+        }
         for (key, value) in &self.context.extensions {
+            if target != Protocol::OpenAiResponses
+                && matches!(key.as_str(), "prompt_cache_key" | "prompt_cache_retention")
+            {
+                continue;
+            }
             out.entry(key.clone()).or_insert_with(|| value.clone());
         }
         if let Some(metadata) = &self.context.metadata {
@@ -643,13 +643,15 @@ impl RequestIr {
             out.entry("safety_identifier".to_owned())
                 .or_insert_with(|| Value::String(identifier.clone()));
         }
-        if let Some(key) = &self.context.prompt_cache_key {
-            out.entry("prompt_cache_key".to_owned())
-                .or_insert_with(|| Value::String(key.clone()));
-        }
-        if let Some(retention) = &self.context.prompt_cache_retention {
-            out.entry("prompt_cache_retention".to_owned())
-                .or_insert_with(|| retention.clone());
+        if target == Protocol::OpenAiResponses {
+            if let Some(key) = &self.context.prompt_cache_key {
+                out.entry("prompt_cache_key".to_owned())
+                    .or_insert_with(|| Value::String(key.clone()));
+            }
+            if let Some(retention) = &self.context.prompt_cache_retention {
+                out.entry("prompt_cache_retention".to_owned())
+                    .or_insert_with(|| retention.clone());
+            }
         }
         for (key, value) in [
             ("store", self.context.store.as_ref()),
@@ -663,7 +665,12 @@ impl RequestIr {
 
         match target {
             Protocol::AnthropicMessages => {
-                if let Some(user_id) = &self.context.end_user_id {
+                if let Some(user_id) = self
+                    .context
+                    .end_user_id
+                    .as_ref()
+                    .or(self.context.prompt_cache_key.as_ref())
+                {
                     let metadata = out
                         .entry("metadata".to_owned())
                         .or_insert_with(|| Value::Object(Map::new()));
@@ -675,7 +682,12 @@ impl RequestIr {
                 }
             }
             Protocol::OpenAiChatCompletions => {
-                if let Some(user_id) = &self.context.end_user_id {
+                if let Some(user_id) = self
+                    .context
+                    .end_user_id
+                    .as_ref()
+                    .or(self.context.prompt_cache_key.as_ref())
+                {
                     out.entry("user".to_owned())
                         .or_insert_with(|| Value::String(user_id.clone()));
                 }
@@ -688,6 +700,25 @@ impl RequestIr {
             }
         }
     }
+}
+
+fn is_context_extension_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "session",
+        "conversation",
+        "thread",
+        "prompt_cache",
+        "cache_key",
+        "cache_id",
+        "user_id",
+        "tenant",
+        "project",
+        "trace_id",
+        "client_id",
+    ]
+    .iter()
+    .any(|fragment| key.contains(fragment))
 }
 
 fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
@@ -1345,9 +1376,27 @@ mod tests {
         assert_eq!(messages["metadata"]["trace"], "root");
         assert_eq!(messages["conversation"]["id"], "conv-1");
         assert_eq!(messages["safety_identifier"], "safe-1");
-        assert_eq!(messages["prompt_cache_key"], "cache-1");
-        assert_eq!(messages["prompt_cache_retention"], "24h");
+        assert!(messages.get("prompt_cache_key").is_none());
+        assert!(messages.get("prompt_cache_retention").is_none());
         assert_eq!(messages["session_id"], "vendor-session-1");
         assert!(messages.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn responses_cache_key_maps_to_messages_user_id() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "prompt_cache_key": "cache-as-identity",
+                "input": "hello"
+            }),
+        )
+        .unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(messages["metadata"]["user_id"], "cache-as-identity");
+        assert!(messages.get("prompt_cache_key").is_none());
     }
 }
