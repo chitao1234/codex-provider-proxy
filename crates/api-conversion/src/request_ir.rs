@@ -25,14 +25,19 @@ pub struct RequestIr {
     pub original: Map<String, Value>,
     pub model: Option<String>,
     pub stream: Option<bool>,
-    pub messages: Vec<IrMessage>,
+    pub transcript: Vec<IrConversationItem>,
     pub instructions: Vec<Value>,
-    pub reasoning: Vec<Value>,
     pub tools: Vec<IrTool>,
     pub tool_choice: Option<Value>,
     pub parameters: BTreeMap<String, Value>,
     pub continuation: BTreeMap<String, Value>,
     pub context: RequestContext,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrConversationItem {
+    Message(IrMessage),
+    Reasoning(Value),
 }
 
 /// Stateful request context shared by protocols and provider dialects.
@@ -131,9 +136,8 @@ impl RequestIr {
             original,
             model,
             stream,
-            messages: Vec::new(),
+            transcript: Vec::new(),
             instructions: Vec::new(),
-            reasoning: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
             parameters: BTreeMap::new(),
@@ -159,23 +163,24 @@ impl RequestIr {
     ) -> Result<Self, ConversionError> {
         let mut ir = Self::parse(protocol, body)?;
         if protocol == Protocol::OpenAiResponses {
+            let current_transcript = std::mem::take(&mut ir.transcript);
             if let Some(previous_request) = previous_request {
-                let mut messages = previous_request.messages.clone();
-                messages.extend(ir.messages);
-                ir.messages = messages;
-                if ir.reasoning.is_empty() {
-                    ir.reasoning = previous_request.reasoning.clone();
-                }
+                ir.transcript = previous_request.transcript.clone();
                 ir.inherit_context(&previous_request.context);
             }
             if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
-                if ir.reasoning.is_empty() {
-                    ir.reasoning.push(serde_json::json!({
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": reasoning}]
-                    }));
+                let current_has_reasoning = current_transcript
+                    .iter()
+                    .any(|item| matches!(item, IrConversationItem::Reasoning(_)));
+                if !current_has_reasoning {
+                    ir.transcript
+                        .push(IrConversationItem::Reasoning(serde_json::json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning}]
+                        })));
                 }
             }
+            ir.transcript.extend(current_transcript);
         }
         Ok(ir)
     }
@@ -285,7 +290,7 @@ impl RequestIr {
         ) else {
             return;
         };
-        self.messages.extend(parsed.messages);
+        self.transcript.extend(parsed.transcript);
     }
 
     fn parse_messages(&mut self) {
@@ -298,13 +303,35 @@ impl RequestIr {
             .and_then(Value::as_array)
             .cloned()
         {
+            let mut saw_non_system = false;
             for value in &messages {
-                if value.get("role").and_then(Value::as_str) == Some("system") {
+                if !saw_non_system && value.get("role").and_then(Value::as_str) == Some("system") {
                     if let Some(content) = value.get("content") {
                         self.instructions.push(content.clone());
                     }
                 } else {
-                    self.parse_message(value, Protocol::AnthropicMessages);
+                    if value.get("role").and_then(Value::as_str) != Some("system") {
+                        saw_non_system = true;
+                    }
+                    if value.get("role").and_then(Value::as_str) == Some("system") {
+                        let text = value
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        self.transcript.push(IrConversationItem::Message(IrMessage {
+                            role: "user".to_owned(),
+                            content: vec![IrContent::Text {
+                                text: format!("<system-reminder>\n{text}\n</system-reminder>"),
+                                extra: Map::new(),
+                            }],
+                            item_id: None,
+                            tool_call_id: None,
+                            tool_calls: Vec::new(),
+                            extra: Map::new(),
+                        }));
+                    } else {
+                        self.parse_message(value, Protocol::AnthropicMessages);
+                    }
                 }
             }
         }
@@ -353,7 +380,7 @@ impl RequestIr {
         }
         if let Some(input) = self.original.get("input") {
             if let Some(text) = input.as_str() {
-                self.messages.push(IrMessage {
+                self.transcript.push(IrConversationItem::Message(IrMessage {
                     role: "user".to_owned(),
                     content: vec![IrContent::Text {
                         text: text.to_owned(),
@@ -363,7 +390,7 @@ impl RequestIr {
                     tool_call_id: None,
                     tool_calls: Vec::new(),
                     extra: Map::new(),
-                });
+                }));
             }
         }
         if let Some(input) = self
@@ -375,24 +402,32 @@ impl RequestIr {
             for value in &input {
                 match value.get("type").and_then(Value::as_str) {
                     Some("message") => self.parse_message(value, Protocol::OpenAiResponses),
-                    Some("function_call") => self.messages.push(IrMessage::assistant_tool_call(
-                        IrToolCall::from_responses_call(value),
+                    Some("function_call") => self.transcript.push(IrConversationItem::Message(
+                        IrMessage::assistant_tool_call(IrToolCall::from_responses_call(value)),
                     )),
-                    Some("reasoning") => self.reasoning.push(value.clone()),
-                    Some("function_call_output") => self.messages.push(IrMessage {
-                        role: "tool".to_owned(),
-                        content: vec![IrContent::Raw(
-                            value.get("output").cloned().unwrap_or(Value::Null),
-                        )],
-                        item_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
-                        tool_call_id: value
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        tool_calls: Vec::new(),
-                        extra: Map::new(),
-                    }),
-                    _ => self.messages.push(IrMessage::custom(value.clone())),
+                    Some("reasoning") => self
+                        .transcript
+                        .push(IrConversationItem::Reasoning(value.clone())),
+                    Some("function_call_output") => {
+                        self.transcript.push(IrConversationItem::Message(IrMessage {
+                            role: "tool".to_owned(),
+                            content: vec![IrContent::Raw(
+                                value.get("output").cloned().unwrap_or(Value::Null),
+                            )],
+                            item_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+                            tool_call_id: value
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            tool_calls: Vec::new(),
+                            extra: Map::new(),
+                        }))
+                    }
+                    _ => self
+                        .transcript
+                        .push(IrConversationItem::Message(IrMessage::custom(
+                            value.clone(),
+                        ))),
                 }
             }
         }
@@ -407,7 +442,10 @@ impl RequestIr {
 
     fn parse_message(&mut self, value: &Value, protocol: Protocol) {
         let Some(object) = value.as_object() else {
-            self.messages.push(IrMessage::custom(value.clone()));
+            self.transcript
+                .push(IrConversationItem::Message(IrMessage::custom(
+                    value.clone(),
+                )));
             return;
         };
         let role = object
@@ -432,7 +470,7 @@ impl RequestIr {
                 message.tool_calls = calls.iter().map(IrToolCall::from_chat).collect();
             }
         }
-        self.messages.push(message);
+        self.transcript.push(IrConversationItem::Message(message));
     }
 
     fn collect_parameters(&mut self) {
@@ -461,7 +499,9 @@ impl RequestIr {
     ) -> Result<Value, ConversionError> {
         match target {
             Protocol::AnthropicMessages => self.render_messages(caps),
-            Protocol::OpenAiChatCompletions => self.render_chat(caps),
+            Protocol::OpenAiChatCompletions => self
+                .render_chat_with_capabilities(caps)
+                .map(|(rendered, _)| rendered),
             Protocol::OpenAiResponses => self.render_responses(caps),
         }
     }
@@ -470,7 +510,7 @@ impl RequestIr {
         &self,
         caps: &ModelCapabilities,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        let mut rendered = self.render_chat(caps)?;
+        let mut rendered = self.render_chat_base(caps)?;
         let report = self.normalize_chat_capabilities(
             caps,
             rendered
@@ -511,17 +551,71 @@ impl RequestIr {
         out
     }
 
-    fn render_chat(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+    fn render_chat_base(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
         let mut out = self.base_output(Protocol::OpenAiChatCompletions);
         self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
-        let mut messages = Vec::new();
-        for instruction in &self.instructions {
-            if let Some(text) = instruction.as_str() {
-                messages.push(serde_json::json!({"role":"system", "content":text}));
+        for key in [
+            "metadata",
+            "cache_control",
+            "context_management",
+            "service_tier",
+        ] {
+            if self.protocol == Protocol::AnthropicMessages {
+                out.remove(key);
             }
         }
-        for message in &self.messages {
-            messages.extend(message.to_chat_values());
+        let mut messages = Vec::new();
+        for instruction in &self.instructions {
+            match instruction {
+                Value::String(text) => {
+                    messages.push(serde_json::json!({"role":"system", "content":text}));
+                }
+                Value::Array(blocks) => {
+                    for block in blocks {
+                        let Some(text) = block.get("text").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if text.starts_with("x-anthropic-billing-header:") {
+                            continue;
+                        }
+                        messages.push(serde_json::json!({"role":"system", "content":text}));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut pending_reasoning = None;
+        for item in &self.transcript {
+            match item {
+                IrConversationItem::Reasoning(reasoning) => {
+                    if let Some(text) = reasoning_text(reasoning) {
+                        pending_reasoning = Some(text);
+                    }
+                }
+                IrConversationItem::Message(message) => {
+                    let mut rendered = message.to_chat_values();
+                    if message.role == "assistant" {
+                        if let Some(reasoning) = pending_reasoning.take() {
+                            if let Some(object) =
+                                rendered.first_mut().and_then(Value::as_object_mut)
+                            {
+                                object.insert(
+                                    "reasoning_content".to_owned(),
+                                    Value::String(reasoning),
+                                );
+                            }
+                        }
+                    }
+                    messages.extend(rendered);
+                }
+            }
+        }
+        if let Some(reasoning) = pending_reasoning {
+            messages.push(serde_json::json!({
+                "role":"assistant",
+                "content":"",
+                "reasoning_content":reasoning
+            }));
         }
         out.insert("messages".to_owned(), Value::Array(messages));
         if !self.tools.is_empty() {
@@ -534,7 +628,6 @@ impl RequestIr {
             out.insert("tool_choice".to_owned(), choice.clone());
         }
         normalize_chat_parameters(&mut out, caps);
-        self.normalize_chat_capabilities(caps, &mut out)?;
         Ok(Value::Object(out))
     }
 
@@ -543,9 +636,36 @@ impl RequestIr {
         caps: &ModelCapabilities,
         out: &mut Map<String, Value>,
     ) -> Result<RequestConversionReport, ConversionError> {
+        if let Some(value) = out.remove("max_tokens") {
+            let value = value.as_u64().map_or(value.clone(), |value| {
+                Value::Number(
+                    caps.max_tokens_cap
+                        .map_or(value, |cap| value.min(cap))
+                        .into(),
+                )
+            });
+            let field = match caps.max_tokens_field {
+                crate::dialect::MaxTokensField::MaxTokens => "max_tokens",
+                crate::dialect::MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+            };
+            out.insert(field.to_owned(), value);
+        }
+        if self.stream == Some(true) && caps.stream_include_usage {
+            out.insert(
+                "stream_options".to_owned(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+        if let Some(split) = caps.reasoning_split {
+            out.insert("reasoning_split".to_owned(), Value::Bool(split));
+        }
         if self
-            .messages
+            .transcript
             .iter()
+            .filter_map(|item| match item {
+                IrConversationItem::Message(message) => Some(message),
+                IrConversationItem::Reasoning(_) => None,
+            })
             .flat_map(|message| message.content.iter())
             .any(|content| matches!(content, IrContent::Image(_)))
             && !caps.image_input
@@ -634,6 +754,22 @@ impl RequestIr {
         {
             out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
         }
+        if let Some(choice) = self.tool_choice.as_ref() {
+            if let Some(object) = choice.as_object() {
+                let mapped = match object.get("type").and_then(Value::as_str) {
+                    Some("auto") => Some(serde_json::json!("auto")),
+                    Some("any") => Some(serde_json::json!("required")),
+                    Some("none") => Some(serde_json::json!("none")),
+                    Some("tool") => object.get("name").map(
+                        |name| serde_json::json!({"type":"function", "function":{"name":name}}),
+                    ),
+                    _ => None,
+                };
+                if let Some(mapped) = mapped {
+                    out.insert("tool_choice".to_owned(), mapped);
+                }
+            }
+        }
         if let Some(format) = self
             .original
             .get("output_config")
@@ -681,21 +817,109 @@ impl RequestIr {
                 match caps.server_tools {
                     ServerToolPolicy::Drop => report.dropped_server_tools.push(name),
                     ServerToolPolicy::MapToFunction => {
-                        report.mapped_server_tools.push(name.clone());
-                        rendered_tools.push(server_tool_as_function(tool));
+                        if matches!(tool.kind.as_str(), kind if kind.starts_with("web_search") || kind.starts_with("web_fetch"))
+                        {
+                            report.mapped_server_tools.push(name.clone());
+                            rendered_tools.push(server_tool_as_function(tool));
+                        } else {
+                            report.dropped_server_tools.push(name);
+                        }
                     }
-                    ServerToolPolicy::Passthrough | ServerToolPolicy::ProviderNative => {
-                        rendered_tools.push(tool.raw.clone());
+                    ServerToolPolicy::Passthrough => rendered_tools.push(tool.raw.clone()),
+                    ServerToolPolicy::ProviderNative => {
+                        if tool.kind.starts_with("web_search") {
+                            if let Some(template) = &caps.search_tool_template {
+                                rendered_tools.push(
+                                    crate::conversion_utils::render_search_tool_template(
+                                        template,
+                                        self.last_user_text().as_deref(),
+                                    ),
+                                );
+                                report.mapped_server_tools.push(name);
+                            } else if caps.search_request_params.is_some() {
+                                report.mapped_server_tools.push(name);
+                            } else {
+                                report.dropped_server_tools.push(name);
+                            }
+                        } else if (tool.kind.starts_with("web_fetch")
+                            && caps.fetch_request_params.is_some())
+                            || (tool.kind.starts_with("code_execution")
+                                && caps.code_interpreter_request_params.is_some())
+                        {
+                            report.mapped_server_tools.push(name);
+                        } else {
+                            report.dropped_server_tools.push(name);
+                        }
                     }
                 }
             } else {
                 rendered_tools.push(tool.to_chat());
             }
         }
-        if !self.tools.is_empty() {
+        if !rendered_tools.is_empty() {
             out.insert("tools".to_owned(), Value::Array(rendered_tools));
+        } else {
+            out.remove("tools");
+        }
+        if !report.mapped_server_tools.is_empty() {
+            for (tool_name, params) in [
+                ("web_search", caps.search_request_params.as_ref()),
+                ("web_fetch", caps.fetch_request_params.as_ref()),
+                (
+                    "code_execution",
+                    caps.code_interpreter_request_params.as_ref(),
+                ),
+            ] {
+                if report
+                    .mapped_server_tools
+                    .iter()
+                    .any(|name| name == tool_name)
+                {
+                    if let Some(Value::Object(params)) = params {
+                        out.extend(params.clone());
+                    }
+                }
+            }
+        }
+        for tool_name in &caps.always_enable_tools {
+            report.mapped_server_tools.push(tool_name.clone());
+            let params = match tool_name.as_str() {
+                "web_search" => caps.search_request_params.as_ref(),
+                "web_fetch" => caps.fetch_request_params.as_ref(),
+                "code_execution" => caps.code_interpreter_request_params.as_ref(),
+                _ => None,
+            };
+            if let Some(Value::Object(params)) = params {
+                out.extend(params.clone());
+            }
+        }
+        if report
+            .mapped_server_tools
+            .iter()
+            .any(|name| name == "code_execution")
+        {
+            out.insert("stream".to_owned(), Value::Bool(true));
         }
         Ok(report)
+    }
+
+    fn last_user_text(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|item| {
+            let IrConversationItem::Message(message) = item else {
+                return None;
+            };
+            (message.role == "user").then(|| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        IrContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        })
     }
 
     fn render_messages(&self, _caps: &ModelCapabilities) -> Result<Value, ConversionError> {
@@ -726,17 +950,19 @@ impl RequestIr {
             );
         }
         let mut messages = Vec::new();
-        if !self.reasoning.is_empty() {
-            let blocks = self
-                .reasoning
-                .iter()
-                .flat_map(reasoning_to_messages_blocks)
-                .collect::<Vec<_>>();
-            if !blocks.is_empty() {
-                messages.push(serde_json::json!({"role":"assistant", "content":blocks}));
+        for item in &self.transcript {
+            match item {
+                IrConversationItem::Reasoning(reasoning) => {
+                    let blocks = reasoning_to_messages_blocks(reasoning);
+                    if !blocks.is_empty() {
+                        messages.push(serde_json::json!({"role":"assistant", "content":blocks}));
+                    }
+                }
+                IrConversationItem::Message(message) => {
+                    messages.extend(message.to_messages_values());
+                }
             }
         }
-        messages.extend(self.messages.iter().flat_map(IrMessage::to_messages_values));
         out.insert("messages".to_owned(), Value::Array(messages));
         if !self.tools.is_empty() {
             out.insert(
@@ -763,12 +989,15 @@ impl RequestIr {
                 },
             );
         }
-        let mut input = self.reasoning.to_vec();
-        input.extend(
-            self.messages
-                .iter()
-                .flat_map(IrMessage::to_responses_values),
-        );
+        let mut input = Vec::new();
+        for item in &self.transcript {
+            match item {
+                IrConversationItem::Reasoning(reasoning) => input.push(reasoning.clone()),
+                IrConversationItem::Message(message) => {
+                    input.extend(message.to_responses_values());
+                }
+            }
+        }
         out.insert("input".to_owned(), Value::Array(input));
         if !self.tools.is_empty() {
             out.insert(
@@ -834,11 +1063,12 @@ impl RequestIr {
 
         match target {
             Protocol::AnthropicMessages => {
-                if let Some(user_id) = self.context.end_user_id.as_ref().or(self
+                if let Some(user_id) = self
                     .context
                     .cache
                     .key
-                    .as_ref())
+                    .as_ref()
+                    .or(self.context.end_user_id.as_ref())
                 {
                     let metadata = out
                         .entry("metadata".to_owned())
@@ -851,11 +1081,12 @@ impl RequestIr {
                 }
             }
             Protocol::OpenAiChatCompletions => {
-                if let Some(user_id) = self.context.end_user_id.as_ref().or(self
+                if let Some(user_id) = self
                     .context
                     .cache
                     .key
-                    .as_ref())
+                    .as_ref()
+                    .or(self.context.end_user_id.as_ref())
                 {
                     out.entry("user".to_owned())
                         .or_insert_with(|| Value::String(user_id.clone()));
@@ -928,12 +1159,24 @@ fn server_tool_as_function(tool: &IrTool) -> Value {
         .name
         .clone()
         .unwrap_or_else(|| tool.kind.replace('-', "_"));
+    let parameters = match tool.kind.as_str() {
+        kind if kind.starts_with("web_search") => {
+            serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
+        }
+        kind if kind.starts_with("web_fetch") => {
+            serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})
+        }
+        _ => tool
+            .parameters
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+    };
     serde_json::json!({
         "type": "function",
         "function": {
             "name": name,
             "description": tool.description.clone().unwrap_or_default(),
-            "parameters": tool.parameters.clone().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}))
+            "parameters": parameters
         }
     })
 }
@@ -1054,6 +1297,7 @@ impl IrContent {
                 Value::Object(object)
             }
             Self::Thinking { text, .. } => serde_json::json!({"type":"text", "text":text}),
+            Self::Image(value) => image_to_chat(value),
             other => other.raw_value(),
         }
     }
@@ -1130,11 +1374,58 @@ impl IrMessage {
             object.insert("content".to_owned(), content_as_chat(&self.content));
             return vec![Value::Object(object)];
         }
-        object.insert("content".to_owned(), content_as_chat(&self.content));
-        if !self.tool_calls.is_empty() {
+        if self.role == "user"
+            && self
+                .content
+                .iter()
+                .any(|content| matches!(content, IrContent::ToolResult { .. }))
+        {
+            let mut values = Vec::new();
+            for content in &self.content {
+                if let IrContent::ToolResult {
+                    call_id, content, ..
+                } = content
+                {
+                    values.push(serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":content}));
+                }
+            }
+            let visible = self
+                .content
+                .iter()
+                .filter(|content| !matches!(content, IrContent::ToolResult { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !visible.is_empty() {
+                let mut user = object;
+                user.insert("content".to_owned(), content_as_chat(&visible));
+                values.push(Value::Object(user));
+            }
+            return values;
+        }
+        let mut calls = self.tool_calls.clone();
+        calls.extend(self.content.iter().filter_map(|content| match content {
+            IrContent::ToolUse(call) => Some(call.clone()),
+            _ => None,
+        }));
+        let visible_content = self
+            .content
+            .iter()
+            .filter(|content| {
+                !matches!(content, IrContent::ToolUse(_) | IrContent::Thinking { .. })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        object.insert("content".to_owned(), content_as_chat(&visible_content));
+        if let Some(reasoning) = self.content.iter().find_map(|content| match content {
+            IrContent::Thinking { text, .. } => Some(text.clone()),
+            _ => None,
+        }) {
+            object.insert("reasoning_content".to_owned(), Value::String(reasoning));
+        }
+        if !calls.is_empty() {
             object.insert(
                 "tool_calls".to_owned(),
-                Value::Array(self.tool_calls.iter().map(IrToolCall::to_chat).collect()),
+                Value::Array(calls.iter().map(IrToolCall::to_chat).collect()),
             );
         }
         vec![Value::Object(object)]
@@ -1203,10 +1494,50 @@ impl IrMessage {
 }
 
 fn content_as_chat(content: &[IrContent]) -> Value {
+    if content.is_empty() {
+        return Value::String(String::new());
+    }
     if let [IrContent::Text { text, .. }] = content {
         return Value::String(text.clone());
     }
-    Value::Array(content.iter().map(IrContent::to_chat).collect())
+    let mut values = content
+        .iter()
+        .filter(|part| !matches!(part, IrContent::Image(_)))
+        .map(IrContent::to_chat)
+        .collect::<Vec<_>>();
+    values.extend(
+        content
+            .iter()
+            .filter(|part| matches!(part, IrContent::Image(_)))
+            .map(IrContent::to_chat),
+    );
+    Value::Array(values)
+}
+
+fn image_to_chat(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    if object.get("type").and_then(Value::as_str) == Some("image_url") {
+        return value.clone();
+    }
+    if let Some(source) = object.get("source").and_then(Value::as_object) {
+        if source.get("type").and_then(Value::as_str) == Some("base64") {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return serde_json::json!({"type":"image_url", "image_url":{"url":format!("data:{media_type};base64,{data}")}});
+        }
+        if let Some(url) = source.get("url").and_then(Value::as_str) {
+            return serde_json::json!({"type":"image_url", "image_url":{"url":url}});
+        }
+    }
+    value.clone()
 }
 
 fn reasoning_to_messages_blocks(reasoning: &Value) -> Vec<Value> {
@@ -1223,6 +1554,18 @@ fn reasoning_to_messages_blocks(reasoning: &Value) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn reasoning_text(reasoning: &Value) -> Option<String> {
+    let text = reasoning
+        .get("summary")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 impl IrToolCall {
@@ -1282,7 +1625,11 @@ impl IrToolCall {
     }
 
     fn to_chat(&self) -> Value {
-        serde_json::json!({"id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "type":"function", "function":{"name":self.name, "arguments":self.arguments}})
+        let arguments = match &self.arguments {
+            Value::String(value) => value.clone(),
+            value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
+        };
+        serde_json::json!({"id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "type":"function", "function":{"name":self.name, "arguments":arguments}})
     }
 
     fn to_messages_block(&self) -> Value {
@@ -1370,9 +1717,12 @@ impl IrTool {
         );
         function.insert(
             "parameters".to_owned(),
-            self.parameters
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+            crate::conversion_utils::normalize_input_schema(
+                &self
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+            ),
         );
         serde_json::json!({"type":"function", "function":function})
     }
@@ -1564,7 +1914,7 @@ mod tests {
             .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
             .unwrap();
 
-        assert_eq!(messages["metadata"]["user_id"], "user-1");
+        assert_eq!(messages["metadata"]["user_id"], "cache-1");
         assert_eq!(messages["metadata"]["trace"], "root");
         assert_eq!(messages["conversation"]["id"], "conv-1");
         assert_eq!(messages["safety_identifier"], "safe-1");
@@ -1590,6 +1940,59 @@ mod tests {
             .unwrap();
         assert_eq!(messages["metadata"]["user_id"], "cache-as-identity");
         assert!(messages.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn responses_cache_key_takes_precedence_when_target_has_one_identity_slot() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "user": "end-user",
+                "prompt_cache_key": "cache-affinity",
+                "input": "hello"
+            }),
+        )
+        .unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(messages["metadata"]["user_id"], "cache-affinity");
+    }
+
+    #[test]
+    fn responses_item_order_survives_neutral_ir_roundtrip() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model": "m",
+                "input": [
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]},
+                    {"type":"reasoning","summary":[{"type":"summary_text","text":"think"}]},
+                    {"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"call-1","output":"answer"}
+                ]
+            }),
+        )
+        .unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        let types = responses["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("message"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output"
+            ]
+        );
     }
 
     #[test]

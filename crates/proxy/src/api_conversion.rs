@@ -14,11 +14,11 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
+use codex_provider_proxy_api_conversion::chat_to_messages::convert_chat_response;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
-use codex_provider_proxy_api_conversion::messages_to_chat::convert_chat_response;
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::responses::{
     chat_response_assistant_turn, convert_chat_response_to_responses,
@@ -81,6 +81,7 @@ pub enum RequestNormalizerKind {
 pub struct RequestPipeline {
     pub parser: RequestParserKind,
     pub renderer: RequestRendererKind,
+    pub normalizer: Option<RequestNormalizerKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::AnthropicMessages,
                 renderer: RequestRendererKind::OpenAiChatCompletions,
+                normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -164,6 +166,7 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::OpenAiResponses,
                 renderer: RequestRendererKind::OpenAiChatCompletions,
+                normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -179,6 +182,7 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::OpenAiResponses,
                 renderer: RequestRendererKind::AnthropicMessages,
+                normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -196,6 +200,7 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Transform(RequestPipeline {
                 parser: RequestParserKind::AnthropicMessages,
                 renderer: RequestRendererKind::OpenAiResponses,
+                normalizer: Some(RequestNormalizerKind::ArkResponses),
             }),
             response: response_pipeline(provider.upstream_api, downstream),
         },
@@ -289,7 +294,12 @@ pub fn convert_request_body(
             normalizer: Some(RequestNormalizerKind::ArkResponses),
         } => {
             let mut rendered = json;
-            normalize_rendered_request(RequestRendererKind::OpenAiResponses, &caps, &mut rendered);
+            normalize_rendered_request(
+                Some(RequestNormalizerKind::ArkResponses),
+                RequestRendererKind::OpenAiResponses,
+                &caps,
+                &mut rendered,
+            );
             (rendered, Default::default())
         }
         RequestAction::Transform(pipeline) => {
@@ -314,12 +324,16 @@ pub fn convert_request_body(
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?;
-                normalize_rendered_request(pipeline.renderer, &caps, &mut rendered);
+                normalize_rendered_request(
+                    pipeline.normalizer,
+                    pipeline.renderer,
+                    &caps,
+                    &mut rendered,
+                );
                 (rendered, Default::default())
             }
         }
     };
-    let converted = converted;
     if !report.dropped_server_tools.is_empty() {
         warn!(
             provider = %provider_name,
@@ -342,11 +356,15 @@ pub fn convert_request_body(
 }
 
 fn normalize_rendered_request(
+    normalizer: Option<RequestNormalizerKind>,
     renderer: RequestRendererKind,
     caps: &ModelCapabilities,
     request: &mut Value,
 ) {
-    if caps.ark_style && renderer == RequestRendererKind::OpenAiResponses {
+    if normalizer == Some(RequestNormalizerKind::ArkResponses)
+        && caps.ark_style
+        && renderer == RequestRendererKind::OpenAiResponses
+    {
         if let Some(object) = request.as_object_mut() {
             codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
         }
@@ -831,6 +849,7 @@ mod tests {
                 RequestAction::Transform(RequestPipeline {
                     parser: RequestParserKind::AnthropicMessages,
                     renderer: RequestRendererKind::OpenAiChatCompletions,
+                    normalizer: None,
                 }),
                 ResponsePipeline {
                     parser: ResponseParserKind::OpenAiChatCompletions,
@@ -844,6 +863,7 @@ mod tests {
                 RequestAction::Transform(RequestPipeline {
                     parser: RequestParserKind::OpenAiResponses,
                     renderer: RequestRendererKind::OpenAiChatCompletions,
+                    normalizer: None,
                 }),
                 ResponsePipeline {
                     parser: ResponseParserKind::OpenAiChatCompletions,

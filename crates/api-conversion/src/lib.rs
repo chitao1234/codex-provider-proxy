@@ -1,22 +1,22 @@
 //! API format conversion between downstream client dialects and upstream provider dialects.
 //!
-//! The first supported conversion is Anthropic Messages (downstream, e.g. Claude Code) to
-//! OpenAI Chat Completions (upstream). Providers opt in by declaring an upstream API and the
-//! downstream APIs they accept; providers without conversion configuration keep the existing
-//! transparent passthrough path.
+//! Requests are parsed into a protocol-neutral IR and rendered as Anthropic Messages, OpenAi
+//! Chat Completions, or OpenAi Responses. Unknown top-level/provider fields remain attached to
+//! the request, while protocol-owned fields, ordered conversation items, cache affinity, and
+//! continuation state are mapped explicitly at protocol boundaries.
 //!
 //! This crate is intentionally pure: no axum, no reqwest, no proxy runtime state. The proxy
 //! crate owns networking, routing, configuration, and logging.
 
 pub mod chat;
 pub mod chat_parser;
-pub(crate) mod chat_request;
+pub mod chat_to_messages;
+pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
 pub mod messages;
 pub mod messages_parser;
 pub mod messages_renderer;
-pub mod messages_to_chat;
 pub mod request_ir;
 pub mod request_renderers;
 pub mod responses;
@@ -25,10 +25,10 @@ pub mod responses_renderer;
 pub mod sse;
 pub mod stream;
 
+pub use chat_to_messages::convert_chat_response;
 pub use dialect::{
     DownstreamApi, MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
     ServerToolPolicy, ThinkingParam, UpstreamApi,
 };
 pub use error::ConversionError;
-pub use messages_to_chat::{convert_chat_response, convert_messages_request};
-pub use responses::{convert_chat_response_to_responses, convert_responses_request};
+pub use responses::convert_chat_response_to_responses;
