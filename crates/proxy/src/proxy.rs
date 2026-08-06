@@ -1459,10 +1459,10 @@ fn maybe_convert_request_body(
         forwarded_path,
         body,
         previous_messages.as_deref(),
-        attempt
-            .response_recorder
-            .as_ref()
-            .and_then(|recorder| recorder.last_reasoning())
+        state
+            .runtime
+            .response_states()
+            .last_reasoning(&attempt.provider_name)
             .as_deref(),
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;

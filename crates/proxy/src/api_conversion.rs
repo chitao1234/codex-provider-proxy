@@ -233,11 +233,6 @@ impl ResponseRecorder {
         }
     }
 
-    /// The last upstream reasoning for this provider, for reattaching on the next turn.
-    pub fn last_reasoning(&self) -> Option<String> {
-        self.store.last_reasoning(&self.provider_name)
-    }
-
     /// Store the transcript for `response_id` (appending the assistant turn when present)
     /// and remember the turn's reasoning for the next request.
     pub fn record(&self, response_id: &str, assistant_turn: Option<Value>) {
