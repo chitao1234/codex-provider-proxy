@@ -93,6 +93,7 @@ pub fn convert_chat_error_body(status: http::StatusCode, body: &Value) -> Value 
             matches!(
                 *error_type,
                 "invalid_request_error"
+                    | "bad_request_error"
                     | "authentication_error"
                     | "permission_error"
                     | "not_found_error"
@@ -160,6 +161,16 @@ mod tests {
             &json!({"error": {"message": "rate limited", "type": "my_provider_rate_limit"}}),
         );
         assert_eq!(body["error"]["type"], "rate_limit_error");
+    }
+
+    #[test]
+    fn preserves_minimax_bad_request_error_type() {
+        let body = convert_chat_error_body(
+            http::StatusCode::BAD_REQUEST,
+            &json!({"error": {"type": "bad_request_error", "message": "invalid params (2013)"}}),
+        );
+        assert_eq!(body["error"]["type"], "bad_request_error");
+        assert_eq!(body["error"]["message"], "invalid params (2013)");
     }
 
     #[test]

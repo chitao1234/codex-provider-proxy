@@ -760,6 +760,39 @@ pub fn render_search_tool_template(template: &Value, query: Option<&str>) -> Val
     Value::Object(rendered)
 }
 
+/// MiMo returns search results in `message.annotations` / `delta.annotations`
+/// (url_citation items). Anthropic has no citation block type, so they are rendered
+/// as a trailing "Sources:" text block for the downstream client.
+fn format_url_citations(annotations: Option<&Value>) -> Option<String> {
+    let annotations = match annotations {
+        Some(Value::Array(items)) => items,
+        _ => return None,
+    };
+    let citations: Vec<String> = annotations
+        .iter()
+        .filter_map(|a| {
+            let object = a.as_object()?;
+            if object.get("type").and_then(Value::as_str) != Some("url_citation") {
+                return None;
+            }
+            let url = object
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let title = object
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(if title.is_empty() {
+                url.to_string()
+            } else {
+                format!("{title}: {url}")
+            })
+        })
+        .collect();
+    (!citations.is_empty()).then(|| format!("Sources:\n{}", citations.join("\n")))
+}
+
 /// Extract a search query from the last user message (text blocks joined, trimmed).
 fn last_user_query(messages: Option<&Value>) -> Option<String> {
     let messages = messages?.as_array()?;
@@ -838,6 +871,12 @@ pub fn convert_chat_response(body: &Value) -> Result<Value, ConversionError> {
         .filter(|text| !text.is_empty())
     {
         content.push(json!({"type": "text", "text": text}));
+    }
+    // MiMo returns search results in message.annotations (url_citation items) instead
+    // of tool_calls. Anthropic has no citation block type, so append a text block
+    // listing the sources so the downstream client can see them.
+    if let Some(sources) = format_url_citations(message.get("annotations")) {
+        content.push(json!({"type": "text", "text": sources}));
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
@@ -1121,6 +1160,16 @@ impl ChatStreamConverter {
             self.close_thinking(out);
             self.open_text(out);
             self.text_delta(text, out);
+        }
+        if let Some(annotations) = delta.get("annotations") {
+            // MiMo streams search sources in the first chunk's delta.annotations
+            // (url_citation items); append them to the text block.
+            if let Some(sources) = format_url_citations(Some(annotations)) {
+                self.close_thinking(out);
+                self.open_text(out);
+                let text = format!("\n\n{sources}");
+                self.text_delta(&text, out);
+            }
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for (position, call) in tool_calls.iter().enumerate() {
@@ -1876,6 +1925,37 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn converts_mimo_annotations_to_sources_text_block() {
+        let body = json!({
+            "id": "mimo-1",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "巴黎是法国首都。",
+                    "annotations": [
+                        {"type": "url_citation", "url": "https://example.com/paris", "title": "Paris Guide", "summary": "..."},
+                        {"type": "url_citation", "url": "https://example.com/france", "title": "", "summary": ""}
+                    ]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let out = convert_chat_response(&body).unwrap();
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "巴黎是法国首都。");
+        assert_eq!(blocks[1]["type"], "text");
+        let sources = blocks[1]["text"].as_str().unwrap();
+        assert!(sources.contains("Sources:"));
+        assert!(sources.contains("Paris Guide: https://example.com/paris"));
+        assert!(sources.contains("https://example.com/france"));
     }
 
     #[test]
