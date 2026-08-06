@@ -76,6 +76,9 @@ pub struct LoggingConfig {
     pub exchange_body_max_bytes: Option<u64>,
     pub exchange_body_compression: BodyLogCompression,
     pub reconstruct_responses: bool,
+    /// Log the pre- and post-conversion request/response bodies for converting
+    /// providers (see `LoggingFile::log_conversion_pairs`).
+    pub log_conversion_pairs: bool,
     pub level: String,
     pub rule: Option<String>,
 }
@@ -199,6 +202,12 @@ struct LoggingFile {
     exchange_body_compression: BodyLogCompression,
     #[serde(default = "default_reconstruct_responses")]
     reconstruct_responses: bool,
+    #[serde(default)]
+    /// Log both sides of API format conversion: the original downstream request and
+    /// the converted upstream response in the unscoped exchange files, and the
+    /// converted upstream request plus the raw upstream response per attempt.
+    /// Only takes effect for providers that convert the request.
+    log_conversion_pairs: bool,
     #[serde(default = "default_log_level")]
     level: String,
     #[serde(default)]
@@ -525,6 +534,7 @@ impl Config {
                 exchange_body_max_bytes,
                 exchange_body_compression: file.logging.exchange_body_compression,
                 reconstruct_responses: file.logging.reconstruct_responses,
+                log_conversion_pairs: file.logging.log_conversion_pairs,
                 level: file.logging.level,
                 rule: file.logging.rule,
             },

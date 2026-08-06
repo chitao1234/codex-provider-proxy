@@ -77,6 +77,10 @@ pub struct ExchangeFileLogger {
     metadata: ExchangeMetadata,
     request_body: BodyLogSink,
     response_body: BodyLogSink,
+    converted_request_body: BodyLogSink,
+    converted_response_body: BodyLogSink,
+    converted_request_headers_path: PathBuf,
+    converted_response_headers_path: PathBuf,
     response_headers_path: PathBuf,
     response_content_encodings: Vec<String>,
     response_content_encoding_error: Option<String>,
@@ -105,6 +109,14 @@ impl ExchangeFileLogger {
         let request_body_path = root_dir.join(format!("{stem}.request_body{body_suffix}"));
         let response_headers_path = root_dir.join(format!("{stem}.response_headers.txt"));
         let response_body_path = root_dir.join(format!("{stem}.response_body{body_suffix}"));
+        let converted_request_headers_path =
+            root_dir.join(format!("{stem}.converted.request_headers.txt"));
+        let converted_request_body_path =
+            root_dir.join(format!("{stem}.converted.request_body{body_suffix}"));
+        let converted_response_headers_path =
+            root_dir.join(format!("{stem}.converted.response_headers.txt"));
+        let converted_response_body_path =
+            root_dir.join(format!("{stem}.converted.response_body{body_suffix}"));
         let reconstructed_path = root_dir.join(format!("{stem}.response_reconstructed.txt"));
 
         let metadata = ExchangeMetadata {
@@ -142,6 +154,14 @@ impl ExchangeFileLogger {
                 request_body: request_body_path.display().to_string(),
                 response_headers: response_headers_path.display().to_string(),
                 response_body: response_body_path.display().to_string(),
+                converted_request_headers: Some(
+                    converted_request_headers_path.display().to_string(),
+                ),
+                converted_request_body: Some(converted_request_body_path.display().to_string()),
+                converted_response_headers: Some(
+                    converted_response_headers_path.display().to_string(),
+                ),
+                converted_response_body: Some(converted_response_body_path.display().to_string()),
                 reconstructed_response: if should_reconstruct {
                     Some(reconstructed_path.display().to_string())
                 } else {
@@ -176,6 +196,20 @@ impl ExchangeFileLogger {
                 body_max_bytes,
                 "response body",
             )?,
+            converted_request_body: BodyLogSink::new(
+                converted_request_body_path,
+                body_compression,
+                body_max_bytes,
+                "converted request body",
+            )?,
+            converted_response_body: BodyLogSink::new(
+                converted_response_body_path,
+                body_compression,
+                body_max_bytes,
+                "converted response body",
+            )?,
+            converted_request_headers_path,
+            converted_response_headers_path,
             response_headers_path,
             response_content_encodings: Vec::new(),
             response_content_encoding_error: None,
@@ -218,6 +252,26 @@ impl ExchangeFileLogger {
             attempt_number,
             body_file_suffix(self.body_compression)
         ));
+        let converted_request_headers_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.request_headers.txt",
+            self.stem, attempt_number
+        ));
+        let converted_request_body_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.request_body{}",
+            self.stem,
+            attempt_number,
+            body_file_suffix(self.body_compression)
+        ));
+        let converted_response_headers_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.response_headers.txt",
+            self.stem, attempt_number
+        ));
+        let converted_response_body_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.response_body{}",
+            self.stem,
+            attempt_number,
+            body_file_suffix(self.body_compression)
+        ));
 
         if let Err(err) = write_attempt_request_headers_file(
             &request_headers_path,
@@ -251,6 +305,22 @@ impl ExchangeFileLogger {
             self.response_body.max_bytes,
             "attempt response body",
         );
+        let converted_request_body_sink = BodyLogSink::new_best_effort(
+            self.request_id,
+            attempt_number,
+            converted_request_body_path.clone(),
+            self.body_compression,
+            self.request_body.max_bytes,
+            "attempt converted request body",
+        );
+        let converted_response_body_sink = BodyLogSink::new_best_effort(
+            self.request_id,
+            attempt_number,
+            converted_response_body_path.clone(),
+            self.body_compression,
+            self.response_body.max_bytes,
+            "attempt converted response body",
+        );
 
         self.metadata.apply_route(route);
         self.metadata.attempts.push(ExchangeAttemptMetadata {
@@ -269,16 +339,28 @@ impl ExchangeFileLogger {
             response_body_bytes: None,
             response_body_logged_bytes: None,
             response_body_truncated: None,
+            converted_request_body_bytes: None,
+            converted_request_body_logged_bytes: None,
+            converted_request_body_truncated: None,
+            converted_response_body_bytes: None,
+            converted_response_body_logged_bytes: None,
+            converted_response_body_truncated: None,
             request_headers: request_headers_path.display().to_string(),
             request_body: request_body_path.display().to_string(),
             response_headers: response_headers_path.display().to_string(),
             response_body: response_body_path.display().to_string(),
+            converted_request_headers: Some(converted_request_headers_path.display().to_string()),
+            converted_request_body: Some(converted_request_body_path.display().to_string()),
+            converted_response_headers: Some(converted_response_headers_path.display().to_string()),
+            converted_response_body: Some(converted_response_body_path.display().to_string()),
         });
 
         self.active_attempt = Some(ActiveAttemptLog {
             attempt_number,
             request_body: request_body_sink,
             response_body: response_body_sink,
+            converted_request_body: converted_request_body_sink,
+            converted_response_body: converted_response_body_sink,
         });
 
         if let Some(request_body) = request_body {
@@ -288,14 +370,111 @@ impl ExchangeFileLogger {
         self.persist_metadata_best_effort("begin attempt metadata");
     }
 
+    /// Record a chunk of the original downstream request body (pre-conversion):
+    /// the unscoped `request_body` file and the active attempt's file.
     pub fn on_request_body_chunk(&mut self, chunk: &Bytes) {
         self.request_body.append(self.request_id, chunk);
         self.on_active_attempt_request_body_chunk(chunk);
     }
 
+    /// Record a chunk of the converted upstream request body: the unscoped
+    /// `converted.request_body` file and the active attempt's converted file.
+    pub fn on_converted_request_body_chunk(&mut self, chunk: &Bytes) {
+        self.converted_request_body.append(self.request_id, chunk);
+        self.on_active_attempt_converted_request_body_chunk(chunk);
+    }
+
+    /// Record a chunk of the raw upstream response body (pre-conversion): the
+    /// unscoped `response_body` file and the active attempt's file.
     pub fn on_response_body_chunk(&mut self, chunk: &Bytes) {
         self.response_body.append(self.request_id, chunk);
         self.on_active_attempt_response_body_chunk(chunk);
+    }
+
+    /// Record a chunk of the converted downstream response body (what the client
+    /// receives): the unscoped `converted.response_body` file and the active
+    /// attempt's converted file.
+    pub fn on_converted_response_body_chunk(&mut self, chunk: &Bytes) {
+        self.converted_response_body.append(self.request_id, chunk);
+        self.on_active_attempt_converted_response_body_chunk(chunk);
+    }
+
+    /// Write the converted upstream request headers to both the unscoped and the
+    /// active attempt's `converted.request_headers.txt` files.
+    pub fn write_converted_request_headers(
+        &mut self,
+        attempt_number: u32,
+        route: AttemptRouteContext<'_>,
+        method: &Method,
+        headers: &HeaderMap,
+    ) {
+        if let Err(err) = write_attempt_request_headers_file(
+            &self.converted_request_headers_path,
+            attempt_number,
+            &route,
+            method,
+            headers,
+        ) {
+            warn!(
+                request_id = self.request_id,
+                path = %self.converted_request_headers_path.display(),
+                error = %err,
+                "failed to write converted request headers log"
+            );
+        }
+        let attempt_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.request_headers.txt",
+            self.stem, attempt_number
+        ));
+        if let Err(err) = write_attempt_request_headers_file(
+            &attempt_path,
+            attempt_number,
+            &route,
+            method,
+            headers,
+        ) {
+            warn!(
+                request_id = self.request_id,
+                attempt = attempt_number,
+                path = %attempt_path.display(),
+                error = %err,
+                "failed to write attempt converted request headers log"
+            );
+        }
+    }
+
+    /// Write the converted downstream response headers to both the unscoped and
+    /// the active attempt's `converted.response_headers.txt` files.
+    pub fn write_converted_response_headers(
+        &mut self,
+        attempt_number: u32,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) {
+        let status_text = status.canonical_reason().unwrap_or("unknown");
+        let mut body = format!("status: {} {}\n", status.as_u16(), status_text);
+        body.push_str(&format_headers(headers));
+        if let Err(err) = fs::write(&self.converted_response_headers_path, body.as_bytes()) {
+            warn!(
+                request_id = self.request_id,
+                path = %self.converted_response_headers_path.display(),
+                error = %err,
+                "failed to write converted response headers log"
+            );
+        }
+        let attempt_path = self.root_dir.join(format!(
+            "{}.attempt_{}.converted.response_headers.txt",
+            self.stem, attempt_number
+        ));
+        if let Err(err) = fs::write(&attempt_path, body.as_bytes()) {
+            warn!(
+                request_id = self.request_id,
+                attempt = attempt_number,
+                path = %attempt_path.display(),
+                error = %err,
+                "failed to write attempt converted response headers log"
+            );
+        }
     }
 
     pub fn record_attempt(
@@ -471,11 +650,10 @@ impl ExchangeFileLogger {
         self.metadata.completed_unix_ms = Some(completed_unix_ms);
         self.metadata.total_duration_ms =
             Some(completed_unix_ms.saturating_sub(self.metadata.started_unix_ms));
-        if let Some(final_attempt) = self.metadata.attempts.iter_mut().rev().find(|a| a.is_final) {
-            final_attempt.response_body_bytes = Some(response_body.bytes);
-            final_attempt.response_body_logged_bytes = Some(response_body.logged_bytes);
-            final_attempt.response_body_truncated = Some(response_body.truncated);
-        }
+        // The final attempt's response bytes are already recorded from its own sink
+        // by finish_attempt_body_writers; with log_conversion_pairs the unscoped
+        // response_body file holds the converted downstream body, not the raw
+        // upstream one, so it must not overwrite the per-attempt figure.
 
         if self.should_reconstruct {
             self.metadata.reconstruction_attempted = true;
@@ -519,6 +697,24 @@ impl ExchangeFileLogger {
         active_attempt.response_body.append(self.request_id, chunk);
     }
 
+    fn on_active_attempt_converted_request_body_chunk(&mut self, chunk: &Bytes) {
+        let Some(active_attempt) = self.active_attempt.as_mut() else {
+            return;
+        };
+        active_attempt
+            .converted_request_body
+            .append(self.request_id, chunk);
+    }
+
+    fn on_active_attempt_converted_response_body_chunk(&mut self, chunk: &Bytes) {
+        let Some(active_attempt) = self.active_attempt.as_mut() else {
+            return;
+        };
+        active_attempt
+            .converted_response_body
+            .append(self.request_id, chunk);
+    }
+
     fn finish_active_attempt_if_matching(&mut self, attempt_number: u32) {
         let Some(active_attempt) = self.active_attempt.take() else {
             return;
@@ -533,8 +729,16 @@ impl ExchangeFileLogger {
     fn finish_attempt_body_writers(&mut self, mut active_attempt: ActiveAttemptLog) {
         active_attempt.request_body.finish(self.request_id);
         active_attempt.response_body.finish(self.request_id);
+        active_attempt
+            .converted_request_body
+            .finish(self.request_id);
+        active_attempt
+            .converted_response_body
+            .finish(self.request_id);
         let request_body = active_attempt.request_body.snapshot();
         let response_body = active_attempt.response_body.snapshot();
+        let converted_request_body = active_attempt.converted_request_body.snapshot();
+        let converted_response_body = active_attempt.converted_response_body.snapshot();
 
         if let Some(attempt_meta) = self.attempt_mut(active_attempt.attempt_number) {
             attempt_meta.request_body_bytes = Some(request_body.bytes);
@@ -543,6 +747,15 @@ impl ExchangeFileLogger {
             attempt_meta.response_body_bytes = Some(response_body.bytes);
             attempt_meta.response_body_logged_bytes = Some(response_body.logged_bytes);
             attempt_meta.response_body_truncated = Some(response_body.truncated);
+            attempt_meta.converted_request_body_bytes = Some(converted_request_body.bytes);
+            attempt_meta.converted_request_body_logged_bytes =
+                Some(converted_request_body.logged_bytes);
+            attempt_meta.converted_request_body_truncated = Some(converted_request_body.truncated);
+            attempt_meta.converted_response_body_bytes = Some(converted_response_body.bytes);
+            attempt_meta.converted_response_body_logged_bytes =
+                Some(converted_response_body.logged_bytes);
+            attempt_meta.converted_response_body_truncated =
+                Some(converted_response_body.truncated);
         }
     }
 
@@ -649,6 +862,10 @@ struct ExchangeMetadataFiles {
     request_body: String,
     response_headers: String,
     response_body: String,
+    converted_request_headers: Option<String>,
+    converted_request_body: Option<String>,
+    converted_response_headers: Option<String>,
+    converted_response_body: Option<String>,
     reconstructed_response: Option<String>,
 }
 
@@ -669,10 +886,20 @@ struct ExchangeAttemptMetadata {
     response_body_bytes: Option<u64>,
     response_body_logged_bytes: Option<u64>,
     response_body_truncated: Option<bool>,
+    converted_request_body_bytes: Option<u64>,
+    converted_request_body_logged_bytes: Option<u64>,
+    converted_request_body_truncated: Option<bool>,
+    converted_response_body_bytes: Option<u64>,
+    converted_response_body_logged_bytes: Option<u64>,
+    converted_response_body_truncated: Option<bool>,
     request_headers: String,
     request_body: String,
     response_headers: String,
     response_body: String,
+    converted_request_headers: Option<String>,
+    converted_request_body: Option<String>,
+    converted_response_headers: Option<String>,
+    converted_response_body: Option<String>,
 }
 
 impl ExchangeAttemptMetadata {
@@ -687,6 +914,8 @@ struct ActiveAttemptLog {
     attempt_number: u32,
     request_body: BodyLogSink,
     response_body: BodyLogSink,
+    converted_request_body: BodyLogSink,
+    converted_response_body: BodyLogSink,
 }
 
 #[derive(Clone, Copy)]

@@ -486,6 +486,7 @@ mod tests {
                 exchange_body_max_bytes: None,
                 exchange_body_compression: BodyLogCompression::None,
                 reconstruct_responses: false,
+                log_conversion_pairs: false,
                 level: "info".to_string(),
                 rule: None,
             },

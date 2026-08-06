@@ -475,6 +475,27 @@ async fn handle_proxy_inner(
         }
     }
 
+    // Log the converted downstream response headers (log_conversion_pairs only).
+    if conversion_applies && cfg.logging.log_conversion_pairs {
+        let logger = exchange_logger.clone();
+        let attempt_number = final_attempt_number;
+        let out_headers_for_log = out_headers.clone();
+        let downstream_status_for_log = downstream_status;
+        with_exchange_logger_blocking(
+            logger,
+            request_id,
+            "write converted response headers log",
+            move |exchange_logger| {
+                exchange_logger.write_converted_response_headers(
+                    attempt_number,
+                    downstream_status_for_log,
+                    &out_headers_for_log,
+                );
+            },
+        )
+        .await;
+    }
+
     let (resp_stream, resp_capture) = response_stream_and_capture(
         &cfg,
         request_id,
@@ -525,6 +546,21 @@ async fn handle_proxy_inner(
             statistics.record_response_stream_error(&err.to_string());
         }
     })) as BoxRespStream;
+    // Observe the final downstream stream (converted or passthrough) for the
+    // unscoped converted.response_body exchange file (log_conversion_pairs only).
+    let resp_stream = if exchange_logger.is_some() && cfg.logging.log_conversion_pairs {
+        let observers = BodyObservers::new(
+            &cfg,
+            exchange_logger.clone(),
+            None,
+            request_id,
+            BodyObservationDirection::ResponseConverted,
+            "append converted response body chunk",
+        );
+        observe_body_stream(resp_stream, observers)
+    } else {
+        resp_stream
+    };
     let final_provider_name = final_attempt.provider_name.clone();
     let final_route_pid = final_attempt.route_pid;
     let resp_headers_for_body_log = resp_headers.clone();
@@ -800,7 +836,7 @@ async fn send_upstream_request(
             &initial_attempt.provider_name,
             &forwarded_path,
         );
-        let request_body = if request_rewrites_may_apply(
+        let needs_buffering = request_rewrites_may_apply(
             cfg,
             &RequestRewriteContext {
                 method: &method,
@@ -808,15 +844,34 @@ async fn send_upstream_request(
                 provider_name: &initial_attempt.provider_name,
                 headers: &initial_attempt.headers,
             },
-        ) || conversion_may_apply
-        {
+        ) || conversion_may_apply;
+        // With log_conversion_pairs the attempt request_body file holds the
+        // pre-conversion body; keep it here for begin_exchange_log_attempt.
+        let mut pre_conversion_request_body: Option<Bytes> = None;
+        let request_body = if needs_buffering {
+            // Buffer (and log) the original downstream body before conversion, so the
+            // unscoped request_body exchange file holds the pre-conversion request.
+            let observers = BodyObservers::new(
+                cfg,
+                exchange_logger.clone(),
+                statistics.clone(),
+                request_id,
+                BodyObservationDirection::Request,
+                "buffer original request body",
+            );
+            let original =
+                buffer_request_body(body, cfg.request_body_buffer_max_bytes, Some(&observers))
+                    .await?;
+            if cfg.logging.log_conversion_pairs {
+                pre_conversion_request_body = Some(original.clone());
+            }
             SingleAttemptRequestBody::Buffered(prepare_request_body_for_attempt(
                 state,
                 cfg,
                 &method,
                 &forwarded_path,
                 &mut initial_attempt,
-                buffer_request_body_unlogged(body, cfg.request_body_buffer_max_bytes).await?,
+                original,
                 request_id,
                 1,
             )?)
@@ -837,7 +892,8 @@ async fn send_upstream_request(
             1,
             &initial_attempt,
             &method,
-            None,
+            pre_conversion_request_body,
+            cfg.logging.log_conversion_pairs && conversion_may_apply,
         )
         .await;
         let (req_body, req_body_capture) = match request_body {
@@ -965,6 +1021,7 @@ async fn with_exchange_logger_blocking<F>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn begin_exchange_log_attempt(
     exchange_logger: Option<SharedExchangeFileLogger>,
     statistics: Option<StatisticsTracker>,
@@ -973,6 +1030,7 @@ async fn begin_exchange_log_attempt(
     attempt: &PreparedUpstreamAttempt,
     method: &http::Method,
     request_body: Option<Bytes>,
+    log_conversion_pairs: bool,
 ) {
     if let Some(statistics) = &statistics {
         statistics.begin_attempt(&attempt.provider_name, attempt.route_pid);
@@ -998,6 +1056,18 @@ async fn begin_exchange_log_attempt(
                 &headers,
                 request_body.as_ref(),
             );
+            if log_conversion_pairs {
+                logger.write_converted_request_headers(
+                    attempt_number,
+                    crate::exchange_log::AttemptRouteContext {
+                        route_pid,
+                        provider_name: &provider_name,
+                        upstream_url: &upstream_url,
+                    },
+                    &method,
+                    &headers,
+                );
+            }
         },
     )
     .await;
@@ -1593,7 +1663,13 @@ fn beta_token_matches_prefix(beta: &str, prefix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum BodyObservationDirection {
     Request,
+    /// The request body after API format conversion; logged only in the per-attempt
+    /// file (the unscoped request_body file holds the original downstream body).
+    RequestConverted,
     Response,
+    /// The response body after API format conversion; logged only in the unscoped
+    /// response_body file (the per-attempt file holds the raw upstream body).
+    ResponseConverted,
 }
 
 #[derive(Clone)]
@@ -1605,6 +1681,9 @@ struct BodyObservers {
     request_id: u64,
     direction: BodyObservationDirection,
     logger_action: &'static str,
+    /// When enabled, the converted direction writes the `converted.*` exchange
+    /// files instead of the plain ones (log_conversion_pairs config).
+    log_conversion_pairs: bool,
 }
 
 impl BodyObservers {
@@ -1629,6 +1708,7 @@ impl BodyObservers {
             request_id,
             direction,
             logger_action,
+            log_conversion_pairs: cfg.logging.log_conversion_pairs,
         }
     }
 
@@ -1656,21 +1736,39 @@ impl BodyObservers {
         }
         if let Some(statistics) = &self.statistics {
             match self.direction {
-                BodyObservationDirection::Request => statistics.capture_request_chunk(chunk),
-                BodyObservationDirection::Response => statistics.capture_response_chunk(chunk),
+                BodyObservationDirection::Request | BodyObservationDirection::RequestConverted => {
+                    statistics.capture_request_chunk(chunk)
+                }
+                BodyObservationDirection::Response
+                | BodyObservationDirection::ResponseConverted => {
+                    statistics.capture_response_chunk(chunk)
+                }
             }
         }
 
         if let Some(exchange_logger) = &self.exchange_logger {
             let chunk = chunk.clone();
             let direction = self.direction;
+            let log_conversion_pairs = self.log_conversion_pairs;
             with_exchange_logger_blocking(
                 Some(exchange_logger.clone()),
                 self.request_id,
                 self.logger_action,
                 move |logger| match direction {
                     BodyObservationDirection::Request => logger.on_request_body_chunk(&chunk),
+                    BodyObservationDirection::RequestConverted => {
+                        if log_conversion_pairs {
+                            logger.on_converted_request_body_chunk(&chunk);
+                        } else {
+                            logger.on_request_body_chunk(&chunk);
+                        }
+                    }
                     BodyObservationDirection::Response => logger.on_response_body_chunk(&chunk),
+                    BodyObservationDirection::ResponseConverted => {
+                        if log_conversion_pairs {
+                            logger.on_converted_response_body_chunk(&chunk);
+                        }
+                    }
                 },
             )
             .await;
@@ -1711,7 +1809,7 @@ async fn body_from_bytes_for_logging(
         exchange_logger,
         statistics,
         request_id,
-        BodyObservationDirection::Request,
+        BodyObservationDirection::RequestConverted,
         "append buffered request body",
     );
     let capture = observers.capture();
@@ -1760,13 +1858,6 @@ async fn buffer_request_body(
     }
 
     Ok(buffered.freeze())
-}
-
-async fn buffer_request_body_unlogged(
-    body: Body,
-    max_bytes: usize,
-) -> std::result::Result<Bytes, std::io::Error> {
-    buffer_request_body(body, max_bytes, None).await
 }
 
 async fn buffer_request_body_for_retry(
@@ -2400,6 +2491,12 @@ where
             args.request_id,
             attempt_number,
         )?;
+        let attempt_request_body_for_log = if cfg.logging.log_conversion_pairs {
+            // The attempt request_body file holds the pre-conversion body.
+            Some(args.request.request_body.clone())
+        } else {
+            Some(request_body.clone())
+        };
         begin_exchange_log_attempt(
             args.exchange_logger.clone(),
             args.statistics.clone(),
@@ -2407,13 +2504,32 @@ where
             attempt_number,
             &current_attempt,
             &args.request.method,
-            Some(request_body.clone()),
+            attempt_request_body_for_log,
+            cfg.logging.log_conversion_pairs
+                && crate::api_conversion::request_conversion_enabled(
+                    &cfg,
+                    &args.request.method,
+                    &current_attempt.provider_name,
+                    &args.request.forwarded_path,
+                ),
         )
         .await;
+        let (req_body, _) = if cfg.logging.log_conversion_pairs {
+            body_from_bytes_for_logging(
+                &cfg,
+                request_body,
+                args.exchange_logger.clone(),
+                None,
+                args.request_id,
+            )
+            .await
+        } else {
+            (reqwest::Body::from(request_body), None)
+        };
         let out = http_client
             .request(args.request.method.clone(), current_attempt.url.clone())
             .headers(current_attempt.headers.clone())
-            .body(request_body);
+            .body(req_body);
         let resp =
             send_with_optional_idle_timeout(args.request_id, args.idle_timeout, None, out.send())
                 .await;
@@ -2722,7 +2838,7 @@ mod tests {
     };
 
     use super::{
-        apply_anthropic_beta_updates, buffer_request_body_unlogged, downstream_response_status,
+        apply_anthropic_beta_updates, buffer_request_body, downstream_response_status,
         error_log_details, filtered_incoming_headers, filtered_response_headers,
         format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
         linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
@@ -2735,12 +2851,12 @@ mod tests {
 
     #[tokio::test]
     async fn request_body_buffer_accepts_exact_limit_and_rejects_over_limit() {
-        let exact = buffer_request_body_unlogged(Body::from("1234"), 4)
+        let exact = buffer_request_body(Body::from("1234"), 4, None)
             .await
             .expect("exact limit should succeed");
         assert_eq!(exact, "1234");
 
-        let error = buffer_request_body_unlogged(Body::from("12345"), 4)
+        let error = buffer_request_body(Body::from("12345"), 4, None)
             .await
             .expect_err("over limit should fail");
         assert!(error
@@ -3196,6 +3312,7 @@ mod tests {
             exchange_body_max_bytes: None,
             exchange_body_compression: BodyLogCompression::None,
             reconstruct_responses: false,
+            log_conversion_pairs: false,
             level: "info".to_string(),
             rule: None,
         }
