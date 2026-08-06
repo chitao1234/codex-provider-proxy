@@ -29,7 +29,9 @@ pub struct RequestIr {
     pub instructions: Vec<Value>,
     pub tools: Vec<IrTool>,
     pub tool_choice: Option<Value>,
-    pub parameters: BTreeMap<String, Value>,
+    /// Top-level fields not modeled by the neutral IR. They are opaque provider/client
+    /// extensions and are preserved without participating in semantic mapping.
+    pub opaque_extensions: BTreeMap<String, Value>,
     pub continuation: BTreeMap<String, Value>,
     pub context: RequestContext,
 }
@@ -55,8 +57,9 @@ pub struct RequestContext {
     pub store: Option<Value>,
     pub include: Option<Value>,
     pub truncation: Option<Value>,
-    /// Provider-specific identity/session/cache keys that have no portable spelling yet.
-    pub extensions: BTreeMap<String, Value>,
+    /// Provider-specific identity/session/cache keys that the IR understands as context
+    /// extensions and maps when a target protocol has an equivalent boundary field.
+    pub represented_extensions: BTreeMap<String, Value>,
 }
 
 /// Protocol-neutral prompt-cache semantics.
@@ -140,7 +143,7 @@ impl RequestIr {
             instructions: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
-            parameters: BTreeMap::new(),
+            opaque_extensions: BTreeMap::new(),
             continuation: BTreeMap::new(),
             context: RequestContext::default(),
         };
@@ -151,7 +154,7 @@ impl RequestIr {
             Protocol::OpenAiResponses => ir.parse_responses(),
         }
         ir.parse_context();
-        ir.collect_parameters();
+        ir.collect_opaque_extensions();
         Ok(ir)
     }
 
@@ -243,7 +246,9 @@ impl RequestIr {
 
         for (key, value) in &self.original {
             if is_context_extension_key(key) {
-                self.context.extensions.insert(key.clone(), value.clone());
+                self.context
+                    .represented_extensions
+                    .insert(key.clone(), value.clone());
             }
         }
     }
@@ -278,10 +283,10 @@ impl RequestIr {
                 .control
                 .clone_from(&previous.cache.control);
         }
-        self.context.extensions = previous
-            .extensions
+        self.context.represented_extensions = previous
+            .represented_extensions
             .iter()
-            .chain(&self.context.extensions)
+            .chain(&self.context.represented_extensions)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
     }
@@ -476,7 +481,7 @@ impl RequestIr {
         self.transcript.push(IrConversationItem::Message(message));
     }
 
-    fn collect_parameters(&mut self) {
+    fn collect_opaque_extensions(&mut self) {
         const STRUCTURAL: &[&str] = &[
             "model",
             "messages",
@@ -490,7 +495,7 @@ impl RequestIr {
         ];
         for (key, value) in &self.original {
             if !STRUCTURAL.contains(&key.as_str()) {
-                self.parameters.insert(key.clone(), value.clone());
+                self.opaque_extensions.insert(key.clone(), value.clone());
             }
         }
     }
@@ -524,16 +529,15 @@ impl RequestIr {
     }
 
     fn base_output(&self) -> Map<String, Value> {
-        let mut out: Map<String, Value> = self.parameters.clone().into_iter().collect();
+        let mut out: Map<String, Value> = self.opaque_extensions.clone().into_iter().collect();
         if let Some(model) = &self.model {
             out.insert("model".to_owned(), Value::String(model.clone()));
         }
         if let Some(stream) = self.stream {
             out.insert("stream".to_owned(), Value::Bool(stream));
         }
-        // `parameters` intentionally excludes protocol structure, including
-        // `previous_response_id`; translated requests must never leak that source-only
-        // continuation handle to an upstream renderer.
+        // Structural fields, including `previous_response_id`, are represented separately and
+        // therefore never leak from the source protocol into a translated request.
         out
     }
 
@@ -1003,7 +1007,7 @@ impl RequestIr {
             out.remove("prompt_cache_key");
             out.remove("prompt_cache_retention");
         }
-        for (key, value) in &self.context.extensions {
+        for (key, value) in &self.context.represented_extensions {
             if target != Protocol::OpenAiResponses
                 && matches!(key.as_str(), "prompt_cache_key" | "prompt_cache_retention")
             {
@@ -1866,6 +1870,22 @@ mod tests {
         assert_eq!(responses["metadata"]["client"], "codex");
         assert_eq!(responses["cache_control"]["type"], "ephemeral");
         assert_eq!(responses["session_id"], "session-7");
+    }
+
+    #[test]
+    fn separates_represented_context_extensions_from_opaque_extensions() {
+        let ir = RequestIr::parse(
+            Protocol::AnthropicMessages,
+            &json!({
+                "model": "m",
+                "session_id": "session-7",
+                "provider_budget": {"tokens": 123},
+                "messages": [{"role":"user","content":"hello"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(ir.context.represented_extensions["session_id"], "session-7");
+        assert_eq!(ir.opaque_extensions["provider_budget"]["tokens"], 123);
     }
 
     #[test]
