@@ -348,12 +348,15 @@ async fn handle_proxy_inner(
         };
     let status = resp.status();
     let downstream_status = downstream_response_status(&cfg, status);
-    let conversion_applies = crate::api_conversion::response_conversion_enabled(
-        &cfg,
-        &parts.method,
-        &final_attempt.provider_name,
-        forwarded_path,
-    );
+    let conversion_plan = cfg
+        .providers
+        .get(&final_attempt.provider_name)
+        .and_then(|provider| {
+            crate::api_conversion::resolve_conversion_plan(provider, &parts.method, forwarded_path)
+                .ok()
+                .flatten()
+        });
+    let conversion_applies = conversion_plan.is_some();
     let resp_headers = resp.headers().clone();
 
     if cfg.logging.log_responses {
@@ -513,71 +516,67 @@ async fn handle_proxy_inner(
         resp_stream,
     );
     let resp_stream = if conversion_applies {
-        // The provider's upstream protocol selects the parser (chat / Messages /
-        // Responses); the forwarded path selects the downstream renderer.
-        let upstream_api = cfg
-            .providers
-            .get(&final_attempt.provider_name)
-            .map(|provider| provider.upstream_api)
-            .unwrap_or_default();
+        let response_pipeline = conversion_plan
+            .expect("conversion applies only when a plan exists")
+            .response;
         if is_text_event_stream(&resp_headers) {
-            match crate::api_conversion::downstream_api_for_path(forwarded_path) {
-                Some(crate::api_conversion::DownstreamApi::AnthropicMessages) => {
-                    match upstream_api {
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages => {
-                            Box::pin(crate::streams::ParserRendererStream::new(
-                                resp_stream,
-                                codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
-                                codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
-                            )) as BoxRespStream
-                        }
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAIResponses => {
-                            Box::pin(crate::streams::ParserRendererStream::new(
-                                resp_stream,
-                                codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
-                                codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
-                            )) as BoxRespStream
-                        }
-                        _ => Box::pin(
-                            crate::api_conversion::ChatToMessagesStream::new(resp_stream),
-                        ) as BoxRespStream,
-                    }
-                }
-                Some(crate::api_conversion::DownstreamApi::OpenAIResponses) => {
-                    match upstream_api {
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::AnthropicMessages => {
-                            Box::pin(crate::streams::ParserRendererStream::with_recorder(
-                                resp_stream,
-                                codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
-                                codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(),
-                                final_attempt.response_recorder.clone(),
-                            )) as BoxRespStream
-                        }
-                        codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAIResponses => {
-                            Box::pin(crate::streams::ParserRendererStream::with_recorder(
-                                resp_stream,
-                                codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
-                                codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(),
-                                final_attempt.response_recorder.clone(),
-                            )) as BoxRespStream
-                        }
-                        _ => Box::pin(
-                            crate::api_conversion::ChatToResponsesStream::with_recorder(
-                                resp_stream,
-                                final_attempt.response_recorder.clone(),
-                            ),
-                        ) as BoxRespStream,
-                    }
-                }
-                None => resp_stream,
+            match (response_pipeline.parser, response_pipeline.renderer) {
+                (
+                    crate::api_conversion::ResponseParserKind::AnthropicMessages,
+                    crate::api_conversion::ResponseRendererKind::AnthropicMessages,
+                ) => Box::pin(crate::streams::ParserRendererStream::new(
+                    resp_stream,
+                    codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
+                    codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
+                )) as BoxRespStream,
+                (
+                    crate::api_conversion::ResponseParserKind::OpenAIResponses,
+                    crate::api_conversion::ResponseRendererKind::AnthropicMessages,
+                ) => Box::pin(crate::streams::ParserRendererStream::new(
+                    resp_stream,
+                    codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+                    codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
+                )) as BoxRespStream,
+                (
+                    crate::api_conversion::ResponseParserKind::OpenAIChatCompletions,
+                    crate::api_conversion::ResponseRendererKind::AnthropicMessages,
+                ) => Box::pin(crate::api_conversion::ChatToMessagesStream::new(
+                    resp_stream,
+                )) as BoxRespStream,
+                (
+                    crate::api_conversion::ResponseParserKind::AnthropicMessages,
+                    crate::api_conversion::ResponseRendererKind::OpenAIResponses,
+                ) => Box::pin(crate::streams::ParserRendererStream::with_recorder(
+                    resp_stream,
+                    codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
+                    codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(
+                    ),
+                    final_attempt.response_recorder.clone(),
+                )) as BoxRespStream,
+                (
+                    crate::api_conversion::ResponseParserKind::OpenAIResponses,
+                    crate::api_conversion::ResponseRendererKind::OpenAIResponses,
+                ) => Box::pin(crate::streams::ParserRendererStream::with_recorder(
+                    resp_stream,
+                    codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+                    codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(
+                    ),
+                    final_attempt.response_recorder.clone(),
+                )) as BoxRespStream,
+                (
+                    crate::api_conversion::ResponseParserKind::OpenAIChatCompletions,
+                    crate::api_conversion::ResponseRendererKind::OpenAIResponses,
+                ) => Box::pin(crate::api_conversion::ChatToResponsesStream::with_recorder(
+                    resp_stream,
+                    final_attempt.response_recorder.clone(),
+                )) as BoxRespStream,
             }
         } else {
             Box::pin(
                 crate::api_conversion::NonStreamingConversionStream::with_recorder(
                     resp_stream,
                     cfg.request_body_buffer_max_bytes,
-                    forwarded_path.to_string(),
-                    upstream_api,
+                    response_pipeline,
                     final_attempt.response_recorder.clone(),
                 ),
             ) as BoxRespStream
@@ -4760,8 +4759,10 @@ mod tests {
         let mut stream = crate::api_conversion::NonStreamingConversionStream::with_recorder(
             inner,
             1024 * 1024,
-            "/v1/messages".to_string(),
-            codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
+            crate::api_conversion::response_pipeline(
+                codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
+                crate::api_conversion::DownstreamApi::AnthropicMessages,
+            ),
             None,
         );
         let mut delivered = BytesMut::new();

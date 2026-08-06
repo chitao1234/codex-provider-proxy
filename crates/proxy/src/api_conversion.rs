@@ -137,10 +137,7 @@ pub fn resolve_conversion_plan(
                 parser: RequestParserKind::AnthropicMessages,
                 renderer: RequestRendererKind::OpenAIChatCompletions,
             }),
-            response: ResponsePipeline {
-                parser: ResponseParserKind::OpenAIChatCompletions,
-                renderer: ResponseRendererKind::AnthropicMessages,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
@@ -149,19 +146,13 @@ pub fn resolve_conversion_plan(
                 parser: RequestParserKind::OpenAIResponses,
                 renderer: RequestRendererKind::OpenAIChatCompletions,
             }),
-            response: ResponsePipeline {
-                parser: ResponseParserKind::OpenAIChatCompletions,
-                renderer: ResponseRendererKind::OpenAIResponses,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Passthrough { normalizer: None },
-            response: ResponsePipeline {
-                parser: ResponseParserKind::AnthropicMessages,
-                renderer: ResponseRendererKind::AnthropicMessages,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
@@ -170,10 +161,7 @@ pub fn resolve_conversion_plan(
                 parser: RequestParserKind::OpenAIResponses,
                 renderer: RequestRendererKind::AnthropicMessages,
             }),
-            response: ResponsePipeline {
-                parser: ResponseParserKind::AnthropicMessages,
-                renderer: ResponseRendererKind::OpenAIResponses,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
@@ -181,10 +169,7 @@ pub fn resolve_conversion_plan(
             request: RequestAction::Passthrough {
                 normalizer: Some(RequestNormalizerKind::ArkResponses),
             },
-            response: ResponsePipeline {
-                parser: ResponseParserKind::OpenAIResponses,
-                renderer: ResponseRendererKind::OpenAIResponses,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::OpenAIResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
@@ -193,10 +178,7 @@ pub fn resolve_conversion_plan(
                 parser: RequestParserKind::AnthropicMessages,
                 renderer: RequestRendererKind::OpenAIResponses,
             }),
-            response: ResponsePipeline {
-                parser: ResponseParserKind::OpenAIResponses,
-                renderer: ResponseRendererKind::AnthropicMessages,
-            },
+            response: response_pipeline(provider.upstream_api, downstream),
         },
     };
     Ok(Some(plan))
@@ -430,16 +412,6 @@ impl fmt::Display for RequestConversionRejected {
 
 impl std::error::Error for RequestConversionRejected {}
 
-/// Whether the response side of the final attempt must be converted back to Messages form.
-pub fn response_conversion_enabled(
-    cfg: &Config,
-    method: &Method,
-    provider_name: &str,
-    forwarded_path: &str,
-) -> bool {
-    request_conversion_enabled(cfg, method, provider_name, forwarded_path)
-}
-
 /// Records the chat transcript for a synthesized Responses response when its stream
 /// (or non-streaming body) finishes, so a later `previous_response_id` can continue it.
 /// Also remembers the last upstream reasoning so a subsequent request whose client
@@ -507,10 +479,21 @@ pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value
 
 /// Convert a non-streaming upstream response body into the downstream dialect,
 /// dispatching on the upstream protocol (chat / Messages / Responses).
+#[cfg(test)]
 pub fn convert_non_streaming_body(
     body: Bytes,
     path: &str,
     upstream_api: UpstreamApi,
+) -> Result<Bytes, std::io::Error> {
+    let downstream = downstream_api_for_path(path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown downstream path")
+    })?;
+    convert_non_streaming_body_with_pipeline(body, response_pipeline(upstream_api, downstream))
+}
+
+pub fn convert_non_streaming_body_with_pipeline(
+    body: Bytes,
+    pipeline: ResponsePipeline,
 ) -> Result<Bytes, std::io::Error> {
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
         std::io::Error::new(
@@ -518,30 +501,23 @@ pub fn convert_non_streaming_body(
             "upstream response is not valid JSON",
         )
     })?;
-    let downstream = downstream_api_for_path(path).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown downstream path")
-    })?;
-    let converted = match (upstream_api, downstream) {
-        // Chat upstream: existing conversion.
-        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::AnthropicMessages) => {
+    let converted = match (pipeline.parser, pipeline.renderer) {
+        (ResponseParserKind::OpenAIChatCompletions, ResponseRendererKind::AnthropicMessages) => {
             convert_chat_response(&json)
         }
-        (UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough, DownstreamApi::OpenAIResponses) => {
+        (ResponseParserKind::OpenAIChatCompletions, ResponseRendererKind::OpenAIResponses) => {
             convert_chat_response_to_responses(&json)
         }
-        // Messages upstream (Anthropic message JSON): render downstream directly.
-        (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => {
-            // The body is already Anthropic Messages; pass through as-is.
+        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::AnthropicMessages) => {
             return Ok(body);
         }
-        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAIResponses) => {
+        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::OpenAIResponses) => {
             codex_provider_proxy_api_conversion::responses_renderer::convert_messages_response_to_responses(&json)
         }
-        // Responses upstream: normalize to downstream.
-        (UpstreamApi::OpenAIResponses, DownstreamApi::AnthropicMessages) => {
+        (ResponseParserKind::OpenAIResponses, ResponseRendererKind::AnthropicMessages) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_messages(&json)
         }
-        (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => {
+        (ResponseParserKind::OpenAIResponses, ResponseRendererKind::OpenAIResponses) => {
             codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_responses(&json)
         }
     }
@@ -554,6 +530,22 @@ pub fn convert_non_streaming_body(
                 "failed to serialize converted response",
             )
         })
+}
+
+pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> ResponsePipeline {
+    ResponsePipeline {
+        parser: match upstream {
+            UpstreamApi::AnthropicMessages => ResponseParserKind::AnthropicMessages,
+            UpstreamApi::OpenAIResponses => ResponseParserKind::OpenAIResponses,
+            UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough => {
+                ResponseParserKind::OpenAIChatCompletions
+            }
+        },
+        renderer: match downstream {
+            DownstreamApi::AnthropicMessages => ResponseRendererKind::AnthropicMessages,
+            DownstreamApi::OpenAIResponses => ResponseRendererKind::OpenAIResponses,
+        },
+    }
 }
 
 trait ChatStreamTarget {
@@ -732,8 +724,7 @@ pin_project! {
         #[pin]
         inner: S,
         max_bytes: usize,
-        path: String,
-        upstream_api: UpstreamApi,
+        pipeline: ResponsePipeline,
         recorder: Option<ResponseRecorder>,
         buffered: BytesMut,
         result: Option<Result<Bytes, std::io::Error>>,
@@ -747,15 +738,13 @@ impl<S> NonStreamingConversionStream<S> {
     pub fn with_recorder(
         inner: S,
         max_bytes: usize,
-        path: String,
-        upstream_api: UpstreamApi,
+        pipeline: ResponsePipeline,
         recorder: Option<ResponseRecorder>,
     ) -> Self {
         Self {
             inner,
             max_bytes,
-            path,
-            upstream_api,
+            pipeline,
             recorder,
             buffered: BytesMut::new(),
             result: None,
@@ -802,10 +791,9 @@ where
                     if let Some(recorder) = &this.recorder {
                         if let Ok(json) = serde_json::from_slice::<Value>(&buffered) {
                             let turn = chat_response_assistant_turn(&json);
-                            let converted = convert_non_streaming_body(
+                            let converted = convert_non_streaming_body_with_pipeline(
                                 buffered.clone(),
-                                this.path,
-                                *this.upstream_api,
+                                *this.pipeline,
                             );
                             if let Ok(converted) = converted {
                                 if let Ok(body) = serde_json::from_slice::<Value>(&converted) {
@@ -818,10 +806,9 @@ where
                             }
                         }
                     }
-                    *this.result = Some(convert_non_streaming_body(
+                    *this.result = Some(convert_non_streaming_body_with_pipeline(
                         buffered,
-                        this.path,
-                        *this.upstream_api,
+                        *this.pipeline,
                     ));
                     return Poll::Ready(this.result.take());
                 }
