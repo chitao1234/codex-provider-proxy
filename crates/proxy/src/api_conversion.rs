@@ -128,11 +128,17 @@ pub fn convert_request_body(
     );
     let dialect =
         downstream_api_for_path(path).expect("request conversion requires a known downstream path");
-    // Upstream Anthropic Messages: the request is already in Messages form when the
-    // downstream speaks Messages (near-passthrough); Responses downstream converts
-    // to Messages via the chat intermediate. The model rewrite handles model mapping.
+    // Upstream Messages: the request is already in Messages form when the downstream
+    // speaks Messages (near-passthrough). Upstream Responses: the request is already
+    // in Responses form when the downstream speaks Responses (same protocol).
+    // The model rewrite handles model mapping.
     if provider.upstream_api == UpstreamApi::AnthropicMessages
         && dialect == DownstreamApi::AnthropicMessages
+    {
+        return Ok(body);
+    }
+    if provider.upstream_api == UpstreamApi::OpenAiResponses
+        && dialect == DownstreamApi::OpenAiResponses
     {
         return Ok(body);
     }

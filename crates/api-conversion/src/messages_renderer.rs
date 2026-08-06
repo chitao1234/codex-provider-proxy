@@ -487,6 +487,23 @@ pub fn convert_responses_response_to_responses(body: &Value) -> Result<Value, Co
             object.insert("id".to_string(), json!(format!("resp_{id}")));
         }
     }
+    // total_tokens is required by some clients (Codex) even when the upstream omits it.
+    if object.get("total_tokens").is_none() {
+        if let (Some(input), Some(output)) = (
+            object
+                .get("usage")
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(Value::as_u64),
+            object
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(Value::as_u64),
+        ) {
+            if let Some(usage) = object.get_mut("usage").and_then(Value::as_object_mut) {
+                usage.insert("total_tokens".to_string(), json!(input + output));
+            }
+        }
+    }
     // Strip non-standard fields that third parties add (Qwen x_details, MiniMax
     // output_text / safety_identifier / conversation).
     for field in [

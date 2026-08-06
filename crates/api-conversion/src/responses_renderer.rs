@@ -416,6 +416,15 @@ pub fn responses_usage(usage: ChatUsage) -> Value {
     if let Some(output) = usage.completion_tokens {
         out.insert("output_tokens".to_string(), json!(output));
     }
+    // total_tokens is required by some clients (Codex) even when the upstream omits it.
+    let total = usage
+        .prompt_tokens
+        .zip(usage.completion_tokens)
+        .map(|(input, output)| input + output);
+    out.insert(
+        "total_tokens".to_string(),
+        json!(total.unwrap_or_default()),
+    );
     let mut input_details = serde_json::Map::new();
     if let Some(cached) = usage.cached_tokens {
         input_details.insert("cached_tokens".to_string(), json!(cached));
