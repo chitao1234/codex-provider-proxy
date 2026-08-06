@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::dialect::RequestConversionReport;
 use crate::{dialect::ModelCapabilities, error::ConversionError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +301,33 @@ impl RequestIr {
         }
     }
 
+    /// Render the IR for a Chat Completions upstream while retaining the mature capability
+    /// policies used by the existing Messages/Responses adapters. This is the compatibility
+    /// renderer used during the migration; it still consumes the IR's lossless source object.
+    pub fn render_chat_with_capabilities(
+        &self,
+        caps: &ModelCapabilities,
+        previous_messages: Option<&[Value]>,
+        last_reasoning: Option<&str>,
+    ) -> Result<(Value, RequestConversionReport), ConversionError> {
+        match self.protocol {
+            Protocol::AnthropicMessages => crate::messages_to_chat::convert_messages_request(
+                &Value::Object(self.original.clone()),
+                caps,
+            ),
+            Protocol::OpenAiResponses => crate::responses::convert_responses_request(
+                &Value::Object(self.original.clone()),
+                caps,
+                previous_messages,
+                last_reasoning,
+            ),
+            Protocol::OpenAiChatCompletions => Ok((
+                Value::Object(self.original.clone()),
+                RequestConversionReport::default(),
+            )),
+        }
+    }
+
     fn base_output(&self, target: Protocol) -> Map<String, Value> {
         let mut out = self.original.clone();
         let keys = match target {
@@ -419,7 +447,7 @@ impl RequestIr {
                 },
             );
         }
-        let mut input = self.reasoning.iter().cloned().collect::<Vec<_>>();
+        let mut input = self.reasoning.to_vec();
         input.extend(
             self.messages
                 .iter()
@@ -678,7 +706,11 @@ impl IrToolCall {
 impl IrTool {
     fn from_messages(value: &Value) -> Self {
         Self {
-            kind: "function".to_owned(),
+            kind: value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("function")
+                .to_owned(),
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             description: value
                 .get("description")

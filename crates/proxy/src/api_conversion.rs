@@ -18,12 +18,10 @@ pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
-use codex_provider_proxy_api_conversion::messages_to_chat::{
-    convert_chat_response, convert_messages_request,
-};
+use codex_provider_proxy_api_conversion::messages_to_chat::convert_chat_response;
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::responses::{
-    chat_response_assistant_turn, convert_chat_response_to_responses, convert_responses_request,
+    chat_response_assistant_turn, convert_chat_response_to_responses,
 };
 use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
 use codex_provider_proxy_api_conversion::{sse, ConversionError};
@@ -292,15 +290,35 @@ pub fn convert_request_body(
         RequestAction::Transform(RequestPipeline {
             parser: RequestParserKind::AnthropicMessages,
             renderer: RequestRendererKind::OpenAIChatCompletions,
-        }) => convert_messages_request(&json, &caps).map_err(|err| {
-            RequestConversionRejected::from_conversion_error(err, plan.downstream)
-        })?,
+        }) => {
+            let request = RequestIr::parse(Protocol::AnthropicMessages, &json).map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
+            request
+                .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?
+        }
         RequestAction::Transform(RequestPipeline {
             parser: RequestParserKind::OpenAIResponses,
             renderer: RequestRendererKind::OpenAIChatCompletions,
-        }) => convert_responses_request(&json, &caps, previous_messages, last_reasoning).map_err(
-            |err| RequestConversionRejected::from_conversion_error(err, plan.downstream),
-        )?,
+        }) => {
+            let request = RequestIr::parse_with_context(
+                Protocol::OpenAiResponses,
+                &json,
+                previous_messages,
+                last_reasoning,
+            )
+            .map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
+            request
+                .render_chat_with_capabilities(&caps, previous_messages, last_reasoning)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?
+        }
         RequestAction::Transform(RequestPipeline {
             parser: RequestParserKind::OpenAIResponses,
             renderer: RequestRendererKind::AnthropicMessages,
