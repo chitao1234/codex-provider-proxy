@@ -10,6 +10,10 @@ use crate::chat::{
     extract_usage, first_choice_finish_reason, first_choice_message, upstream_id, upstream_model,
     ChatUsage,
 };
+use crate::chat_request::{
+    add_forced_server_tools, apply_max_tokens_cap, copy_bool, copy_string, copy_u64, copy_value,
+    max_tokens_field,
+};
 use crate::dialect::{ModelCapabilities, RequestConversionReport};
 use crate::error::ConversionError;
 
@@ -68,25 +72,7 @@ pub fn convert_responses_request(
     let messages = expand_input(request.get("input"), caps, last_reasoning)?;
     let (tools, mut report) = convert_tools(request.get("tools"), caps)?;
 
-    // Force-enable configured server tools even when the client did not declare them
-    // (mirrors the Messages path).
-    if !caps.always_enable_tools.is_empty() {
-        for tool in &caps.always_enable_tools {
-            let normalized = match tool.as_str() {
-                "WebSearch" => "web_search",
-                "WebFetch" => "web_fetch",
-                "CodeExecution" => "code_execution",
-                other => other,
-            };
-            if !report
-                .mapped_server_tools
-                .iter()
-                .any(|mapped| mapped == normalized)
-            {
-                report.mapped_server_tools.push(normalized.to_string());
-            }
-        }
-    }
+    add_forced_server_tools(caps, &mut report);
     // Merge provider-native request params for mapped server tools.
     let query = last_input_user_text(request.get("input"));
     merge_native_params(&mut out, caps, &report, query.as_deref());
@@ -117,12 +103,7 @@ pub fn convert_responses_request(
 
 /// Normalize request parameters to Ark (Volcengine) Responses style.
 ///
-/// Ark deviations from official Responses (PDF research):
-/// - `reasoning.effort` is not used; Ark controls thinking via
-///   `thinking: {"type": "enabled"|"disabled"|"auto"}`.
-/// - `caching: {"type": "enabled"|"disabled", "prefix": true}` explicitly enables
-///   prefix caching (official has none; Ark needs >=256 tokens to create).
-/// - web_search tools use `max_keyword` instead of official `search_context_size`.
+/// Normalize the Chat Completions request generated from an Ark-style Responses request.
 fn apply_ark_style(out: &mut Map<String, Value>) {
     // reasoning_effort (from downstream reasoning.effort) -> Ark thinking.type.
     if let Some(effort) = out.get("reasoning_effort").and_then(Value::as_str) {
@@ -134,42 +115,13 @@ fn apply_ark_style(out: &mut Map<String, Value>) {
         out.insert("thinking".to_string(), json!({"type": thinking_type}));
         out.remove("reasoning_effort");
     }
-    // Ark does not support the caching parameter in codex flow (tested:
-    // 400 "caching is not supported in coding plan / agent plan / codex flow"),
-    // so no caching injection here.
-    // Normalize web_search tools: max_keyword instead of search_context_size.
-    if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
-        for tool in tools {
-            let Some(object) = tool.as_object_mut() else {
-                continue;
-            };
-            if object.get("type").and_then(Value::as_str) != Some("web_search") {
-                continue;
-            }
-            let search = object
-                .entry("web_search".to_string())
-                .or_insert_with(|| json!({}));
-            if let Some(search) = search.as_object_mut() {
-                if let Some(context) = search.remove("search_context_size") {
-                    search.insert(
-                        "max_keyword".to_string(),
-                        match context.as_str() {
-                            Some("low") => json!(1),
-                            Some("medium") => json!(3),
-                            _ => json!(5),
-                        },
-                    );
-                }
-            }
-        }
-    }
+    normalize_ark_web_search_tools(out);
 }
 
 /// Apply Ark-style parameter normalization directly to a Responses request object
 /// (for same-protocol passthrough where the downstream already speaks Responses).
 ///
 /// - `reasoning.effort` -> Ark `thinking: {"type": "enabled"|"disabled"}`.
-/// - Adds `caching: {"type": "enabled", "prefix": true}`.
 /// - web_search tools: `search_context_size` -> `max_keyword`.
 pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
     // reasoning.effort -> Ark thinking.type.
@@ -180,17 +132,21 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
         .and_then(Value::as_str)
         .map(str::to_owned);
     if let Some(effort) = &effort {
-        let thinking_type = if matches!(effort.as_str(), "none" | "minimal") {
-            "disabled"
-        } else {
-            "enabled"
-        };
+        let thinking_type = ark_thinking_type(effort);
         request.insert("thinking".to_string(), json!({"type": thinking_type}));
     }
-    // Ark does not support the caching parameter in codex flow (tested:
-    // 400 "caching is not supported in coding plan / agent plan / codex flow"),
-    // so no caching injection here.
-    // Normalize web_search tools: max_keyword instead of search_context_size.
+    normalize_ark_web_search_tools(request);
+}
+
+fn ark_thinking_type(effort: &str) -> &'static str {
+    if matches!(effort, "none" | "minimal") {
+        "disabled"
+    } else {
+        "enabled"
+    }
+}
+
+fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
     if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
             let Some(object) = tool.as_object_mut() else {
@@ -204,63 +160,15 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
                 .or_insert_with(|| json!({}));
             if let Some(search) = search.as_object_mut() {
                 if let Some(context) = search.remove("search_context_size") {
-                    search.insert(
-                        "max_keyword".to_string(),
-                        match context.as_str() {
-                            Some("low") => json!(1),
-                            Some("medium") => json!(3),
-                            _ => json!(5),
-                        },
-                    );
+                    let max_keyword = match context.as_str() {
+                        Some("low") => 1,
+                        Some("medium") => 3,
+                        _ => 5,
+                    };
+                    search.insert("max_keyword".to_string(), Value::from(max_keyword));
                 }
             }
         }
-    }
-}
-
-fn max_tokens_field(field: crate::dialect::MaxTokensField) -> &'static str {
-    match field {
-        crate::dialect::MaxTokensField::MaxTokens => "max_tokens",
-        crate::dialect::MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
-    }
-}
-
-fn copy_string(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = request.get(from).and_then(Value::as_str) {
-        out.insert(to.to_string(), Value::String(value.to_string()));
-    }
-}
-
-fn copy_u64(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = request.get(from).and_then(Value::as_u64) {
-        out.insert(to.to_string(), Value::from(value));
-    }
-}
-
-fn copy_bool(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = request.get(from).and_then(Value::as_bool) {
-        out.insert(to.to_string(), Value::Bool(value));
-    }
-}
-
-fn copy_value(request: &Map<String, Value>, out: &mut Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = request.get(from) {
-        if !value.is_null() {
-            out.insert(to.to_string(), value.clone());
-        }
-    }
-}
-
-fn apply_max_tokens_cap(caps: &ModelCapabilities, out: &mut Map<String, Value>) {
-    let Some(cap) = caps.max_tokens_cap else {
-        return;
-    };
-    let field = max_tokens_field(caps.max_tokens_field);
-    let Some(value) = out.get(field).and_then(Value::as_u64) else {
-        return;
-    };
-    if value > cap {
-        out.insert(field.to_string(), Value::from(cap));
     }
 }
 

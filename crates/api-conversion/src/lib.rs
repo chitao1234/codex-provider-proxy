@@ -10,6 +10,7 @@
 
 pub mod chat;
 pub mod chat_parser;
+pub(crate) mod chat_request;
 pub mod dialect;
 pub mod error;
 pub mod messages;

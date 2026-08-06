@@ -43,13 +43,10 @@ const RESPONSES_PATH: &str = "responses";
 
 /// The downstream dialect a forwarded path maps to, if any.
 pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
-    let trimmed = path.trim_matches('/');
-    if trimmed == MESSAGES_PATH || trimmed.ends_with(&format!("/{MESSAGES_PATH}")) {
-        Some(DownstreamApi::AnthropicMessages)
-    } else if trimmed == RESPONSES_PATH || trimmed.ends_with(&format!("/{RESPONSES_PATH}")) {
-        Some(DownstreamApi::OpenAiResponses)
-    } else {
-        None
+    match path.trim_matches('/').rsplit('/').next() {
+        Some(MESSAGES_PATH) => Some(DownstreamApi::AnthropicMessages),
+        Some(RESPONSES_PATH) => Some(DownstreamApi::OpenAiResponses),
+        _ => None,
     }
 }
 
