@@ -39,7 +39,7 @@ provider selection, retries, and PID routing.
 - tool definitions and tool choice;
 - continuation data;
 - stateful request context (conversation, end-user identity, safety identity, metadata, storage,
-  truncation, include selectors, prompt-cache identity and retention);
+  truncation, include selectors, and the protocol-neutral `CacheContext`);
 - arbitrary top-level parameters.
 
 Messages, tool calls, and tool definitions retain their original object data in addition to the
@@ -154,10 +154,12 @@ Unknown provider-specific identity/cache fields remain in the lossless extension
 normalizers may add explicit spellings later, but a missing mapping must not make parsing fail or
 erase the field from continuation state.
 
-Where a target protocol has no separate prompt-cache key, the renderer applies a deliberate
-identity mapping instead of leaking an unsupported source field: a Responses `prompt_cache_key`
-becomes Anthropic `metadata.user_id` (or the Chat `user` field) when no explicit end-user identity
-is present. The source-only cache-key fields are then omitted from that target request.
+`CacheContext` is populated by all three request parsers, not only Responses. It contains the
+cache-affinity key, retention policy, and top-level cache control. Renderers map that same IR to
+each target spelling: Responses `prompt_cache_key`, Anthropic `metadata.user_id`, or Chat `user`.
+When a target protocol has no separate prompt-cache key, the renderer uses the cache key as the
+fallback identity only when no explicit end-user identity is present, and omits source-only cache
+fields from the target request.
 
 `previous_response_id` itself is not blindly forwarded during cross-protocol rendering because a
 proxy-synthesized response id is meaningful only to the proxy's local state store. The restored

@@ -46,14 +46,23 @@ pub struct RequestContext {
     pub end_user_id: Option<String>,
     pub safety_identifier: Option<String>,
     pub metadata: Option<Value>,
-    pub prompt_cache_key: Option<String>,
-    pub prompt_cache_retention: Option<Value>,
-    pub cache_control: Option<Value>,
+    pub cache: CacheContext,
     pub store: Option<Value>,
     pub include: Option<Value>,
     pub truncation: Option<Value>,
     /// Provider-specific identity/session/cache keys that have no portable spelling yet.
     pub extensions: BTreeMap<String, Value>,
+}
+
+/// Protocol-neutral prompt-cache semantics.
+///
+/// `key` is the stable cache-affinity identity. Protocols expose it under different names
+/// (`prompt_cache_key`, `metadata.user_id`, or `user`), so renderers map it only at the boundary.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CacheContext {
+    pub key: Option<String>,
+    pub retention: Option<Value>,
+    pub control: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,13 +206,29 @@ impl RequestIr {
             .get("safety_identifier")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.context.prompt_cache_key = self
+        self.context.cache.key = self
             .original
             .get("prompt_cache_key")
             .and_then(Value::as_str)
-            .map(str::to_owned);
-        self.context.prompt_cache_retention = self.original.get("prompt_cache_retention").cloned();
-        self.context.cache_control = self.original.get("cache_control").cloned();
+            .map(str::to_owned)
+            .or_else(|| {
+                (self.protocol == Protocol::OpenAiChatCompletions)
+                    .then(|| self.context.end_user_id.clone())
+                    .flatten()
+            })
+            .or_else(|| {
+                (self.protocol == Protocol::AnthropicMessages)
+                    .then(|| {
+                        self.original
+                            .get("metadata")
+                            .and_then(|metadata| metadata.get("user_id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            });
+        self.context.cache.retention = self.original.get("prompt_cache_retention").cloned();
+        self.context.cache.control = self.original.get("cache_control").cloned();
         self.context.store = self.original.get("store").cloned();
         self.context.include = self.original.get("include").cloned();
         self.context.truncation = self.original.get("truncation").cloned();
@@ -230,20 +255,20 @@ impl RequestIr {
         if self.context.metadata.is_none() {
             self.context.metadata.clone_from(&previous.metadata);
         }
-        if self.context.prompt_cache_key.is_none() {
-            self.context
-                .prompt_cache_key
-                .clone_from(&previous.prompt_cache_key);
+        if self.context.cache.key.is_none() {
+            self.context.cache.key.clone_from(&previous.cache.key);
         }
-        if self.context.prompt_cache_retention.is_none() {
+        if self.context.cache.retention.is_none() {
             self.context
-                .prompt_cache_retention
-                .clone_from(&previous.prompt_cache_retention);
+                .cache
+                .retention
+                .clone_from(&previous.cache.retention);
         }
-        if self.context.cache_control.is_none() {
+        if self.context.cache.control.is_none() {
             self.context
-                .cache_control
-                .clone_from(&previous.cache_control);
+                .cache
+                .control
+                .clone_from(&previous.cache.control);
         }
         self.context.extensions = previous
             .extensions
@@ -631,7 +656,7 @@ impl RequestIr {
             out.entry("metadata".to_owned())
                 .or_insert_with(|| metadata.clone());
         }
-        if let Some(cache_control) = &self.context.cache_control {
+        if let Some(cache_control) = &self.context.cache.control {
             out.entry("cache_control".to_owned())
                 .or_insert_with(|| cache_control.clone());
         }
@@ -644,11 +669,11 @@ impl RequestIr {
                 .or_insert_with(|| Value::String(identifier.clone()));
         }
         if target == Protocol::OpenAiResponses {
-            if let Some(key) = &self.context.prompt_cache_key {
+            if let Some(key) = &self.context.cache.key {
                 out.entry("prompt_cache_key".to_owned())
                     .or_insert_with(|| Value::String(key.clone()));
             }
-            if let Some(retention) = &self.context.prompt_cache_retention {
+            if let Some(retention) = &self.context.cache.retention {
                 out.entry("prompt_cache_retention".to_owned())
                     .or_insert_with(|| retention.clone());
             }
@@ -665,11 +690,11 @@ impl RequestIr {
 
         match target {
             Protocol::AnthropicMessages => {
-                if let Some(user_id) = self
+                if let Some(user_id) = self.context.end_user_id.as_ref().or(self
                     .context
-                    .end_user_id
-                    .as_ref()
-                    .or(self.context.prompt_cache_key.as_ref())
+                    .cache
+                    .key
+                    .as_ref())
                 {
                     let metadata = out
                         .entry("metadata".to_owned())
@@ -682,11 +707,11 @@ impl RequestIr {
                 }
             }
             Protocol::OpenAiChatCompletions => {
-                if let Some(user_id) = self
+                if let Some(user_id) = self.context.end_user_id.as_ref().or(self
                     .context
-                    .end_user_id
-                    .as_ref()
-                    .or(self.context.prompt_cache_key.as_ref())
+                    .cache
+                    .key
+                    .as_ref())
                 {
                     out.entry("user".to_owned())
                         .or_insert_with(|| Value::String(user_id.clone()));
@@ -1398,5 +1423,39 @@ mod tests {
             .unwrap();
         assert_eq!(messages["metadata"]["user_id"], "cache-as-identity");
         assert!(messages.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn messages_cache_identity_maps_to_responses_prompt_cache_key() {
+        let ir = RequestIr::parse(
+            Protocol::AnthropicMessages,
+            &json!({
+                "model": "m",
+                "metadata": {"user_id": "anthropic-cache-user"},
+                "messages": [{"role":"user", "content":"hello"}]
+            }),
+        )
+        .unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["prompt_cache_key"], "anthropic-cache-user");
+    }
+
+    #[test]
+    fn chat_cache_identity_maps_to_responses_prompt_cache_key() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiChatCompletions,
+            &json!({
+                "model": "m",
+                "user": "chat-cache-user",
+                "messages": [{"role":"user", "content":"hello"}]
+            }),
+        )
+        .unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["prompt_cache_key"], "chat-cache-user");
     }
 }
