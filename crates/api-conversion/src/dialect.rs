@@ -117,6 +117,10 @@ fn default_reasoning_effort_levels() -> Vec<String> {
         .collect()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Per-model (or provider-default) capability knobs the converter consults.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -160,6 +164,11 @@ pub struct ModelCapabilities {
     /// `ServerToolPolicy::ProviderNative`; forces the corresponding native params/tools.
     #[serde(default)]
     pub always_enable_tools: Vec<String>,
+    /// Whether the upstream accepts the `stop` parameter (stop sequences). Reasoning
+    /// models such as Grok 4.5 reject it ("presence_penalty/frequency_penalty/stop not
+    /// available"), so conversion drops `stop_sequences` when this is false.
+    #[serde(default = "default_true")]
+    pub accept_stop: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -179,6 +188,7 @@ impl Default for ModelCapabilities {
             fetch_request_params: None,
             code_interpreter_request_params: None,
             always_enable_tools: Vec::new(),
+            accept_stop: true,
         }
     }
 }

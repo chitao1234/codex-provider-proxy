@@ -52,7 +52,7 @@ pub fn convert_messages_request(
     apply_max_tokens_cap(caps, &mut out);
     copy_value(request, &mut out, "temperature", "temperature");
     copy_user(request, &mut out);
-    convert_stop_sequences(request, &mut out);
+    convert_stop_sequences(request, caps, &mut out);
     convert_effort_and_thinking(request, caps, &mut out)?;
     convert_tool_choice(request, &mut out);
     convert_parallel_tool_use(request, caps, &mut out);
@@ -189,7 +189,16 @@ fn copy_user(request: &Map<String, Value>, out: &mut Map<String, Value>) {
     }
 }
 
-fn convert_stop_sequences(request: &Map<String, Value>, out: &mut Map<String, Value>) {
+fn convert_stop_sequences(
+    request: &Map<String, Value>,
+    caps: &ModelCapabilities,
+    out: &mut Map<String, Value>,
+) {
+    if !caps.accept_stop {
+        // Reasoning models such as Grok 4.5 reject the `stop` parameter; drop
+        // downstream stop_sequences instead of failing the request.
+        return;
+    }
     let Some(sequences) = request.get("stop_sequences").and_then(Value::as_array) else {
         return;
     };
@@ -1378,6 +1387,22 @@ mod tests {
         assert_eq!(out["messages"][0]["role"], "system");
         assert_eq!(out["messages"][1]["role"], "user");
         assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn drops_stop_sequences_when_upstream_rejects_stop() {
+        let mut no_stop_caps = caps();
+        no_stop_caps.accept_stop = false;
+        let body = json!({
+            "model": "grok-4.5",
+            "stop_sequences": ["END"],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_messages_request(&body, &no_stop_caps).unwrap();
+        assert!(out.get("stop").is_none(), "stop must be dropped");
+
+        let (out, _) = convert_messages_request(&body, &caps()).unwrap();
+        assert_eq!(out["stop"], "END");
     }
 
     #[test]
