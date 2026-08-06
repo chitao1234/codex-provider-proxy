@@ -68,7 +68,30 @@ pub fn convert_responses_request(
 
     let instructions = request.get("instructions").and_then(Value::as_str);
     let messages = expand_input(request.get("input"), caps)?;
-    let (tools, report) = convert_tools(request.get("tools"), caps)?;
+    let (tools, mut report) = convert_tools(request.get("tools"), caps)?;
+
+    // Force-enable configured server tools even when the client did not declare them
+    // (mirrors the Messages path).
+    if !caps.always_enable_tools.is_empty() {
+        for tool in &caps.always_enable_tools {
+            let normalized = match tool.as_str() {
+                "WebSearch" => "web_search",
+                "WebFetch" => "web_fetch",
+                "CodeExecution" => "code_execution",
+                other => other,
+            };
+            if !report
+                .mapped_server_tools
+                .iter()
+                .any(|mapped| mapped == normalized)
+            {
+                report.mapped_server_tools.push(normalized.to_string());
+            }
+        }
+    }
+    // Merge provider-native request params for mapped server tools.
+    let query = last_input_user_text(request.get("input"));
+    merge_native_params(&mut out, caps, &report, query.as_deref());
 
     let mut chat_messages: Vec<Value> = Vec::with_capacity(
         messages.len()
@@ -555,16 +578,45 @@ fn convert_tools(
     Ok((out, report))
 }
 
+/// The last user text in a Responses `input`, for search query templating.
+fn last_input_user_text(input: Option<&Value>) -> Option<String> {
+    let input = input?;
+    if let Some(text) = input.as_str() {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.chars().take(60).collect());
+    }
+    let items = input.as_array()?;
+    for item in items.iter().rev() {
+        let object = item.as_object()?;
+        if object.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        if object.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = object.get("content") else {
+            continue;
+        };
+        let (text, _) = responses_content_text(content);
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.chars().take(60).collect());
+        }
+    }
+    None
+}
+
 /// Merge provider-native request params for mapped tools (search/fetch/code).
 pub fn merge_native_params(
     out: &mut Map<String, Value>,
     caps: &ModelCapabilities,
     report: &RequestConversionReport,
+    last_user_query: Option<&str>,
 ) {
     if let Some(params) = &caps.search_request_params {
         if report.mapped_server_tools.iter().any(|t| t == "web_search") {
             if let Value::Object(merged) =
-                crate::messages_to_chat::render_search_tool_template(params, None)
+                crate::messages_to_chat::render_search_tool_template(params, last_user_query)
             {
                 out.extend(merged);
             }
@@ -831,6 +883,13 @@ impl ResponsesStreamConverter {
         let chunk: Value = serde_json::from_str(payload)
             .map_err(|_| ConversionError::invalid("upstream SSE chunk is not valid JSON"))?;
 
+        // Upstream error event: emit a downstream `error` SSE event and stop, instead
+        // of faking response.completed.
+        if let Some(error) = chunk.get("error").and_then(Value::as_object) {
+            self.emit_error(error, out);
+            return Ok(());
+        }
+
         if !self.started {
             self.begin(&chunk, out);
         }
@@ -858,6 +917,28 @@ impl ResponsesStreamConverter {
             return;
         }
         self.emit_completed(out);
+    }
+
+    fn emit_error(&mut self, error: &Map<String, Value>, out: &mut Vec<Bytes>) {
+        self.finished = true;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream request failed");
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("api_error");
+        self.emit(
+            "error",
+            &json!({
+                "type": "error",
+                "code": code,
+                "message": message,
+                "param": null,
+            }),
+            out,
+        );
     }
 
     fn begin(&mut self, chunk: &Value, out: &mut Vec<Bytes>) {
@@ -1252,6 +1333,50 @@ mod tests {
     }
 
     #[test]
+    fn builtin_tools_map_to_provider_native_params() {
+        let mut caps = caps();
+        caps.server_tools = crate::dialect::ServerToolPolicy::ProviderNative;
+        caps.always_enable_tools = vec!["web_search".to_string(), "code_execution".to_string()];
+        caps.search_request_params =
+            Some(json!({"web_search": {"enable": true, "search_query": "{search_query}"}}));
+        caps.code_interpreter_request_params = Some(json!({"enable_code_interpreter": true}));
+
+        let body = json!({
+            "model": "m",
+            "input": "what's the weather in Paris?",
+            "stream": false,
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (out, report) = convert_responses_request(&body, &caps, None).unwrap();
+        assert_eq!(out["web_search"]["enable"], true);
+        assert!(out["web_search"]["search_query"]
+            .as_str()
+            .unwrap()
+            .contains("Paris"));
+        assert_eq!(out["enable_code_interpreter"], true);
+        // code interpreter forces streaming upstream (qwen requirement).
+        assert_eq!(out["stream"], true);
+        // Both tools were mapped, not dropped.
+        assert_eq!(report.mapped_server_tools.len(), 2);
+        assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn builtin_tools_dropped_when_upstream_has_no_equivalent() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search_preview"}, {"type": "file_search"}]
+        });
+        let (out, report) = convert_responses_request(&body, &caps(), None).unwrap();
+        assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+        assert_eq!(
+            report.dropped_server_tools,
+            vec!["web_search".to_string(), "file_search".to_string()]
+        );
+    }
+
+    #[test]
     fn prepends_previous_messages_before_current_input() {
         let body = json!({
             "model": "m",
@@ -1438,6 +1563,31 @@ mod tests {
         let turn = converter.assistant_turn().expect("assistant turn recorded");
         assert_eq!(turn["content"], "Hi there");
         assert!(turn.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn stream_error_event_emits_error_and_no_completed() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut out = Vec::new();
+        converter
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter
+            .on_chunk(
+                r#"{"error":{"message":"upstream exploded","type":"server_error","code":"upstream_error"}}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter.on_chunk("[DONE]", &mut out).unwrap();
+
+        let text = String::from_utf8_lossy(&out.concat()).into_owned();
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"code\":\"upstream_error\""));
+        assert!(text.contains("\"message\":\"upstream exploded\""));
+        assert!(!text.contains("event: response.completed"));
     }
 
     #[test]

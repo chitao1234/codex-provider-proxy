@@ -984,6 +984,13 @@ impl ChatStreamConverter {
         let chunk: Value = serde_json::from_str(payload)
             .map_err(|_| ConversionError::invalid("upstream SSE chunk is not valid JSON"))?;
 
+        // Upstream error event: emit an Anthropic error SSE event and stop, instead of
+        // faking message_stop.
+        if let Some(error) = chunk.get("error").and_then(Value::as_object) {
+            self.emit_error(error, out);
+            return Ok(());
+        }
+
         if !self.started {
             self.begin(&chunk, out);
         }
@@ -1024,6 +1031,29 @@ impl ChatStreamConverter {
 
     fn saw_tool_call(&self) -> bool {
         self.tools.values().any(|tool| tool.block_index.is_some())
+    }
+
+    /// Emit an Anthropic `error` SSE event for an upstream stream error and stop.
+    fn emit_error(&mut self, error: &Map<String, Value>, out: &mut Vec<Bytes>) {
+        self.ended = true;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream request failed");
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("api_error");
+        out.push(encode_sse_event(
+            "error",
+            &json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": format!("{code}: {message}"),
+                },
+            }),
+        ));
     }
 
     fn begin(&mut self, chunk: &Value, out: &mut Vec<Bytes>) {
@@ -1863,6 +1893,31 @@ mod tests {
         // No cumulative value is ever sent.
         assert!(!text.contains("\"partial_json\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
         assert_eq!(text.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn stream_error_event_emits_anthropic_error() {
+        let mut converter = ChatStreamConverter::new();
+        let mut out = Vec::new();
+        converter
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter
+            .on_chunk(
+                r#"{"error":{"message":"upstream exploded","type":"server_error","code":"upstream_error"}}"#,
+                &mut out,
+            )
+            .unwrap();
+        converter.on_chunk("[DONE]", &mut out).unwrap();
+
+        let text = String::from_utf8_lossy(&out.concat()).into_owned();
+        assert!(text.contains("event: error"));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("upstream exploded"));
+        assert!(!text.contains("event: message_stop"));
     }
 
     #[test]
