@@ -9,6 +9,7 @@ mod rewrite;
 mod rpc;
 mod runtime;
 mod statistics;
+mod streams;
 
 use std::{path::PathBuf, sync::Arc};
 

@@ -17,6 +17,7 @@ pub mod messages_parser;
 pub mod messages_renderer;
 pub mod messages_to_chat;
 pub mod responses;
+pub mod responses_parser;
 pub mod responses_renderer;
 pub mod sse;
 pub mod stream;
