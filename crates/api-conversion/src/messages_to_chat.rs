@@ -20,14 +20,7 @@ use crate::messages::{
 };
 use crate::sse::encode_sse_event;
 
-/// What the request conversion did, for logging.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RequestConversionReport {
-    /// Server tool definitions dropped because the upstream has no equivalent.
-    pub dropped_server_tools: Vec<String>,
-    /// Server tools mapped to function tools (web_search/web_fetch).
-    pub mapped_server_tools: Vec<String>,
-}
+pub use crate::dialect::RequestConversionReport;
 
 /// Convert an Anthropic Messages request body into a Chat Completions request body.
 pub fn convert_messages_request(
@@ -710,7 +703,7 @@ fn tool_name(object: &Map<String, Value>) -> String {
 
 /// Render a native search tool template, substituting the `{search_query}` placeholder
 /// (when present) with a query derived from the conversation (the last user text).
-fn render_search_tool_template(template: &Value, query: Option<&str>) -> Value {
+pub fn render_search_tool_template(template: &Value, query: Option<&str>) -> Value {
     let Some(object) = template.as_object() else {
         return template.clone();
     };
@@ -751,7 +744,7 @@ fn last_user_query(messages: Option<&Value>) -> Option<String> {
     None
 }
 
-fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
+pub fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
     let mut function = Map::new();
     function.insert("name".to_string(), json!(name));
     if !description.is_empty() {
@@ -763,7 +756,7 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
 
 /// Normalize an Anthropic input_schema for use as Chat `parameters`:
 /// strip the `$schema` marker and ensure `properties` exists on object schemas.
-fn normalize_input_schema(schema: &Value) -> Value {
+pub fn normalize_input_schema(schema: &Value) -> Value {
     let Some(object) = schema.as_object() else {
         return json!({"type": "object", "properties": {}});
     };

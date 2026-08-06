@@ -23,6 +23,8 @@ pub enum UpstreamApi {
 pub enum DownstreamApi {
     /// Anthropic Messages API (`POST /v1/messages`), e.g. Claude Code.
     AnthropicMessages,
+    /// OpenAI Responses API (`POST /v1/responses`), e.g. Codex CLI.
+    OpenAiResponses,
 }
 
 /// Which output-token field the upstream expects.
@@ -238,6 +240,15 @@ pub fn converts_messages_to_upstream(
     accepted: &[DownstreamApi],
 ) -> bool {
     upstream_api != UpstreamApi::Passthrough && accepted.contains(&DownstreamApi::AnthropicMessages)
+}
+
+/// What a request conversion did, for logging.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestConversionReport {
+    /// Server tool definitions dropped because the upstream has no equivalent.
+    pub dropped_server_tools: Vec<String>,
+    /// Server tools mapped to function tools (web_search/web_fetch).
+    pub mapped_server_tools: Vec<String>,
 }
 
 #[cfg(test)]

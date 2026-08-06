@@ -456,6 +456,7 @@ async fn handle_proxy_inner(
             downstream_status,
             resp,
             &resp_headers,
+            forwarded_path,
         )
         .await;
     }
@@ -489,13 +490,22 @@ async fn handle_proxy_inner(
     );
     let resp_stream = if conversion_applies {
         if is_text_event_stream(&resp_headers) {
-            Box::pin(crate::api_conversion::ChatToMessagesStream::new(
-                resp_stream,
-            )) as BoxRespStream
+            match crate::api_conversion::downstream_api_for_path(forwarded_path) {
+                Some(crate::api_conversion::DownstreamApi::AnthropicMessages) => Box::pin(
+                    crate::api_conversion::ChatToMessagesStream::new(resp_stream),
+                )
+                    as BoxRespStream,
+                Some(crate::api_conversion::DownstreamApi::OpenAiResponses) => Box::pin(
+                    crate::api_conversion::ChatToResponsesStream::new(resp_stream),
+                )
+                    as BoxRespStream,
+                None => resp_stream,
+            }
         } else {
             Box::pin(crate::api_conversion::NonStreamingConversionStream::new(
                 resp_stream,
                 cfg.request_body_buffer_max_bytes,
+                forwarded_path.to_string(),
             )) as BoxRespStream
         }
     } else {
@@ -576,6 +586,7 @@ async fn convert_upstream_error_response(
     downstream_status: StatusCode,
     resp: reqwest::Response,
     upstream_headers: &HeaderMap,
+    forwarded_path: &str,
 ) -> Result<Response<Body>> {
     let body = buffer_response_body_for_conversion(resp, cfg.request_body_buffer_max_bytes).await?;
     let Ok(json) = serde_json::from_slice::<Value>(&body) else {
@@ -585,7 +596,8 @@ async fn convert_upstream_error_response(
         *response.headers_mut() = filtered_response_headers(upstream_headers);
         return Ok(response);
     };
-    let converted = crate::api_conversion::convert_error_body(upstream_status, &json);
+    let converted =
+        crate::api_conversion::convert_error_body(upstream_status, &json, forwarded_path);
     let mut response = Response::builder()
         .status(downstream_status)
         .body(Body::from(converted.to_string()))?;
@@ -1346,8 +1358,13 @@ fn maybe_convert_request_body(
     ) {
         return Ok(body);
     }
-    let converted = crate::api_conversion::convert_request_body(cfg, &attempt.provider_name, body)
-        .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
+    let converted = crate::api_conversion::convert_request_body(
+        cfg,
+        &attempt.provider_name,
+        forwarded_path,
+        body,
+    )
+    .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
     attempt.headers.remove(header::CONTENT_LENGTH);
     attempt.headers.remove(ANTHROPIC_BETA_HEADER);
     attempt.headers.insert(
@@ -4449,7 +4466,7 @@ mod tests {
     #[test]
     fn convert_non_streaming_body_parses_chat_json() {
         let body = Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}");
-        let out = crate::api_conversion::convert_non_streaming_body(body).unwrap();
+        let out = crate::api_conversion::convert_non_streaming_body(body, "/v1/messages").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["type"], "message");
     }
@@ -4459,8 +4476,11 @@ mod tests {
         let inner = futures_util::stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"{\"id\":\"t\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"stop\"}]}")),
         ]);
-        let mut stream =
-            crate::api_conversion::NonStreamingConversionStream::new(inner, 1024 * 1024);
+        let mut stream = crate::api_conversion::NonStreamingConversionStream::new(
+            inner,
+            1024 * 1024,
+            "/v1/messages".to_string(),
+        );
         let mut delivered = BytesMut::new();
         while let Some(item) = stream.next().await {
             delivered.extend_from_slice(&item.unwrap());
@@ -4721,13 +4741,17 @@ mod tests {
     #[test]
     fn provider_converts_messages_requires_both_config() {
         let provider = converting_provider(Url::parse("https://example.com/").unwrap());
-        assert!(crate::api_conversion::provider_converts_messages(&provider));
+        assert!(crate::api_conversion::provider_converts_path(
+            &provider,
+            "/v1/messages"
+        ));
         let passthrough = Provider {
             upstream_api: codex_provider_proxy_api_conversion::dialect::UpstreamApi::Passthrough,
             ..provider.clone()
         };
-        assert!(!crate::api_conversion::provider_converts_messages(
-            &passthrough
+        assert!(!crate::api_conversion::provider_converts_path(
+            &passthrough,
+            "/v1/messages"
         ));
     }
 }

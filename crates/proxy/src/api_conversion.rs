@@ -1,8 +1,9 @@
 //! Proxy-side integration of the API conversion layer.
 //!
 //! Decides when a request must be converted (provider declares an upstream Chat Completions
-//! API and accepts downstream Anthropic Messages), converts the request body after the
-//! model-mapping rewrite, and adapts upstream response streams back to Messages form.
+//! API and accepts downstream Anthropic Messages and/or OpenAI Responses), converts the
+//! request body after the model-mapping rewrite, and adapts upstream response streams back
+//! to the downstream dialect.
 
 use std::{
     collections::VecDeque,
@@ -12,12 +13,14 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use codex_provider_proxy_api_conversion::dialect::{
-    converts_messages_to_upstream, ModelCapabilities,
-};
+pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
+use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
 use codex_provider_proxy_api_conversion::messages_to_chat::{
     convert_chat_response, convert_messages_request, ChatStreamConverter,
+};
+use codex_provider_proxy_api_conversion::responses::{
+    convert_chat_response_to_responses, convert_responses_request, ResponsesStreamConverter,
 };
 use codex_provider_proxy_api_conversion::{sse, ConversionError};
 use futures_util::Stream;
@@ -28,25 +31,36 @@ use tracing::warn;
 
 use crate::config::{Config, Provider};
 
-/// Upstream path a converted Messages request is sent to.
+/// Upstream path a converted request is sent to.
 pub const CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 const MESSAGES_PATH: &str = "messages";
+const RESPONSES_PATH: &str = "responses";
 
-/// Whether this provider converts downstream Anthropic Messages traffic.
-pub fn provider_converts_messages(provider: &Provider) -> bool {
-    converts_messages_to_upstream(provider.upstream_api, &provider.accept_downstream_apis)
+/// The downstream dialect a forwarded path maps to, if any.
+pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
+    let trimmed = path.trim_matches('/');
+    if trimmed == MESSAGES_PATH || trimmed.ends_with(&format!("/{MESSAGES_PATH}")) {
+        Some(DownstreamApi::AnthropicMessages)
+    } else if trimmed == RESPONSES_PATH || trimmed.ends_with(&format!("/{RESPONSES_PATH}")) {
+        Some(DownstreamApi::OpenAiResponses)
+    } else {
+        None
+    }
 }
 
-/// Whether a forwarded path is the Anthropic Messages endpoint.
-pub fn path_is_messages(path: &str) -> bool {
-    let trimmed = path.trim_matches('/');
-    trimmed == MESSAGES_PATH || trimmed.ends_with(&format!("/{MESSAGES_PATH}"))
+/// Whether this provider converts the downstream dialect for the given path.
+pub fn provider_converts_path(provider: &Provider, path: &str) -> bool {
+    let Some(api) = downstream_api_for_path(path) else {
+        return false;
+    };
+    provider.upstream_api != UpstreamApi::Passthrough
+        && provider.accept_downstream_apis.contains(&api)
 }
 
 /// The upstream path to use for a provider/forwarded-path pair: `/chat/completions` when the
-/// provider converts Messages traffic, otherwise the forwarded path unchanged.
+/// provider converts that path, otherwise the forwarded path unchanged.
 pub fn conversion_upstream_path<'a>(provider: &Provider, forwarded_path: &'a str) -> &'a str {
-    if provider_converts_messages(provider) && path_is_messages(forwarded_path) {
+    if provider_converts_path(provider, forwarded_path) {
         CHAT_COMPLETIONS_PATH
     } else {
         forwarded_path
@@ -61,18 +75,18 @@ pub fn request_conversion_enabled(
     forwarded_path: &str,
 ) -> bool {
     *method == Method::POST
-        && path_is_messages(forwarded_path)
         && cfg
             .providers
             .get(provider_name)
-            .is_some_and(provider_converts_messages)
+            .is_some_and(|provider| provider_converts_path(provider, forwarded_path))
 }
 
-/// Convert a (model-mapped) Messages request body into Chat Completions form using the
-/// provider's per-model capabilities.
+/// Convert a (model-mapped) downstream request body into Chat Completions form using the
+/// provider's per-model capabilities, dispatching on the downstream dialect.
 pub fn convert_request_body(
     cfg: &Config,
     provider_name: &str,
+    path: &str,
     body: Bytes,
 ) -> Result<Bytes, RequestConversionRejected> {
     let provider = cfg
@@ -95,8 +109,14 @@ pub fn convert_request_body(
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
-    let (converted, report) = convert_messages_request(&json, &caps)
-        .map_err(RequestConversionRejected::from_conversion_error)?;
+    let dialect =
+        downstream_api_for_path(path).expect("request conversion requires a known downstream path");
+    let (converted, report) = match dialect {
+        DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
+            .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
+        DownstreamApi::OpenAiResponses => convert_responses_request(&json, &caps)
+            .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
+    };
     if !report.dropped_server_tools.is_empty() {
         warn!(
             provider = %provider_name,
@@ -126,14 +146,20 @@ pub struct RequestConversionRejected {
 }
 
 impl RequestConversionRejected {
-    fn from_conversion_error(err: ConversionError) -> Self {
+    fn from_conversion_error(err: ConversionError, dialect: DownstreamApi) -> Self {
         Self {
-            error_body: err.to_anthropic_error_body(),
+            error_body: match dialect {
+                DownstreamApi::AnthropicMessages => err.to_anthropic_error_body(),
+                DownstreamApi::OpenAiResponses => err.to_openai_error_body(),
+            },
         }
     }
 
     fn invalid(message: &str) -> Self {
-        Self::from_conversion_error(ConversionError::invalid(message))
+        Self::from_conversion_error(
+            ConversionError::invalid(message),
+            DownstreamApi::AnthropicMessages,
+        )
     }
 }
 
@@ -159,21 +185,34 @@ pub fn response_conversion_enabled(
     request_conversion_enabled(cfg, method, provider_name, forwarded_path)
 }
 
-/// Convert an upstream non-2xx JSON error body to the Anthropic error envelope.
-pub fn convert_error_body(status: StatusCode, body: &Value) -> Value {
-    convert_chat_error_body(status, body)
+/// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
+pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value {
+    match downstream_api_for_path(path) {
+        Some(DownstreamApi::AnthropicMessages) => convert_chat_error_body(status, body),
+        Some(DownstreamApi::OpenAiResponses) => body.clone(),
+        None => body.clone(),
+    }
 }
 
-/// Convert a non-streaming upstream Chat Completions body into Messages JSON bytes.
-pub fn convert_non_streaming_body(body: Bytes) -> Result<Bytes, std::io::Error> {
+/// Convert a non-streaming upstream Chat Completions body into the downstream dialect.
+pub fn convert_non_streaming_body(body: Bytes, path: &str) -> Result<Bytes, std::io::Error> {
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "upstream chat response is not valid JSON",
         )
     })?;
-    let converted = convert_chat_response(&json)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let converted = match downstream_api_for_path(path) {
+        Some(DownstreamApi::AnthropicMessages) => convert_chat_response(&json),
+        Some(DownstreamApi::OpenAiResponses) => convert_chat_response_to_responses(&json),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown downstream path for response conversion",
+            ));
+        }
+    }
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     serde_json::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| {
@@ -269,13 +308,99 @@ where
     }
 }
 
-// Adapt a non-streaming upstream Chat Completions body into Messages JSON bytes, buffering
-// the whole response (bounded by `max_bytes`).
+// Adapt an upstream SSE stream (Chat Completions chunks) into downstream Responses events.
+pin_project! {
+    pub struct ChatToResponsesStream<S> {
+        #[pin]
+        inner: S,
+        converter: ResponsesStreamConverter,
+        pending: BytesMut,
+        out_events: VecDeque<Bytes>,
+        finished: bool,
+    }
+}
+
+impl<S> ChatToResponsesStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            converter: ResponsesStreamConverter::new(),
+            pending: BytesMut::new(),
+            out_events: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<S> Stream for ChatToResponsesStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(event) = this.out_events.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending.extend_from_slice(&chunk);
+                    let mut events = Vec::new();
+                    while let Some(boundary_end) =
+                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
+                    {
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        if let Some(payload) = sse::first_data_payload(&event_bytes) {
+                            if let Err(err) = this.converter.on_chunk(payload, &mut events) {
+                                return Poll::Ready(Some(Err(std::io::Error::other(err))));
+                            }
+                        }
+                    }
+                    if !events.is_empty() {
+                        this.out_events.extend(events);
+                        return Poll::Ready(Some(Ok(this
+                            .out_events
+                            .pop_front()
+                            .expect("events were just pushed"))));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    *this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    *this.finished = true;
+                    let mut events = Vec::new();
+                    this.converter.finish(&mut events);
+                    if events.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    this.out_events.extend(events);
+                    return Poll::Ready(Some(Ok(this
+                        .out_events
+                        .pop_front()
+                        .expect("events were just pushed"))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+// Adapt a non-streaming upstream Chat Completions body into the downstream dialect,
+// buffering the whole response (bounded by `max_bytes`).
 pin_project! {
     pub struct NonStreamingConversionStream<S> {
         #[pin]
         inner: S,
         max_bytes: usize,
+        path: String,
         buffered: BytesMut,
         result: Option<Result<Bytes, std::io::Error>>,
         finished: bool,
@@ -283,10 +408,11 @@ pin_project! {
 }
 
 impl<S> NonStreamingConversionStream<S> {
-    pub fn new(inner: S, max_bytes: usize) -> Self {
+    pub fn new(inner: S, max_bytes: usize, path: String) -> Self {
         Self {
             inner,
             max_bytes,
+            path,
             buffered: BytesMut::new(),
             result: None,
             finished: false,
@@ -329,7 +455,7 @@ where
                 Poll::Ready(None) => {
                     *this.finished = true;
                     let buffered = std::mem::take(this.buffered).freeze();
-                    *this.result = Some(convert_non_streaming_body(buffered));
+                    *this.result = Some(convert_non_streaming_body(buffered, this.path));
                     return Poll::Ready(this.result.take());
                 }
                 Poll::Pending => return Poll::Pending,

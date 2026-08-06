@@ -54,6 +54,18 @@ impl ConversionError {
         })
     }
 
+    /// OpenAI Responses error envelope: `{"error":{"message":...,"type":...,"param":null,"code":...}}`
+    pub fn to_openai_error_body(&self) -> Value {
+        json!({
+            "error": {
+                "message": self.to_string(),
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error",
+            }
+        })
+    }
+
     /// Anthropic error type name for an upstream HTTP status when no JSON error type is available.
     pub fn anthropic_error_type_from_status(status: http::StatusCode) -> &'static str {
         match status.as_u16() {
