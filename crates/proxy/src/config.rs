@@ -474,7 +474,6 @@ impl Config {
         let upstream_idle_timeout = timeout_from_secs(file.upstream_idle_timeout_secs);
         let mut providers = HashMap::new();
         for (name, provider) in file.providers {
-            validate_provider_conversion(&name, &provider)?;
             if provider.base_url.cannot_be_a_base() {
                 return Err(anyhow!("provider {name} base_url cannot be a base url"));
             }
@@ -572,24 +571,6 @@ impl Config {
     }
 }
 
-fn validate_provider_conversion(name: &str, provider: &ProviderFile) -> Result<()> {
-    let unsupported_downstream = match provider.upstream_api {
-        UpstreamApi::AnthropicMessages => Some(DownstreamApi::OpenAIResponses),
-        UpstreamApi::OpenAIResponses => Some(DownstreamApi::AnthropicMessages),
-        UpstreamApi::Passthrough | UpstreamApi::OpenAiChatCompletions => None,
-    };
-    if let Some(downstream) =
-        unsupported_downstream.filter(|api| provider.accept_downstream_apis.contains(api))
-    {
-        return Err(anyhow!(
-            "provider {name} advertises unsupported conversion: upstream {:?} cannot accept downstream {:?} requests yet",
-            provider.upstream_api,
-            downstream,
-        ));
-    }
-    Ok(())
-}
-
 fn normalize_rewrite_config(
     rewrite: RewriteFile,
     providers: &HashMap<String, Provider>,
@@ -651,6 +632,8 @@ pub fn example_config_toml() -> &'static str {
 mod tests {
     use std::time::Duration;
 
+    use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
+
     use super::{BodyLogCompression, Config};
 
     #[test]
@@ -672,8 +655,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_messages_upstream_with_responses_downstream() {
-        let error = Config::from_toml_str(
+    fn accepts_messages_upstream_with_responses_downstream() {
+        let config = Config::from_toml_str(
             r#"
                 listen_addr = "127.0.0.1:8080"
                 default_provider = "provider_a"
@@ -685,14 +668,17 @@ mod tests {
                 accept_downstream_apis = ["openai_responses"]
             "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("unsupported conversion"));
+        assert_eq!(
+            config.providers["provider_a"].accept_downstream_apis,
+            vec![DownstreamApi::OpenAIResponses]
+        );
     }
 
     #[test]
-    fn rejects_responses_upstream_with_messages_downstream() {
-        let error = Config::from_toml_str(
+    fn accepts_responses_upstream_with_messages_downstream() {
+        let config = Config::from_toml_str(
             r#"
                 listen_addr = "127.0.0.1:8080"
                 default_provider = "provider_a"
@@ -704,9 +690,12 @@ mod tests {
                 accept_downstream_apis = ["anthropic_messages"]
             "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("unsupported conversion"));
+        assert_eq!(
+            config.providers["provider_a"].accept_downstream_apis,
+            vec![DownstreamApi::AnthropicMessages]
+        );
     }
 
     #[test]

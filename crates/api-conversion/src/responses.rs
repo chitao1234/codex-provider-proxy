@@ -134,6 +134,7 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
     if let Some(effort) = &effort {
         let thinking_type = ark_thinking_type(effort);
         request.insert("thinking".to_string(), json!({"type": thinking_type}));
+        request.remove("reasoning");
     }
     normalize_ark_web_search_tools(request);
 }

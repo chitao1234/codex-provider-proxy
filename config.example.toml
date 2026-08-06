@@ -110,9 +110,12 @@ api_key = "replace-me"
 # conversions are supported for:
 #   - upstream "openai_chat_completions" + downstream "anthropic_messages" or "openai_responses"
 #   - upstream "anthropic_messages" + downstream "anthropic_messages" (passthrough)
+#   - upstream "anthropic_messages" + downstream "openai_responses"
 #   - upstream "openai_responses" + downstream "openai_responses" (passthrough/normalization)
-# Cross-conversion between Messages and Responses is intentionally rejected until its
-# request renderer is implemented.
+#   - upstream "openai_responses" + downstream "anthropic_messages"
+# Messages↔Responses request conversion is supported through the shared request renderer;
+# provider-specific fields that have no target equivalent are normalized or dropped according
+# to the conversion report and capability settings.
 #
 # `capabilities` sets provider-level conversion defaults; `models."<model>"` overrides them
 # per upstream model name (matched after [[rewrite.model_mappings]] rewrites). Available
@@ -125,6 +128,7 @@ api_key = "replace-me"
 #   parallel_tool_calls = true
 #   response_format = "json_object"        # "text" | "json_object" | "json_schema"
 #   stream_include_usage = true
+#   ark_style = false                   # normalize Responses requests for Ark/Volcengine
 #
 # [providers.chat_provider]
 # base_url = "https://api.deepseek.com/"

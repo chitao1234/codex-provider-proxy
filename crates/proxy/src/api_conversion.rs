@@ -50,6 +50,8 @@ pub enum RequestParserKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRendererKind {
     OpenAIChatCompletions,
+    AnthropicMessages,
+    OpenAIResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +164,18 @@ pub fn resolve_conversion_plan(
                 renderer: ResponseRendererKind::AnthropicMessages,
             },
         },
+        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAIResponses) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::Transform(RequestPipeline {
+                parser: RequestParserKind::OpenAIResponses,
+                renderer: RequestRendererKind::AnthropicMessages,
+            }),
+            response: ResponsePipeline {
+                parser: ResponseParserKind::AnthropicMessages,
+                renderer: ResponseRendererKind::OpenAIResponses,
+            },
+        },
         (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
@@ -173,12 +187,18 @@ pub fn resolve_conversion_plan(
                 renderer: ResponseRendererKind::OpenAIResponses,
             },
         },
-        (upstream, downstream) => {
-            return Err(UnsupportedConversion {
-                upstream,
-                downstream,
-            });
-        }
+        (UpstreamApi::OpenAIResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::Transform(RequestPipeline {
+                parser: RequestParserKind::AnthropicMessages,
+                renderer: RequestRendererKind::OpenAIResponses,
+            }),
+            response: ResponsePipeline {
+                parser: ResponseParserKind::OpenAIResponses,
+                renderer: ResponseRendererKind::AnthropicMessages,
+            },
+        },
     };
     Ok(Some(plan))
 }
@@ -253,9 +273,10 @@ pub fn convert_request_body(
     let model = json
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     let caps = ModelCapabilities::resolve(
-        model,
+        &model,
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
@@ -266,21 +287,7 @@ pub fn convert_request_body(
         RequestAction::Passthrough { normalizer: None } => return Ok(body),
         RequestAction::Passthrough {
             normalizer: Some(RequestNormalizerKind::ArkResponses),
-        } => {
-            let mut json = json;
-            if caps.ark_style {
-                if let Some(object) = json.as_object_mut() {
-                    codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(
-                        object,
-                    );
-                }
-                let converted = serde_json::to_vec(&json).map(Bytes::from).map_err(|_| {
-                    RequestConversionRejected::invalid("failed to serialize request")
-                })?;
-                return Ok(converted);
-            }
-            return Ok(body);
-        }
+        } => (json, Default::default()),
         RequestAction::Transform(RequestPipeline {
             parser: RequestParserKind::AnthropicMessages,
             renderer: RequestRendererKind::OpenAIChatCompletions,
@@ -293,7 +300,42 @@ pub fn convert_request_body(
         }) => convert_responses_request(&json, &caps, previous_messages, last_reasoning).map_err(
             |err| RequestConversionRejected::from_conversion_error(err, plan.downstream),
         )?,
+        RequestAction::Transform(RequestPipeline {
+            parser: RequestParserKind::OpenAIResponses,
+            renderer: RequestRendererKind::AnthropicMessages,
+        }) => {
+            let (chat, report) =
+                convert_responses_request(&json, &caps, previous_messages, last_reasoning)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?;
+            let rendered = codex_provider_proxy_api_conversion::request_renderers::convert_chat_request_to_messages(&chat)
+                .map_err(|err| RequestConversionRejected::from_conversion_error(err, plan.downstream))?;
+            (rendered, report)
+        }
+        RequestAction::Transform(RequestPipeline {
+            parser: RequestParserKind::AnthropicMessages,
+            renderer: RequestRendererKind::OpenAIResponses,
+        }) => {
+            let (chat, report) = convert_messages_request(&json, &caps).map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
+            let rendered = codex_provider_proxy_api_conversion::request_renderers::convert_chat_request_to_responses(&chat)
+                .map_err(|err| RequestConversionRejected::from_conversion_error(err, plan.downstream))?;
+            (rendered, report)
+        }
+        RequestAction::Transform(_) => {
+            return Err(RequestConversionRejected::openai_invalid(
+                "request conversion pipeline is not implemented",
+            ));
+        }
     };
+    let mut converted = converted;
+    if provider.upstream_api == UpstreamApi::OpenAIResponses && caps.ark_style {
+        if let Some(object) = converted.as_object_mut() {
+            codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
+        }
+    }
     if !report.dropped_server_tools.is_empty() {
         warn!(
             provider = %provider_name,
@@ -843,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_cross_protocol_requests() {
+    fn accepts_cross_protocol_requests() {
         for (upstream, downstream, path) in [
             (
                 UpstreamApi::AnthropicMessages,
@@ -856,14 +898,49 @@ mod tests {
                 "/v1/messages",
             ),
         ] {
-            assert_eq!(
-                resolve_conversion_plan(&provider(upstream, downstream), &Method::POST, path,),
-                Err(UnsupportedConversion {
-                    upstream,
-                    downstream,
-                })
+            assert!(
+                resolve_conversion_plan(&provider(upstream, downstream), &Method::POST, path,)
+                    .unwrap()
+                    .is_some()
             );
         }
+    }
+
+    #[test]
+    fn normalizes_converted_messages_request_for_ark_responses_upstream() {
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "ark"
+listen_addr = "127.0.0.1:0"
+[providers.ark]
+base_url = "https://ark.example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["anthropic_messages"]
+[providers.ark.capabilities]
+ark_style = true
+reasoning_effort = { enabled = true, levels = ["high"], default = "high" }
+"#,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "ark-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {"effort": "high"}
+        });
+        let converted = convert_request_body(
+            &config,
+            "ark",
+            "/v1/messages",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(converted["thinking"]["type"], "enabled");
+        assert!(converted.get("reasoning").is_none());
     }
 
     #[test]
