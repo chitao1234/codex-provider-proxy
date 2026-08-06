@@ -21,6 +21,7 @@ use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::messages_to_chat::{
     convert_chat_response, convert_messages_request,
 };
+use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::responses::{
     chat_response_assistant_turn, convert_chat_response_to_responses, convert_responses_request,
 };
@@ -304,25 +305,29 @@ pub fn convert_request_body(
             parser: RequestParserKind::OpenAIResponses,
             renderer: RequestRendererKind::AnthropicMessages,
         }) => {
-            let (chat, report) =
-                convert_responses_request(&json, &caps, previous_messages, last_reasoning)
-                    .map_err(|err| {
-                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                    })?;
-            let rendered = codex_provider_proxy_api_conversion::request_renderers::convert_chat_request_to_messages(&chat)
-                .map_err(|err| RequestConversionRejected::from_conversion_error(err, plan.downstream))?;
-            (rendered, report)
+            let request = RequestIr::parse(Protocol::OpenAiResponses, &json).map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
+            let rendered = request
+                .render(Protocol::AnthropicMessages, &caps)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?;
+            (rendered, Default::default())
         }
         RequestAction::Transform(RequestPipeline {
             parser: RequestParserKind::AnthropicMessages,
             renderer: RequestRendererKind::OpenAIResponses,
         }) => {
-            let (chat, report) = convert_messages_request(&json, &caps).map_err(|err| {
+            let request = RequestIr::parse(Protocol::AnthropicMessages, &json).map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            let rendered = codex_provider_proxy_api_conversion::request_renderers::convert_chat_request_to_responses(&chat)
-                .map_err(|err| RequestConversionRejected::from_conversion_error(err, plan.downstream))?;
-            (rendered, report)
+            let rendered = request
+                .render(Protocol::OpenAiResponses, &caps)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?;
+            (rendered, Default::default())
         }
         RequestAction::Transform(_) => {
             return Err(RequestConversionRejected::openai_invalid(

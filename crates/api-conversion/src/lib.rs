@@ -17,6 +17,7 @@ pub mod messages;
 pub mod messages_parser;
 pub mod messages_renderer;
 pub mod messages_to_chat;
+pub mod request_ir;
 pub mod request_renderers;
 pub mod responses;
 pub mod responses_parser;
