@@ -41,6 +41,36 @@ const RESPONSES_UPSTREAM_PATH: &str = "v1/responses";
 const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAction {
+    Passthrough,
+    NormalizeResponses,
+    MessagesToChat,
+    ResponsesToChat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseAction {
+    Passthrough,
+    ChatToMessages,
+    ChatToResponses,
+    ResponsesToResponses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversionPlan {
+    pub downstream: DownstreamApi,
+    pub upstream: UpstreamApi,
+    pub request: RequestAction,
+    pub response: ResponseAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedConversion {
+    pub upstream: UpstreamApi,
+    pub downstream: DownstreamApi,
+}
+
 /// The downstream dialect a forwarded path maps to, if any.
 pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
     match path.trim_matches('/').rsplit('/').next() {
@@ -50,13 +80,62 @@ pub fn downstream_api_for_path(path: &str) -> Option<DownstreamApi> {
     }
 }
 
+pub fn resolve_conversion_plan(
+    provider: &Provider,
+    method: &Method,
+    path: &str,
+) -> Result<Option<ConversionPlan>, UnsupportedConversion> {
+    if *method != Method::POST {
+        return Ok(None);
+    }
+    let Some(downstream) = downstream_api_for_path(path) else {
+        return Ok(None);
+    };
+    if !provider.accept_downstream_apis.contains(&downstream) {
+        return Ok(None);
+    }
+    let plan = match (provider.upstream_api, downstream) {
+        (UpstreamApi::Passthrough, _) => return Ok(None),
+        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::AnthropicMessages) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::MessagesToChat,
+            response: ResponseAction::ChatToMessages,
+        },
+        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAIResponses) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::ResponsesToChat,
+            response: ResponseAction::ChatToResponses,
+        },
+        (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::Passthrough,
+            response: ResponseAction::Passthrough,
+        },
+        (UpstreamApi::OpenAIResponses, DownstreamApi::OpenAIResponses) => ConversionPlan {
+            downstream,
+            upstream: provider.upstream_api,
+            request: RequestAction::NormalizeResponses,
+            response: ResponseAction::ResponsesToResponses,
+        },
+        (upstream, downstream) => {
+            return Err(UnsupportedConversion {
+                upstream,
+                downstream,
+            });
+        }
+    };
+    Ok(Some(plan))
+}
+
 /// Whether this provider converts the downstream dialect for the given path.
 pub fn provider_converts_path(provider: &Provider, path: &str) -> bool {
-    let Some(api) = downstream_api_for_path(path) else {
-        return false;
-    };
-    provider.upstream_api != UpstreamApi::Passthrough
-        && provider.accept_downstream_apis.contains(&api)
+    resolve_conversion_plan(provider, &Method::POST, path)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// The upstream path to use for a provider/forwarded-path pair: the provider's upstream
@@ -86,11 +165,9 @@ pub fn request_conversion_enabled(
     provider_name: &str,
     forwarded_path: &str,
 ) -> bool {
-    *method == Method::POST
-        && cfg
-            .providers
-            .get(provider_name)
-            .is_some_and(|provider| provider_converts_path(provider, forwarded_path))
+    cfg.providers.get(provider_name).is_some_and(|provider| {
+        resolve_conversion_plan(provider, method, forwarded_path).is_ok_and(|plan| plan.is_some())
+    })
 }
 
 /// Convert a (model-mapped) downstream request body into Chat Completions form using the
@@ -129,42 +206,33 @@ pub fn convert_request_body(
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
-    let dialect =
-        downstream_api_for_path(path).expect("request conversion requires a known downstream path");
-    // Upstream Messages: the request is already in Messages form when the downstream
-    // speaks Messages (near-passthrough). Upstream Responses: the request is already
-    // in Responses form when the downstream speaks Responses (same protocol).
-    // The model rewrite handles model mapping.
-    if provider.upstream_api == UpstreamApi::AnthropicMessages
-        && dialect == DownstreamApi::AnthropicMessages
-    {
-        return Ok(body);
-    }
-    // Upstream Responses + downstream Responses is the same protocol: pass through
-    // unchanged, except Ark-style parameter normalization (thinking/caching) when
-    // the provider is Ark.
-    if provider.upstream_api == UpstreamApi::OpenAIResponses
-        && dialect == DownstreamApi::OpenAIResponses
-    {
-        if caps.ark_style {
+    let plan = resolve_conversion_plan(provider, &Method::POST, path)
+        .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
+        .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
+    let (converted, report) = match plan.request {
+        RequestAction::Passthrough => return Ok(body),
+        RequestAction::NormalizeResponses => {
             let mut json = json;
-            if let Some(object) = json.as_object_mut() {
-                codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(
-                    object,
-                );
+            if caps.ark_style {
+                if let Some(object) = json.as_object_mut() {
+                    codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(
+                        object,
+                    );
+                }
+                let converted = serde_json::to_vec(&json).map(Bytes::from).map_err(|_| {
+                    RequestConversionRejected::invalid("failed to serialize request")
+                })?;
+                return Ok(converted);
             }
-            return serde_json::to_vec(&json)
-                .map(Bytes::from)
-                .map_err(|_| RequestConversionRejected::invalid("failed to serialize request"));
+            return Ok(body);
         }
-        return Ok(body);
-    }
-    let (converted, report) = match dialect {
-        DownstreamApi::AnthropicMessages => convert_messages_request(&json, &caps)
-            .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?,
-        DownstreamApi::OpenAIResponses => {
-            convert_responses_request(&json, &caps, previous_messages, last_reasoning)
-                .map_err(|err| RequestConversionRejected::from_conversion_error(err, dialect))?
+        RequestAction::MessagesToChat => convert_messages_request(&json, &caps).map_err(|err| {
+            RequestConversionRejected::from_conversion_error(err, plan.downstream)
+        })?,
+        RequestAction::ResponsesToChat => {
+            convert_responses_request(&json, &caps, previous_messages, last_reasoning).map_err(
+                |err| RequestConversionRejected::from_conversion_error(err, plan.downstream),
+            )?
         }
     };
     if !report.dropped_server_tools.is_empty() {
@@ -639,4 +707,100 @@ pub fn strip_converted_response_headers(headers: &mut HeaderMap) {
     headers.remove(http::header::CONTENT_LENGTH);
     headers.remove(http::header::CONTENT_ENCODING);
     headers.remove(http::header::TRANSFER_ENCODING);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(upstream: UpstreamApi, downstream: DownstreamApi) -> Provider {
+        Provider {
+            upstream_api: upstream,
+            accept_downstream_apis: vec![downstream],
+            ..Provider::default()
+        }
+    }
+
+    #[test]
+    fn resolves_supported_conversion_matrix() {
+        let cases = [
+            (
+                UpstreamApi::OpenAiChatCompletions,
+                DownstreamApi::AnthropicMessages,
+                "/v1/messages",
+                RequestAction::MessagesToChat,
+                ResponseAction::ChatToMessages,
+            ),
+            (
+                UpstreamApi::OpenAiChatCompletions,
+                DownstreamApi::OpenAIResponses,
+                "/v1/responses",
+                RequestAction::ResponsesToChat,
+                ResponseAction::ChatToResponses,
+            ),
+            (
+                UpstreamApi::AnthropicMessages,
+                DownstreamApi::AnthropicMessages,
+                "/v1/messages",
+                RequestAction::Passthrough,
+                ResponseAction::Passthrough,
+            ),
+            (
+                UpstreamApi::OpenAIResponses,
+                DownstreamApi::OpenAIResponses,
+                "/v1/responses",
+                RequestAction::NormalizeResponses,
+                ResponseAction::ResponsesToResponses,
+            ),
+        ];
+
+        for (upstream, downstream, path, request, response) in cases {
+            let plan =
+                resolve_conversion_plan(&provider(upstream, downstream), &Method::POST, path)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(plan.request, request);
+            assert_eq!(plan.response, response);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_cross_protocol_requests() {
+        for (upstream, downstream, path) in [
+            (
+                UpstreamApi::AnthropicMessages,
+                DownstreamApi::OpenAIResponses,
+                "/v1/responses",
+            ),
+            (
+                UpstreamApi::OpenAIResponses,
+                DownstreamApi::AnthropicMessages,
+                "/v1/messages",
+            ),
+        ] {
+            assert_eq!(
+                resolve_conversion_plan(&provider(upstream, downstream), &Method::POST, path,),
+                Err(UnsupportedConversion {
+                    upstream,
+                    downstream,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_non_post_and_unaccepted_paths() {
+        let provider = provider(
+            UpstreamApi::OpenAiChatCompletions,
+            DownstreamApi::OpenAIResponses,
+        );
+        assert_eq!(
+            resolve_conversion_plan(&provider, &Method::GET, "/v1/responses").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_conversion_plan(&provider, &Method::POST, "/v1/messages").unwrap(),
+            None
+        );
+    }
 }
