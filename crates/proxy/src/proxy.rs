@@ -1563,8 +1563,8 @@ fn maybe_convert_request_body(
     Ok(converted)
 }
 
-/// Resolve the stored chat transcript for the request's `previous_response_id`,
-/// rejecting unknown/expired ids and continuations across providers.
+/// Resolve the stored neutral transcript for the request's `previous_response_id`, rejecting only
+/// unknown or expired ids. Provider and model changes remain intentionally allowed.
 fn resolve_previous_response_state(
     state: &ProxyState,
     provider_name: &str,
@@ -1593,25 +1593,19 @@ fn resolve_previous_response_state(
             )),
         );
     };
-    if previous.provider_name != provider_name {
-        return Err(
-            crate::api_conversion::RequestConversionRejected::openai_invalid(format!(
-                "previous_response_id {previous_id:?} belongs to provider {:?}, not {provider_name:?}",
-                previous.provider_name
-            )),
-        );
-    }
     if let Ok(model) = serde_json::from_slice::<Value>(body) {
         let model = model
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or_default();
         if !previous.model.is_empty() && previous.model != model {
-            warn!(
+            debug!(
                 previous_response_id = %previous_id,
+                previous_provider = %previous.provider_name,
                 previous_model = %previous.model,
+                provider = %provider_name,
                 model = %model,
-                "continuing a conversation with a different model"
+                "continuing a conversation across provider or model change"
             );
         }
     }

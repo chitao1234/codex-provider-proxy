@@ -6,8 +6,9 @@
 //! transcript is prepended to the messages converted from the new `input`, giving
 //! the upstream model the full conversation.
 //!
-//! Entries are bound to the provider that produced them (continuing across a
-//! different provider is rejected) and expire after a TTL to bound memory.
+//! Entries remember the provider that produced them for diagnostics, but continuation remains
+//! intentionally portable across provider or model changes. Entries expire after a TTL to bound
+//! memory.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
