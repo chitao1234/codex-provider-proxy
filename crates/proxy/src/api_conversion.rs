@@ -325,6 +325,9 @@ pub fn convert_request_body(
                 &caps,
                 &mut rendered,
             );
+            if pipeline.renderer == RequestRendererKind::OpenAiResponses {
+                inject_ark_explicit_cache(&caps, &json, &mut rendered);
+            }
             (rendered, report)
         }
     };
@@ -349,13 +352,75 @@ pub fn convert_request_body(
         .map_err(|_| RequestConversionRejected::invalid("failed to serialize converted request"))
 }
 
+/// Inject Ark's explicit caching controls into a rendered Responses request when the
+/// provider enabled `ark_explicit_cache` (Volcengine docs: caching + previous_response_id
+/// + store; PDF p1087/p1093/p1108).
+///
+/// Conservative constraints (documented):
+/// - `tools` may only be set on the first round, so requests carrying tools skip caching;
+/// - `instructions` must be empty to write or hit the cache;
+/// - prefix caching creation requires `stream=false` (session caching has no such limit),
+///   so streaming first rounds fall back to session caching.
+fn inject_ark_explicit_cache(caps: &ModelCapabilities, original: &Value, request: &mut Value) {
+    if !caps.cache.ark_explicit_cache || !caps.ark_style {
+        return;
+    }
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("tools")
+        .is_some_and(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()))
+    {
+        return;
+    }
+    if object
+        .get("instructions")
+        .and_then(Value::as_str)
+        .is_some_and(|instructions| !instructions.trim().is_empty())
+    {
+        return;
+    }
+    let has_previous = original
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if has_previous {
+        // Continue the session cache chain; Ark's response ids pass through the
+        // synthesized id unchanged (resp_ prefix preserved), so the downstream
+        // previous_response_id is the upstream id.
+        object.insert(
+            "previous_response_id".to_owned(),
+            original.get("previous_response_id").cloned().unwrap_or(Value::Null),
+        );
+        object.insert(
+            "caching".to_owned(),
+            serde_json::json!({"type": "enabled"}),
+        );
+        return;
+    }
+    let streaming = object.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if streaming {
+        // Prefix-cache creation requires stream=false; use session caching instead.
+        object.insert(
+            "caching".to_owned(),
+            serde_json::json!({"type": "enabled"}),
+        );
+    } else {
+        object.insert(
+            "caching".to_owned(),
+            serde_json::json!({"type": "enabled", "prefix": true}),
+        );
+        object.insert("store".to_owned(), serde_json::json!(true));
+    }
+}
+
 fn normalize_rendered_request(
     normalizer: Option<RequestNormalizerKind>,
     renderer: RequestRendererKind,
     caps: &ModelCapabilities,
     request: &mut Value,
-) {
-    if normalizer == Some(RequestNormalizerKind::ArkResponses)
+) {    if normalizer == Some(RequestNormalizerKind::ArkResponses)
         && caps.ark_style
         && renderer == RequestRendererKind::OpenAiResponses
     {
@@ -1002,6 +1067,116 @@ search_tool_template = { type = "web_search", web_search = { search_context_size
             "nested object flattened"
         );
         assert_eq!(tools[0]["max_keyword"], 3);
+    }
+
+    #[test]
+    fn ark_explicit_cache_injection_respects_constraints() {
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "ark"
+listen_addr = "127.0.0.1:0"
+[providers.ark]
+base_url = "https://ark.example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["openai_responses"]
+[providers.ark.capabilities]
+ark_style = true
+cache = { ark_explicit_cache = true }
+"#,
+        )
+        .unwrap();
+        let request = |input: Value| {
+            serde_json::json!({"model": "ark-model", "input": input})
+        };
+        let render = |body: Value| {
+            let converted = convert_request_body(
+                &config,
+                "ark",
+                "/v1/responses",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                None,
+                None,
+            )
+            .unwrap();
+            serde_json::from_slice::<Value>(&converted).unwrap()
+        };
+
+        // Streaming first round: session caching only (prefix creation needs stream=false).
+        let mut body = request(serde_json::json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+        ]));
+        body["stream"] = serde_json::json!(true);
+        let out = render(body);
+        assert_eq!(out["caching"]["type"], "enabled");
+        assert!(out["caching"].get("prefix").is_none());
+
+        // Non-streaming first round: prefix caching + store.
+        let mut body = request(serde_json::json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+        ]));
+        body["stream"] = serde_json::json!(false);
+        let out = render(body);
+        assert_eq!(out["caching"]["type"], "enabled");
+        assert_eq!(out["caching"]["prefix"], true);
+        assert_eq!(out["store"], true);
+
+        // Continuation round: session caching + previous_response_id passthrough.
+        let body = serde_json::json!({
+            "model": "ark-model",
+            "previous_response_id": "resp_ark_upstream_id",
+            "input": "continue"
+        });
+        let out = render(body);
+        assert_eq!(out["caching"]["type"], "enabled");
+        assert_eq!(out["previous_response_id"], "resp_ark_upstream_id");
+
+        // Tools present: caching skipped (tools only allowed on the first round).
+        let body = serde_json::json!({
+            "model": "ark-model",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+        });
+        let out = render(body);
+        assert!(out.get("caching").is_none());
+
+        // Instructions present: caching skipped (must be empty to write/hit).
+        let body = serde_json::json!({
+            "model": "ark-model",
+            "input": "hi",
+            "instructions": "be precise"
+        });
+        let out = render(body);
+        assert!(out.get("caching").is_none());
+
+        // Capability off: nothing injected.
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "ark"
+listen_addr = "127.0.0.1:0"
+[providers.ark]
+base_url = "https://ark.example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["openai_responses"]
+[providers.ark.capabilities]
+ark_style = true
+"#,
+        )
+        .unwrap();
+        let out = convert_request_body(
+            &config,
+            "ark",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&request(serde_json::json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ]))).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert!(out.get("caching").is_none());
     }
 
     #[test]

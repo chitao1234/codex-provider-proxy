@@ -72,7 +72,11 @@ struct RequestContext {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct CacheContext {
     key: Option<String>,
+    /// OpenAI `prompt_cache_options` { mode, ttl } (GPT-5.6+).
+    options: Option<Value>,
+    /// Deprecated OpenAI `prompt_cache_retention` (in_memory / 24h).
     retention: Option<Value>,
+    /// Top-level Anthropic `cache_control` (auto breakpoint).
     control: Option<Value>,
 }
 
@@ -246,6 +250,7 @@ impl RequestIr {
                     })
                     .flatten()
             });
+        self.context.cache.options = self.original.get("prompt_cache_options").cloned();
         self.context.cache.retention = self.original.get("prompt_cache_retention").cloned();
         self.context.cache.control = self.original.get("cache_control").cloned();
         self.context.store = self.original.get("store").cloned();
@@ -278,6 +283,12 @@ impl RequestIr {
         }
         if self.context.cache.key.is_none() {
             self.context.cache.key.clone_from(&previous.cache.key);
+        }
+        if self.context.cache.options.is_none() {
+            self.context
+                .cache
+                .options
+                .clone_from(&previous.cache.options);
         }
         if self.context.cache.retention.is_none() {
             self.context
@@ -550,7 +561,7 @@ impl RequestIr {
 
     fn render_chat_base(&self, caps: &ModelCapabilities) -> Map<String, Value> {
         let mut out = self.base_output();
-        self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
+        self.apply_context(Protocol::OpenAiChatCompletions, caps, &mut out);
         for key in [
             "metadata",
             "cache_control",
@@ -641,7 +652,7 @@ impl RequestIr {
                         }
                         continue;
                     }
-                    let mut rendered = message.to_chat_values();
+                    let mut rendered = message.to_chat_values(caps.cache.block_cache_control);
                     if message.role == "assistant" {
                         if let Some(reasoning) = pending_reasoning.take() {
                             if let Some(object) =
@@ -962,7 +973,7 @@ impl RequestIr {
             ));
         }
         let mut out = self.base_output();
-        self.apply_context(Protocol::AnthropicMessages, &mut out);
+        self.apply_context(Protocol::AnthropicMessages, caps, &mut out);
         // The Messages API requires max_tokens (no default; Kimi rejects a missing
         // field with 400). Clients speaking Chat/Responses may omit their optional
         // output budget (e.g. Codex without model metadata), so use the provider's
@@ -1054,7 +1065,7 @@ impl RequestIr {
                         }));
                         continue;
                     }
-                    messages.extend(message.to_messages_values());
+                    messages.extend(message.to_messages_values(caps.cache.block_cache_control));
                 }
             }
         }
@@ -1111,7 +1122,7 @@ impl RequestIr {
             ));
         }
         let mut out = self.base_output();
-        self.apply_context(Protocol::OpenAiResponses, &mut out);
+        self.apply_context(Protocol::OpenAiResponses, caps, &mut out);
         // Anthropic-owned parameters with no Responses equivalent are dropped
         // (`context_management` carries claude's edit-tool directives such as
         // clear_thinking, rejected by Ark). `metadata` and `cache_control` are
@@ -1203,7 +1214,7 @@ impl RequestIr {
                         }
                         continue;
                     }
-                    input.extend(message.to_responses_values());
+                    input.extend(message.to_responses_values(false));
                 }
             }
         }
@@ -1243,14 +1254,36 @@ impl RequestIr {
         Ok((Value::Object(out), report))
     }
 
-    fn apply_context(&self, target: Protocol, out: &mut Map<String, Value>) {
-        if target != Protocol::OpenAiResponses {
+    fn apply_context(&self, target: Protocol, caps: &ModelCapabilities, out: &mut Map<String, Value>) {
+        // Cache controls are emitted only when the upstream supports them
+        // (conservative; see docs/cache-adaptation-design.md §1.2).
+        // `prompt_cache_key` is a chat/responses routing hint (Kimi, MiniMax
+        // responses, Grok); the Messages dialect maps the identity to metadata.user_id.
+        let keep_key =
+            matches!(target, Protocol::OpenAiChatCompletions | Protocol::OpenAiResponses)
+                && caps.cache.prompt_cache_key;
+        // Top-level `cache_control` is the Anthropic auto-breakpoint; the
+        // Responses/Chat dialects have no such field.
+        let keep_top_level_cache_control =
+            target == Protocol::AnthropicMessages && caps.cache.block_cache_control;
+        // `prompt_cache_options`/deprecated `prompt_cache_retention` are OpenAI
+        // protocol-only.
+        let keep_options = target != Protocol::AnthropicMessages && caps.cache.prompt_cache_options;
+
+        if !keep_key {
             out.remove("prompt_cache_key");
+        }
+        if !keep_options {
+            out.remove("prompt_cache_options");
             out.remove("prompt_cache_retention");
         }
+        if !keep_top_level_cache_control {
+            out.remove("cache_control");
+        }
         for (key, value) in &self.context.represented_extensions {
-            if target != Protocol::OpenAiResponses
-                && matches!(key.as_str(), "prompt_cache_key" | "prompt_cache_retention")
+            if matches!(key.as_str(), "prompt_cache_key" | "prompt_cache_retention" | "prompt_cache_options" | "cache_control")
+                && !(key == "prompt_cache_key" && keep_key)
+                && !(key == "cache_control" && keep_top_level_cache_control)
             {
                 continue;
             }
@@ -1260,9 +1293,11 @@ impl RequestIr {
             out.entry("metadata".to_owned())
                 .or_insert_with(|| metadata.clone());
         }
-        if let Some(cache_control) = &self.context.cache.control {
-            out.entry("cache_control".to_owned())
-                .or_insert_with(|| cache_control.clone());
+        if keep_top_level_cache_control {
+            if let Some(cache_control) = &self.context.cache.control {
+                out.entry("cache_control".to_owned())
+                    .or_insert_with(|| cache_control.clone());
+            }
         }
         if let Some(conversation) = &self.context.conversation {
             out.entry("conversation".to_owned())
@@ -1272,10 +1307,16 @@ impl RequestIr {
             out.entry("safety_identifier".to_owned())
                 .or_insert_with(|| Value::String(identifier.clone()));
         }
-        if target == Protocol::OpenAiResponses {
+        if keep_key {
             if let Some(key) = &self.context.cache.key {
                 out.entry("prompt_cache_key".to_owned())
                     .or_insert_with(|| Value::String(key.clone()));
+            }
+        }
+        if keep_options {
+            if let Some(options) = &self.context.cache.options {
+                out.entry("prompt_cache_options".to_owned())
+                    .or_insert_with(|| options.clone());
             }
             if let Some(retention) = &self.context.cache.retention {
                 out.entry("prompt_cache_retention".to_owned())
@@ -1865,6 +1906,47 @@ impl IrContent {
     }
 }
 
+/// Deep-copy the content, stripping block-level `cache_control` markers when the
+/// upstream does not support them (conservative: never leak a control an upstream
+/// would reject or silently ignore).
+fn prepared_content(content: &[IrContent], keep_cache_control: bool) -> Vec<IrContent> {
+    if keep_cache_control {
+        return content.to_vec();
+    }
+    content
+        .iter()
+        .map(|part| match part {
+            IrContent::Text { text, extra } => {
+                let mut extra = extra.clone();
+                extra.remove("cache_control");
+                IrContent::Text {
+                    text: text.clone(),
+                    extra,
+                }
+            }
+            IrContent::Thinking {
+                text,
+                signature,
+                extra,
+            } => {
+                let mut extra = extra.clone();
+                extra.remove("cache_control");
+                IrContent::Thinking {
+                    text: text.clone(),
+                    signature: signature.clone(),
+                    extra,
+                }
+            }
+            IrContent::Image(value) => {
+                let mut object = value.as_object().cloned().unwrap_or_default();
+                object.remove("cache_control");
+                IrContent::Image(Value::Object(object))
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
 impl IrMessage {
     fn custom(value: Value) -> Self {
         Self {
@@ -1888,9 +1970,10 @@ impl IrMessage {
         }
     }
 
-    fn to_chat_values(&self) -> Vec<Value> {
+    fn to_chat_values(&self, keep_cache_control: bool) -> Vec<Value> {
+        let content = prepared_content(&self.content, keep_cache_control);
         if self.role == "custom" {
-            return self.content.iter().map(IrContent::raw_value).collect();
+            return content.iter().map(IrContent::raw_value).collect();
         }
         let mut object = self.extra.clone();
         for key in ["role", "content", "tool_calls", "tool_call_id", "id"] {
@@ -1902,17 +1985,16 @@ impl IrMessage {
                 "tool_call_id".to_owned(),
                 Value::String(self.tool_call_id.clone().unwrap_or_default()),
             );
-            object.insert("content".to_owned(), content_as_chat(&self.content));
+            object.insert("content".to_owned(), content_as_chat(&content));
             return vec![Value::Object(object)];
         }
         if self.role == "user"
-            && self
-                .content
+            && content
                 .iter()
                 .any(|content| matches!(content, IrContent::ToolResult { .. }))
         {
             let mut values = Vec::new();
-            for content in &self.content {
+            for content in &content {
                 if let IrContent::ToolResult {
                     call_id, content, ..
                 } = content
@@ -1920,8 +2002,7 @@ impl IrMessage {
                     values.push(serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":content}));
                 }
             }
-            let visible = self
-                .content
+            let visible = content
                 .iter()
                 .filter(|content| !matches!(content, IrContent::ToolResult { .. }))
                 .cloned()
@@ -1934,12 +2015,11 @@ impl IrMessage {
             return values;
         }
         let mut calls = self.tool_calls.clone();
-        calls.extend(self.content.iter().filter_map(|content| match content {
+        calls.extend(content.iter().filter_map(|content| match content {
             IrContent::ToolUse(call) => Some(call.clone()),
             _ => None,
         }));
-        let visible_content = self
-            .content
+        let visible_content = content
             .iter()
             .filter(|content| {
                 !matches!(content, IrContent::ToolUse(_) | IrContent::Thinking { .. })
@@ -1947,7 +2027,7 @@ impl IrMessage {
             .cloned()
             .collect::<Vec<_>>();
         object.insert("content".to_owned(), content_as_chat(&visible_content));
-        if let Some(reasoning) = self.content.iter().find_map(|content| match content {
+        if let Some(reasoning) = content.iter().find_map(|content| match content {
             IrContent::Thinking { text, .. } => Some(text.clone()),
             _ => None,
         }) {
@@ -1962,18 +2042,18 @@ impl IrMessage {
         vec![Value::Object(object)]
     }
 
-    fn to_messages_values(&self) -> Vec<Value> {
+    fn to_messages_values(&self, keep_cache_control: bool) -> Vec<Value> {
+        let content = prepared_content(&self.content, keep_cache_control);
         if self.role == "custom" {
             return Vec::new();
         }
         if self.role == "tool" {
             return vec![serde_json::json!({
                 "role":"user",
-                "content":[{"type":"tool_result", "tool_use_id":self.tool_call_id.clone().unwrap_or_default(), "content":content_as_chat(&self.content)}]
+                "content":[{"type":"tool_result", "tool_use_id":self.tool_call_id.clone().unwrap_or_default(), "content":content_as_chat(&content)}]
             })];
         }
-        let mut blocks = self
-            .content
+        let mut blocks = content
             .iter()
             .map(IrContent::to_messages)
             .collect::<Vec<_>>();
@@ -1989,21 +2069,22 @@ impl IrMessage {
         vec![Value::Object(object)]
     }
 
-    fn to_responses_values(&self) -> Vec<Value> {
+    fn to_responses_values(&self, keep_cache_control: bool) -> Vec<Value> {
+        let prepared = prepared_content(&self.content, keep_cache_control);
         if self.role == "custom" {
-            return self.content.iter().map(IrContent::raw_value).collect();
+            return prepared.iter().map(IrContent::raw_value).collect();
         }
         let mut values = Vec::new();
         if self.role == "tool" {
             values.push(serde_json::json!({
                 "type":"function_call_output",
                 "call_id":self.tool_call_id.clone().unwrap_or_default(),
-                "output":content_as_chat(&self.content)
+                "output":content_as_chat(&prepared)
             }));
             return values;
         }
         let mut content = Vec::new();
-        for part in &self.content {
+        for part in &prepared {
             match part {
                 IrContent::ToolResult {
                     call_id, content, ..
@@ -2058,8 +2139,15 @@ fn content_as_chat(content: &[IrContent]) -> Value {
     if content.is_empty() {
         return Value::String(String::new());
     }
-    if let [IrContent::Text { text, .. }] = content {
-        return Value::String(text.clone());
+    if let [IrContent::Text { text, extra }] = content {
+        // Fold a single text block to a plain string only when it carries no
+        // extra fields (cache_control, vendor extensions) that would be lost.
+        let mut meaningful = extra.clone();
+        meaningful.remove("type");
+        meaningful.remove("text");
+        if meaningful.is_empty() {
+            return Value::String(text.clone());
+        }
     }
     let mut values = content
         .iter()
@@ -2388,16 +2476,23 @@ mod tests {
             "provider_budget": {"reasoning": 7}
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        // Parse keeps the block cache_control in the IR.
+        let IrConversationItem::Message(message) = &ir.transcript[0] else {
+            panic!("expected message");
+        };
+        let IrContent::Text { extra, .. } = &message.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(extra["cache_control"]["type"], "ephemeral");
         let responses = ir
             .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
         assert_eq!(responses["provider_budget"]["reasoning"], 7);
         assert_eq!(responses["tools"][0]["vendor_extension"]["x"], true);
         assert_eq!(responses["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(
-            responses["input"][0]["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
+        // Responses has no block-level cache_control; it is stripped at render
+        // (no provider supports it on the responses endpoint).
+        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -2469,14 +2564,16 @@ mod tests {
             "messages": [{"role":"user", "content":"hello"}]
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
-        let responses = ir
-            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
-            .unwrap();
+        let mut caps = ModelCapabilities::default();
+        caps.cache.prompt_cache_key = true;
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
 
         assert_eq!(responses["user"], "user-42");
         assert_eq!(responses["metadata"]["client"], "codex");
-        assert_eq!(responses["cache_control"]["type"], "ephemeral");
         assert_eq!(responses["session_id"], "session-7");
+        // Top-level cache_control has no Responses equivalent; stripped at render.
+        assert!(responses.get("cache_control").is_none());
+        assert_eq!(responses["prompt_cache_key"], "user-42");
     }
 
     #[test]
@@ -2646,9 +2743,9 @@ mod tests {
             }),
         )
         .unwrap();
-        let responses = ir
-            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
-            .unwrap();
+        let mut caps = ModelCapabilities::default();
+        caps.cache.prompt_cache_key = true;
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
         assert_eq!(responses["prompt_cache_key"], "anthropic-cache-user");
     }
 
@@ -3175,6 +3272,110 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_options_kept_only_with_capability() {
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "prompt_cache_key": "cache-1",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+
+        // No capability: key and options stripped.
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert!(responses.get("prompt_cache_key").is_none());
+        assert!(responses.get("prompt_cache_options").is_none());
+
+        // prompt_cache_key only.
+        let mut caps = ModelCapabilities::default();
+        caps.cache.prompt_cache_key = true;
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert_eq!(responses["prompt_cache_key"], "cache-1");
+        assert!(responses.get("prompt_cache_options").is_none());
+
+        // Both capabilities.
+        let mut caps = ModelCapabilities::default();
+        caps.cache.prompt_cache_key = true;
+        caps.cache.prompt_cache_options = true;
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert_eq!(responses["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(responses["prompt_cache_options"]["ttl"], "30m");
+
+        // Messages target never carries the OpenAI options.
+        let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
+        assert!(messages.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn block_cache_control_kept_or_stripped_by_capability() {
+        let request = json!({
+            "model": "m",
+            "messages": [{"role":"user", "content":[
+                {"type":"text", "text":"hello", "cache_control":{"type":"ephemeral"}}
+            ]}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+
+        // No capability: block cache_control stripped from chat and responses.
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        assert!(chat["messages"][0]["content"][0].get("cache_control").is_none());
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
+
+        // Capability on: kept for chat (Qwen chat endpoint), stripped for responses
+        // (no provider supports block-level cache_control on responses).
+        let mut caps = ModelCapabilities::default();
+        caps.cache.block_cache_control = true;
+        let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
+        assert_eq!(chat["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
+
+        // Messages target keeps the block per capability: Anthropic-native for
+        // supporting upstreams (MiniMax anthropic endpoint, Qwen), stripped for
+        // upstreams that ignore it (DeepSeek/GLM/Kimi/MiMo/Grok).
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert!(messages["messages"][0]["content"][0].get("cache_control").is_none());
+        let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
+        assert_eq!(messages["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn top_level_cache_control_kept_only_for_messages_with_capability() {
+        let request = json!({
+            "model": "m",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role":"user", "content":"hello"}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+
+        // No capability: top-level cache_control stripped everywhere.
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert!(messages.get("cache_control").is_none());
+
+        // Capability on: kept for Messages (Anthropic auto-breakpoint).
+        let mut caps = ModelCapabilities::default();
+        caps.cache.block_cache_control = true;
+        let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
+        assert_eq!(messages["cache_control"]["type"], "ephemeral");
+        // Still stripped for chat/responses.
+        let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
+        assert!(chat.get("cache_control").is_none());
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert!(responses.get("cache_control").is_none());
+    }
+
+    #[test]
     fn messages_custom_tool_stays_custom() {
         // The Messages dialect natively supports `custom` tools; rendering back to
         // Messages keeps the custom type instead of flattening it.
@@ -3235,9 +3436,15 @@ mod tests {
             }),
         )
         .unwrap();
+        // Without the capability the key is stripped (conservative default).
         let responses = ir
             .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
+        assert!(responses.get("prompt_cache_key").is_none());
+        // With the capability the identity maps to prompt_cache_key.
+        let mut caps = ModelCapabilities::default();
+        caps.cache.prompt_cache_key = true;
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
         assert_eq!(responses["prompt_cache_key"], "chat-cache-user");
     }
 }

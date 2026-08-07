@@ -1552,6 +1552,7 @@ fn maybe_convert_request_body(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    inject_cache_routing_header(cfg, attempt, &converted);
     info!(
         request_id,
         attempt = attempt_number,
@@ -1561,6 +1562,57 @@ fn maybe_convert_request_body(
         "request converted from messages to chat completions"
     );
     Ok(converted)
+}
+
+/// Inject cache-routing headers for upstreams that route cache affinity via a header
+/// rather than a request field. Grok's Chat Completions endpoint maps `prompt_cache_key`
+/// to the `x-grok-conv-id` header (sticky routing to a single server). Only applies when
+/// the provider declared `cache.prompt_cache_key` and the converted request carries one.
+fn inject_cache_routing_header(
+    cfg: &Config,
+    attempt: &mut PreparedUpstreamAttempt,
+    converted: &[u8],
+) {
+    let Some(provider) = cfg.providers.get(&attempt.provider_name) else {
+        return;
+    };
+    let Some(model) = serde_json::from_slice::<serde_json::Value>(converted)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    else {
+        return;
+    };
+    let caps = codex_provider_proxy_api_conversion::dialect::ModelCapabilities::resolve(
+        &model,
+        provider.default_capabilities.as_ref(),
+        &provider.model_capabilities,
+    );
+    if !caps.cache.prompt_cache_key
+        || provider.upstream_api
+            != codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions
+    {
+        return;
+    }
+    let Some(key) = serde_json::from_slice::<serde_json::Value>(converted)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|key| !key.is_empty())
+    else {
+        return;
+    };
+    if let Ok(value) = http::HeaderValue::from_str(&key) {
+        attempt.headers.insert("x-grok-conv-id", value);
+    }
 }
 
 /// Resolve the stored neutral transcript for the request's `previous_response_id`, rejecting only

@@ -206,6 +206,11 @@ pub struct ModelCapabilities {
     /// true to enable Ark parameter normalization.
     #[serde(default)]
     pub ark_style: bool,
+    /// Cache adaptation capabilities. Defaults are conservative: unsupported cache
+    /// controls are stripped so they never leak to an upstream that would reject or
+    /// silently ignore them (see docs/cache-adaptation-design.md for the research).
+    #[serde(default)]
+    pub cache: CacheCapabilities,
 }
 
 impl Default for ModelCapabilities {
@@ -230,8 +235,40 @@ impl Default for ModelCapabilities {
             accept_developer_role: true,
             reasoning_split: None,
             ark_style: false,
+            cache: CacheCapabilities::default(),
         }
     }
+}
+
+/// Provider cache-control capabilities, driving which cache controls the renderer
+/// keeps or strips. Research: docs/cache-adaptation-design.md §1.2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct CacheCapabilities {
+    /// Supports Anthropic-style block-level `cache_control` (ephemeral).
+    /// MiniMax (anthropic endpoint) and Qwen (chat/dashscope/anthropic); false
+    /// strips block-level cache_control when rendering away from Messages.
+    #[serde(default)]
+    pub block_cache_control: bool,
+    /// Supports the top-level `prompt_cache_key` routing/identity hint on chat or
+    /// responses. Kimi (chat), MiniMax (responses), Grok (chat/responses); false
+    /// strips it from chat/responses requests.
+    #[serde(default)]
+    pub prompt_cache_key: bool,
+    /// Supports `prompt_cache_options` { mode, ttl } (OpenAI protocol).
+    #[serde(default)]
+    pub prompt_cache_options: bool,
+    /// Reports cached tokens at `usage.cached_tokens` (Kimi) instead of
+    /// `usage.prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    pub cached_tokens_top_level: bool,
+    /// Reports cache via `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`
+    /// (DeepSeek) instead of `prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: bool,
+    /// Ark Responses explicit caching via `caching` + `previous_response_id` +
+    /// `store` (proxy layer injects the state chain).
+    #[serde(default)]
+    pub ark_explicit_cache: bool,
 }
 
 impl ModelCapabilities {

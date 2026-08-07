@@ -279,6 +279,8 @@ fn extract_anthropic_usage(usage: &Value) -> ChatUsage {
         prompt_tokens: u64_field("input_tokens"),
         completion_tokens: u64_field("output_tokens"),
         cached_tokens: u64_field("cache_read_input_tokens"),
+        cache_write_tokens: None,
+        prompt_cache_miss_tokens: None,
         reasoning_tokens: usage
             .and_then(|u| u.get("output_tokens_details"))
             .and_then(Value::as_object)

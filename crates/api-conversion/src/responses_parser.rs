@@ -321,6 +321,8 @@ fn extract_responses_usage(usage: &Value) -> ChatUsage {
             .and_then(Value::as_object)
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64),
+        cache_write_tokens: None,
+        prompt_cache_miss_tokens: None,
         reasoning_tokens: usage
             .and_then(|u| u.get("output_tokens_details"))
             .and_then(Value::as_object)

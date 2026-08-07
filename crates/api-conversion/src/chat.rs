@@ -7,7 +7,14 @@ use serde_json::Value;
 pub struct ChatUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens` (standard OpenAI), or the
+    /// provider-specific equivalents normalized here: Kimi's top-level
+    /// `usage.cached_tokens`, DeepSeek's `usage.prompt_cache_hit_tokens`.
     pub cached_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cache_write_tokens` (GPT-5.6+).
+    pub cache_write_tokens: Option<u64>,
+    /// `usage.prompt_cache_miss_tokens` (DeepSeek).
+    pub prompt_cache_miss_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -16,11 +23,17 @@ impl ChatUsage {
         self.prompt_tokens.is_none()
             && self.completion_tokens.is_none()
             && self.cached_tokens.is_none()
+            && self.cache_write_tokens.is_none()
+            && self.prompt_cache_miss_tokens.is_none()
             && self.reasoning_tokens.is_none()
     }
 }
 
 /// Extract usage from a chat.completion / chat.completion.chunk body.
+///
+/// Cached tokens are reported under three shapes across providers: standard
+/// `prompt_tokens_details.cached_tokens`, Kimi's top-level `cached_tokens`, and
+/// DeepSeek's `prompt_cache_hit_tokens`; all normalize into `cached_tokens`.
 pub fn extract_usage(body: &Value) -> ChatUsage {
     let usage = body.get("usage").and_then(Value::as_object);
     let u64_field = |field: &str| {
@@ -38,10 +51,15 @@ pub fn extract_usage(body: &Value) -> ChatUsage {
             .and_then(|details| details.get(field))
             .and_then(Value::as_u64)
     };
+    let cached = detail_field(details("prompt_tokens_details"), "cached_tokens")
+        .or_else(|| u64_field("cached_tokens"))
+        .or_else(|| u64_field("prompt_cache_hit_tokens"));
     ChatUsage {
         prompt_tokens: u64_field("prompt_tokens"),
         completion_tokens: u64_field("completion_tokens"),
-        cached_tokens: detail_field(details("prompt_tokens_details"), "cached_tokens"),
+        cached_tokens: cached,
+        cache_write_tokens: detail_field(details("prompt_tokens_details"), "cache_write_tokens"),
+        prompt_cache_miss_tokens: u64_field("prompt_cache_miss_tokens"),
         reasoning_tokens: detail_field(details("completion_tokens_details"), "reasoning_tokens"),
     }
 }
@@ -132,6 +150,45 @@ mod tests {
         let usage = extract_usage(&body);
         assert_eq!(usage.cached_tokens, Some(128));
         assert_eq!(usage.reasoning_tokens, Some(43));
+    }
+
+    #[test]
+    fn extracts_kimi_top_level_cached_tokens() {
+        let body = json!({
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 8}
+        });
+        let usage = extract_usage(&body);
+        assert_eq!(usage.cached_tokens, Some(8));
+    }
+
+    #[test]
+    fn extracts_deepseek_cache_hit_tokens() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_cache_hit_tokens": 60,
+                "prompt_cache_miss_tokens": 40
+            }
+        });
+        let usage = extract_usage(&body);
+        assert_eq!(usage.cached_tokens, Some(60));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(40));
+        assert_eq!(usage.prompt_tokens, Some(100));
+    }
+
+    #[test]
+    fn extracts_cache_write_tokens() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30}
+            }
+        });
+        let usage = extract_usage(&body);
+        assert_eq!(usage.cached_tokens, Some(50));
+        assert_eq!(usage.cache_write_tokens, Some(30));
     }
 
     #[test]
