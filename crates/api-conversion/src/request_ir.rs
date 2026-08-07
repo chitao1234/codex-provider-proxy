@@ -550,11 +550,20 @@ impl RequestIr {
         target: Protocol,
         caps: &ModelCapabilities,
     ) -> Result<Value, ConversionError> {
+        self.render_with_report(target, caps)
+            .map(|(rendered, _)| rendered)
+    }
+
+    /// Render into `target`, also returning the server-tool policy report so the
+    /// proxy can surface dropped/mapped tools for any target dialect.
+    pub fn render_with_report(
+        &self,
+        target: Protocol,
+        caps: &ModelCapabilities,
+    ) -> Result<(Value, RequestConversionReport), ConversionError> {
         match target {
             Protocol::AnthropicMessages => self.render_messages(caps),
-            Protocol::OpenAiChatCompletions => self
-                .render_chat_with_capabilities(caps)
-                .map(|(rendered, _)| rendered),
+            Protocol::OpenAiChatCompletions => self.render_chat_with_capabilities(caps),
             Protocol::OpenAiResponses => self.render_responses(caps),
         }
     }
@@ -949,7 +958,10 @@ impl RequestIr {
         })
     }
 
-    fn render_messages(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+    fn render_messages(
+        &self,
+        caps: &ModelCapabilities,
+    ) -> Result<(Value, RequestConversionReport), ConversionError> {
         if self
             .transcript
             .iter()
@@ -1086,10 +1098,13 @@ impl RequestIr {
                 render_messages_tool_choice(choice),
             );
         }
-        Ok(Value::Object(out))
+        Ok((Value::Object(out), report))
     }
 
-    fn render_responses(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+    fn render_responses(
+        &self,
+        caps: &ModelCapabilities,
+    ) -> Result<(Value, RequestConversionReport), ConversionError> {
         if self
             .transcript
             .iter()
@@ -1115,6 +1130,56 @@ impl RequestIr {
         // strips `metadata` under `ark_style`.
         if self.protocol == Protocol::AnthropicMessages {
             out.remove("context_management");
+        }
+        // Anthropic thinking -> Responses controls. Native-thinking upstreams (Ark)
+        // accept the thinking object; qwen-style upstreams document reasoning.effort
+        // as the control and ignore an unknown thinking object.
+        if self.protocol == Protocol::AnthropicMessages {
+            if let Some(thinking) = self.original.get("thinking") {
+                let thinking_type = thinking.get("type").and_then(Value::as_str);
+                match caps.thinking_param {
+                    ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+                        // Native thinking dialects keep the object with a normalized
+                        // type (Ark accepts enabled/disabled/auto; adaptive is
+                        // collapsed to the dialect's "on" value).
+                        let on = match caps.thinking_param {
+                            ThinkingParam::Adaptive => "adaptive",
+                            _ => "enabled",
+                        };
+                        let mapped = if thinking_type == Some("disabled") {
+                            "disabled"
+                        } else {
+                            on
+                        };
+                        out.insert(
+                            "thinking".to_owned(),
+                            serde_json::json!({"type": mapped}),
+                        );
+                    }
+                    ThinkingParam::EnableThinking => {
+                        // qwen responses: reasoning.effort is the documented control;
+                        // an unknown thinking object would be silently ignored. Only
+                        // force the disabled case when no explicit effort was provided
+                        // (an explicit output_config.effort is respected).
+                        out.remove("thinking");
+                        let has_explicit_effort = self
+                            .original
+                            .get("output_config")
+                            .and_then(Value::as_object)
+                            .and_then(|config| config.get("effort"))
+                            .is_some();
+                        if thinking_type == Some("disabled") && !has_explicit_effort {
+                            out.insert(
+                                "reasoning".to_owned(),
+                                serde_json::json!({"effort": "none"}),
+                            );
+                        }
+                    }
+                    ThinkingParam::None => {
+                        out.remove("thinking");
+                    }
+                }
+            }
         }
         // Responses `max_output_tokens` is optional; pass the client budget through.
         if let Some(value) = &self.max_output_tokens {
@@ -1166,7 +1231,7 @@ impl RequestIr {
             );
         }
         normalize_responses_parameters(&mut out, caps);
-        Ok(Value::Object(out))
+        Ok((Value::Object(out), report))
     }
 
     fn apply_context(&self, target: Protocol, out: &mut Map<String, Value>) {
@@ -2775,6 +2840,49 @@ mod tests {
         caps.max_tokens_cap = Some(4096);
         let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
         assert_eq!(messages["max_tokens"], 4096, "default clamped by cap");
+    }
+
+    #[test]
+    fn responses_render_maps_anthropic_thinking_per_dialect() {
+        // Native-thinking dialect (Ark, TopLevel): the object is kept with a
+        // normalized type; adaptive collapses to enabled.
+        let mut caps = ModelCapabilities::default();
+        caps.thinking_param = ThinkingParam::TopLevel;
+        let request = json!({
+            "model": "m",
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert_eq!(responses["thinking"]["type"], "enabled");
+
+        // qwen-style dialect (EnableThinking): the thinking object has no
+        // documented Responses form and is consumed; disabled without an explicit
+        // effort becomes reasoning.effort=none (the documented off switch).
+        let mut caps = ModelCapabilities::default();
+        caps.thinking_param = ThinkingParam::EnableThinking;
+        let request = json!({
+            "model": "m",
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert!(responses.get("thinking").is_none(), "thinking object consumed");
+        assert_eq!(responses["reasoning"]["effort"], "none");
+
+        // An explicit effort is respected over the disabled thinking flag.
+        let request = json!({
+            "model": "m",
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert!(responses.get("thinking").is_none());
+        assert_eq!(responses["reasoning"]["effort"], "high");
     }
 
     #[test]

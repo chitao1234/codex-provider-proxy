@@ -321,8 +321,8 @@ pub fn convert_request_body(
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?
             } else {
-                let mut rendered = request
-                    .render(pipeline.renderer.protocol(), &caps)
+                let (mut rendered, report) = request
+                    .render_with_report(pipeline.renderer.protocol(), &caps)
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?;
@@ -332,7 +332,7 @@ pub fn convert_request_body(
                     &caps,
                     &mut rendered,
                 );
-                (rendered, Default::default())
+                (rendered, report)
             }
         }
     };
