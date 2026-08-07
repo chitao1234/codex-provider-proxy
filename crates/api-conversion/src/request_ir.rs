@@ -325,34 +325,22 @@ impl RequestIr {
         {
             let mut saw_non_system = false;
             for value in &messages {
-                if !saw_non_system && value.get("role").and_then(Value::as_str) == Some("system") {
+                let is_system = value.get("role").and_then(Value::as_str) == Some("system");
+                if !saw_non_system && is_system {
+                    // Leading system messages are the protocol's top-level system,
+                    // kept as instructions (the Messages dialect has no message form).
                     if let Some(content) = value.get("content") {
                         self.instructions.push(content.clone());
                     }
-                } else {
-                    if value.get("role").and_then(Value::as_str) != Some("system") {
-                        saw_non_system = true;
-                    }
-                    if value.get("role").and_then(Value::as_str) == Some("system") {
-                        let text = value
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        self.transcript.push(IrConversationItem::Message(IrMessage {
-                            role: "user".to_owned(),
-                            content: vec![IrContent::Text {
-                                text: format!("<system-reminder>\n{text}\n</system-reminder>"),
-                                extra: Map::new(),
-                            }],
-                            item_id: None,
-                            tool_call_id: None,
-                            tool_calls: Vec::new(),
-                            extra: Map::new(),
-                        }));
-                    } else {
-                        self.parse_message(value, Protocol::AnthropicMessages);
-                    }
+                    continue;
                 }
+                if !is_system {
+                    saw_non_system = true;
+                }
+                // Mid-conversation system messages keep their role in the transcript;
+                // the renderer maps them per target dialect (system-reminder for chat,
+                // folded into top-level system for messages).
+                self.parse_message(value, Protocol::AnthropicMessages);
             }
         }
         self.tools = self
@@ -372,19 +360,9 @@ impl RequestIr {
             .cloned()
         {
             for value in &messages {
-                if value.get("role").and_then(Value::as_str) == Some("system") {
-                    if let Some(content) = value.get("content") {
-                        self.instructions.push(content.clone());
-                    }
-                } else if value.get("role").and_then(Value::as_str) == Some("developer") {
-                    // Fold OpenAI developer messages into the system instructions; the
-                    // Messages dialect has no developer role.
-                    if let Some(text) = value.get("content").and_then(Value::as_str) {
-                        self.instructions.push(Value::String(text.to_owned()));
-                    }
-                } else {
-                    self.parse_message(value, Protocol::OpenAiChatCompletions);
-                }
+                // Every message keeps its role in the transcript, including system and
+                // developer; the renderer maps them per target dialect.
+                self.parse_message(value, Protocol::OpenAiChatCompletions);
             }
         }
         self.tools = self
@@ -424,24 +402,9 @@ impl RequestIr {
             for value in &input {
                 match value.get("type").and_then(Value::as_str) {
                     Some("message") => {
-                        if value.get("role").and_then(Value::as_str) == Some("developer") {
-                            // OpenAI developer messages carry system-level instructions;
-                            // Anthropic upstreams reject the role, so fold the text into
-                            // the top-level system/instructions.
-                            let text = value
-                                .get("content")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            if !text.is_empty() {
-                                self.instructions.push(Value::String(text));
-                            }
-                        } else {
-                            self.parse_message(value, Protocol::OpenAiResponses);
-                        }
+                        // Every message role (including developer) is kept in the
+                        // transcript; the renderer maps them per target dialect.
+                        self.parse_message(value, Protocol::OpenAiResponses);
                     }
                     Some("function_call") => self.transcript.push(IrConversationItem::Message(
                         IrMessage::assistant_tool_call(IrToolCall::from_responses_call(value)),
@@ -567,7 +530,7 @@ impl RequestIr {
         &self,
         caps: &ModelCapabilities,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        let mut rendered = self.render_chat_base();
+        let mut rendered = self.render_chat_base(caps);
         let report = self.normalize_chat_capabilities(caps, &mut rendered)?;
         Ok((Value::Object(rendered), report))
     }
@@ -585,7 +548,7 @@ impl RequestIr {
         out
     }
 
-    fn render_chat_base(&self) -> Map<String, Value> {
+    fn render_chat_base(&self, caps: &ModelCapabilities) -> Map<String, Value> {
         let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
         for key in [
@@ -639,6 +602,45 @@ impl RequestIr {
                     }
                 }
                 IrConversationItem::Message(message) => {
+                    if message.role == "system" {
+                        // Mid-conversation system messages keep their position as a
+                        // system-reminder user message (many chat providers mishandle
+                        // a system message mid-conversation). Leading system messages
+                        // were already collected into instructions.
+                        let text = message
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                IrContent::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !text.is_empty() {
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!("<system-reminder>\n{text}\n</system-reminder>")
+                            }));
+                        }
+                        continue;
+                    }
+                    if message.role == "developer" && !caps.accept_developer_role {
+                        // The upstream rejects the developer role; fold into a system
+                        // message (content preserved).
+                        let text = message
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                IrContent::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !text.is_empty() {
+                            messages.push(serde_json::json!({"role": "system", "content": text}));
+                        }
+                        continue;
+                    }
                     let mut rendered = message.to_chat_values();
                     if message.role == "assistant" {
                         if let Some(reasoning) = pending_reasoning.take() {
@@ -897,6 +899,7 @@ impl RequestIr {
         let last_user_text = self.last_user_text();
         let rendered_tools = render_tools_with_policy(
             &self.tools,
+            Protocol::OpenAiChatCompletions,
             caps,
             &mut report,
             IrTool::to_chat,
@@ -1028,12 +1031,9 @@ impl RequestIr {
                 out.insert("stop_sequences".to_owned(), Value::Array(sequences));
             }
         }
-        if !self.instructions.is_empty() {
-            out.insert(
-                "system".to_owned(),
-                Value::String(instructions_text(&self.instructions)),
-            );
-        }
+        // The Messages dialect has no system/developer message role: those messages
+        // fold into the top-level system (collected across the transcript).
+        let mut system_extra: Vec<String> = Vec::new();
         let mut messages = Vec::new();
         for item in &self.transcript {
             match item {
@@ -1044,14 +1044,35 @@ impl RequestIr {
                     }
                 }
                 IrConversationItem::Message(message) => {
+                    if message.role == "system" || message.role == "developer" {
+                        system_extra.extend(message.content.iter().filter_map(|content| {
+                            if let IrContent::Text { text, .. } = content {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        }));
+                        continue;
+                    }
                     messages.extend(message.to_messages_values());
                 }
             }
+        }
+        let mut system_text = instructions_text(&self.instructions);
+        if !system_extra.is_empty() {
+            if !system_text.is_empty() {
+                system_text.push('\n');
+            }
+            system_text.push_str(&system_extra.join("\n\n"));
+        }
+        if !system_text.is_empty() {
+            out.insert("system".to_owned(), Value::String(system_text));
         }
         out.insert("messages".to_owned(), Value::Array(messages));
         let mut report = RequestConversionReport::default();
         let rendered_tools = render_tools_with_policy(
             &self.tools,
+            Protocol::AnthropicMessages,
             caps,
             &mut report,
             IrTool::to_messages,
@@ -1161,6 +1182,27 @@ impl RequestIr {
             match item {
                 IrConversationItem::Reasoning(reasoning) => input.push(reasoning.clone()),
                 IrConversationItem::Message(message) => {
+                    if message.role == "developer" && !caps.accept_developer_role {
+                        // The upstream rejects the developer role; fold into a system
+                        // message (content preserved).
+                        let text = message
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                IrContent::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !text.is_empty() {
+                            input.push(serde_json::json!({
+                                "type": "message",
+                                "role": "system",
+                                "content": [{"type": "input_text", "text": text}],
+                            }));
+                        }
+                        continue;
+                    }
                     input.extend(message.to_responses_values());
                 }
             }
@@ -1170,6 +1212,7 @@ impl RequestIr {
         let last_user_text = self.last_user_text();
         let rendered_tools = render_tools_with_policy(
             &self.tools,
+            Protocol::OpenAiResponses,
             caps,
             &mut report,
             IrTool::to_responses,
@@ -1326,6 +1369,7 @@ fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
 /// target dialect; `render_mapped` renders a mapped server tool as a function tool.
 fn render_tools_with_policy(
     tools: &[IrTool],
+    target: Protocol,
     caps: &ModelCapabilities,
     report: &mut RequestConversionReport,
     render_plain: impl Fn(&IrTool) -> Value,
@@ -1334,6 +1378,13 @@ fn render_tools_with_policy(
 ) -> Vec<Value> {
     let mut rendered_tools = Vec::new();
     for tool in tools {
+        if is_freeform_tool(tool) && target == Protocol::OpenAiResponses {
+            // Codex's freeform tool (`type: "custom"` + `format`) is natively
+            // supported by the Responses dialect (custom free-text tool); keep it
+            // instead of treating it as a server-side tool.
+            rendered_tools.push(tool.raw.clone());
+            continue;
+        }
         if is_server_tool(tool) {
             let name = tool.name.clone().unwrap_or_else(|| tool.kind.clone());
             match caps.server_tools {
@@ -1468,14 +1519,41 @@ fn merge_native_params(
 /// non-`function`/`custom` type (`web_search_20260209`, `file_search`, `bash`, ...) and
 /// the well-known camelCase names (`WebSearch`, `WebFetch`) count as server tools, so the
 /// `ServerToolPolicy` applies to them instead of leaking a raw definition upstream.
+/// Whether a parsed tool is a server-side tool (has a non-function type, or a recognized
+/// server tool name). Mirrors the Messages-dialect `is_server_tool`: any explicit
+/// non-`function`/`custom` type (`web_search_20260209`, `file_search`, `bash`, ...) and
+/// the well-known camelCase names (`WebSearch`, `WebFetch`) count as server tools, so the
+/// `ServerToolPolicy` applies to them instead of leaking a raw definition upstream.
+///
+/// Codex's freeform tool also reuses `type: "custom"` but carries no schema (a `format`
+/// descriptor instead); see `is_freeform_tool`. It is a server-side tool for dialects
+/// without a custom type (chat, messages), but the Responses dialect supports it natively.
 fn is_server_tool(tool: &IrTool) -> bool {
     let kind = tool.kind.as_str();
     if kind != "function" && kind != "custom" && !kind.is_empty() {
         return true;
     }
+    // Codex's freeform tool reuses the Messages `custom` type but is a no-schema
+    // free-text tool (it carries a `format` descriptor, no input_schema) — unlike
+    // Anthropic's `custom`, a schema'd client function. Upstreams that only speak
+    // `function` reject it, so it is treated as a server-side tool and goes
+    // through the `ServerToolPolicy` (dropped by default).
+    if is_freeform_tool(tool) {
+        return true;
+    }
     tool.name
         .as_deref()
         .is_some_and(crate::server_tools::is_known_name)
+}
+
+/// Whether a tool is Codex's freeform tool: `type: "custom"` with a `format`
+/// descriptor and no input schema. Distinct from Anthropic's `custom` (a schema'd
+/// client function). The Responses dialect supports it natively; chat and messages
+/// do not.
+fn is_freeform_tool(tool: &IrTool) -> bool {
+    tool.kind == "custom"
+        && tool.parameters.is_none()
+        && tool.raw.get("format").is_some()
 }
 
 /// Short name for a server tool, used to match provider-native policies and map to a
@@ -2194,8 +2272,15 @@ impl IrTool {
         }
     }
 
+    /// Whether the tool is a plain function or a schema'd `custom` (Anthropic client
+    /// function) that can be rendered as a function in the chat/responses dialects.
+    /// Schema-less `custom` (Codex's freeform) is handled by the server-tool policy.
+    fn has_schema_function_kind(&self) -> bool {
+        self.kind == "function" || (self.kind == "custom" && self.parameters.is_some())
+    }
+
     fn to_chat(&self) -> Value {
-        if self.kind != "function" {
+        if !self.has_schema_function_kind() {
             return self.raw.clone();
         }
         let mut function = self
@@ -2204,6 +2289,9 @@ impl IrTool {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| self.raw.as_object().cloned().unwrap_or_default());
+        // A schema'd Anthropic `custom` tool flattens into the function body; the
+        // custom type tag and input_schema have no chat equivalents.
+        function.remove("type");
         function.remove("input_schema");
         function.insert(
             "name".to_owned(),
@@ -2226,6 +2314,11 @@ impl IrTool {
     }
 
     fn to_messages(&self) -> Value {
+        // The Messages dialect natively supports `custom` tools (schema'd client
+        // functions); keep them as-is. Everything else renders as a plain tool.
+        if self.kind == "custom" {
+            return self.raw.clone();
+        }
         if self.kind != "function" {
             return self.raw.clone();
         }
@@ -2255,7 +2348,7 @@ impl IrTool {
     }
 
     fn to_responses(&self) -> Value {
-        if self.kind != "function" {
+        if !self.has_schema_function_kind() {
             return self.raw.clone();
         }
         let mut object = self.raw.as_object().cloned().unwrap_or_default();
@@ -2880,6 +2973,255 @@ mod tests {
         let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
         assert!(responses.get("thinking").is_none());
         assert_eq!(responses["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn codex_freeform_custom_tool_is_dropped_not_leaked() {
+        // Codex's freeform tool is `type: "custom"` with a `format` descriptor and
+        // no schema. It must go through the server-tool policy (dropped by default)
+        // instead of leaking to upstreams that only accept `function` (chat 400) or
+        // require `input_schema` (messages 400).
+        let freeform = json!({
+            "type": "custom",
+            "name": "freeform",
+            "description": "Emit arbitrary structured output",
+            "format": {"type": "text", "syntax": "markdown", "definition": "..."}
+        });
+        let request = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [freeform]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        // Chat: dropped (no custom type).
+        let (chat, report) = ir
+            .render_with_report(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        assert!(chat.get("tools").is_none(), "freeform tool dropped for chat");
+        assert_eq!(report.dropped_server_tools, vec!["freeform"]);
+        // Messages: dropped (no custom free-text type).
+        let (messages, report) = ir
+            .render_with_report(
+                Protocol::AnthropicMessages,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        assert!(messages.get("tools").is_none(), "freeform tool dropped for messages");
+        assert_eq!(report.dropped_server_tools, vec!["freeform"]);
+    }
+
+    #[test]
+    fn codex_freeform_custom_tool_is_kept_for_responses() {
+        // The Responses dialect natively supports `type: "custom"` free-text tools
+        // (codex-researched from the OpenAI API reference: custom = free form text
+        // inputs/outputs with a format descriptor); the tool is preserved as-is.
+        let freeform = json!({
+            "type": "custom",
+            "name": "freeform",
+            "description": "Emit arbitrary structured output",
+            "format": {"type": "text"}
+        });
+        let request = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [freeform]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let (responses, report) = ir
+            .render_with_report(
+                Protocol::OpenAiResponses,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        let tools = responses["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(tools[0]["name"], "freeform");
+        assert_eq!(tools[0]["format"]["type"], "text");
+        assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn anthropic_schema_custom_tool_is_preserved() {
+        // Anthropic `custom` tools carry an input_schema and must keep working as
+        // ordinary tools (they are schema'd client functions, not freeform).
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "custom", "name": "my_custom", "description": "custom fn",
+                       "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let (chat, report) = ir
+            .render_with_report(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "schema'd custom tool kept");
+        assert_eq!(tools[0]["function"]["name"], "my_custom");
+        assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn developer_messages_keep_role_in_ir_and_render() {
+        // Parse must not lose the developer role: it stays an IrMessage and renders
+        // as a developer message to dialects that support it (chat, responses).
+        let request = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "be precise"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        // IR keeps the developer message with its role and content.
+        let roles: Vec<&str> = ir
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                IrConversationItem::Message(message) => Some(message.role.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roles, vec!["developer", "user"]);
+
+        // Responses render keeps the developer message.
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["input"][0]["role"], "developer");
+
+        // Chat render keeps the developer message.
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(chat["messages"][0]["role"], "developer");
+        assert_eq!(chat["messages"][0]["content"], "be precise");
+    }
+
+    #[test]
+    fn developer_and_mid_system_fold_into_messages_system() {
+        // Messages has no developer/system message role: both fold into the top-level
+        // system while keeping their content.
+        let request = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "be precise"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "message", "role": "system",
+                 "content": [{"type": "input_text", "text": "mid-rule"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "second"}]}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        let system = messages["system"].as_str().unwrap();
+        assert!(system.contains("be precise"));
+        assert!(system.contains("mid-rule"));
+        // The messages array carries only the user turns.
+        let roles: Vec<&str> = messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        assert_eq!(roles, vec!["user", "user"]);
+    }
+
+    #[test]
+    fn chat_mid_system_becomes_system_reminder_at_render() {
+        // The system-reminder wrapping is a render-time behavior for chat upstreams;
+        // parse keeps the system role.
+        let request = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "mid-rule"},
+                {"role": "assistant", "content": "ok"}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
+        let roles: Vec<&str> = ir
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                IrConversationItem::Message(message) => Some(message.role.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roles, vec!["user", "system", "assistant"]);
+
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        let rendered = chat["messages"].as_array().unwrap();
+        assert_eq!(rendered[1]["role"], "user");
+        assert!(rendered[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn messages_custom_tool_stays_custom() {
+        // The Messages dialect natively supports `custom` tools; rendering back to
+        // Messages keeps the custom type instead of flattening it.
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "custom", "name": "my_custom", "description": "custom fn",
+                       "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let (messages, report) = ir
+            .render_with_report(
+                Protocol::AnthropicMessages,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        let tools = messages["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "custom", "custom type preserved");
+        assert_eq!(tools[0]["name"], "my_custom");
+        assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn developer_folds_when_upstream_rejects_role() {
+        // accept_developer_role=false folds developer messages into system for both
+        // chat and responses renderings; content is preserved.
+        let mut caps = ModelCapabilities::default();
+        caps.accept_developer_role = false;
+        let request = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "be precise"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+
+        let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][0]["content"], "be precise");
+
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
+        assert_eq!(responses["input"][0]["role"], "system");
+        assert_eq!(responses["input"][0]["content"][0]["text"], "be precise");
     }
 
     #[test]

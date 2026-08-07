@@ -37,6 +37,20 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
             request.remove("prompt_cache_key");
         }
     }
+    // Ark rejects per-content-block `cache_control` inside `input` (caching is
+    // top-level only in Responses; observed `unknown field "cache_control"`).
+    if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            let Some(message) = item.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for block in message {
+                if let Some(object) = block.as_object_mut() {
+                    object.remove("cache_control");
+                }
+            }
+        }
+    }
     normalize_ark_web_search_tools(request);
 }
 

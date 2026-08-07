@@ -156,6 +156,11 @@ pub struct ModelCapabilities {
     /// (e.g. Kimi rejects a missing field). `None` keeps the omission.
     #[serde(default)]
     pub default_max_tokens: Option<u64>,
+    /// Whether the upstream accepts the OpenAI `developer` message role. Both the
+    /// Chat Completions and Responses protocols define it, but some compatible
+    /// upstreams reject it; when false, developer messages fold into system.
+    #[serde(default = "default_true")]
+    pub accept_developer_role: bool,
     /// Native search tool template for `ServerToolPolicy::ProviderNative` (e.g.
     /// `{"type":"web_search","web_search":{"search_result":true}}` for glm). The optional
     /// `{search_query}` placeholder is replaced with the last user message.
@@ -222,6 +227,7 @@ impl Default for ModelCapabilities {
             code_interpreter_request_params: None,
             always_enable_tools: Vec::new(),
             accept_stop: true,
+            accept_developer_role: true,
             reasoning_split: None,
             ark_style: false,
         }
