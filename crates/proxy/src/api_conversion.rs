@@ -314,26 +314,18 @@ pub fn convert_request_body(
             .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            if pipeline.renderer == RequestRendererKind::OpenAiChatCompletions {
-                request
-                    .render_chat_with_capabilities(&caps)
-                    .map_err(|err| {
-                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                    })?
-            } else {
-                let (mut rendered, report) = request
-                    .render_with_report(pipeline.renderer.protocol(), &caps)
-                    .map_err(|err| {
-                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                    })?;
-                normalize_rendered_request(
-                    pipeline.normalizer,
-                    pipeline.renderer,
-                    &caps,
-                    &mut rendered,
-                );
-                (rendered, report)
-            }
+            let (mut rendered, report) = request
+                .render_with_report(pipeline.renderer.protocol(), &caps)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?;
+            normalize_rendered_request(
+                pipeline.normalizer,
+                pipeline.renderer,
+                &caps,
+                &mut rendered,
+            );
+            (rendered, report)
         }
     };
     if !report.dropped_server_tools.is_empty() {
@@ -1005,7 +997,10 @@ search_tool_template = { type = "web_search", web_search = { search_context_size
         assert_eq!(tools[0]["type"], "web_search");
         // Ark declares the tool flat; normalization flattens the template's OpenAI
         // sub-object and maps search_context_size to max_keyword.
-        assert!(tools[0].get("web_search").is_none(), "nested object flattened");
+        assert!(
+            tools[0].get("web_search").is_none(),
+            "nested object flattened"
+        );
         assert_eq!(tools[0]["max_keyword"], 3);
     }
 

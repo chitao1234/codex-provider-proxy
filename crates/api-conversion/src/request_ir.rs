@@ -36,7 +36,6 @@ pub struct RequestIr {
     /// Top-level fields not modeled by the neutral IR. They are opaque provider/client
     /// extensions and are preserved without participating in semantic mapping.
     pub opaque_extensions: BTreeMap<String, Value>,
-    pub continuation: BTreeMap<String, Value>,
     pub context: RequestContext,
 }
 
@@ -154,7 +153,6 @@ impl RequestIr {
             tools: Vec::new(),
             tool_choice: None,
             opaque_extensions: BTreeMap::new(),
-            continuation: BTreeMap::new(),
             context: RequestContext::default(),
         };
 
@@ -398,10 +396,6 @@ impl RequestIr {
         if let Some(instructions) = self.original.get("instructions") {
             self.instructions.push(instructions.clone());
         }
-        if let Some(previous) = self.original.get("previous_response_id") {
-            self.continuation
-                .insert("previous_response_id".to_owned(), previous.clone());
-        }
         if let Some(input) = self.original.get("input") {
             if let Some(text) = input.as_str() {
                 self.transcript.push(IrConversationItem::Message(IrMessage {
@@ -563,23 +557,18 @@ impl RequestIr {
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
         match target {
             Protocol::AnthropicMessages => self.render_messages(caps),
-            Protocol::OpenAiChatCompletions => self.render_chat_with_capabilities(caps),
+            Protocol::OpenAiChatCompletions => self.render_chat(caps),
             Protocol::OpenAiResponses => self.render_responses(caps),
         }
     }
 
-    pub fn render_chat_with_capabilities(
+    fn render_chat(
         &self,
         caps: &ModelCapabilities,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        let mut rendered = self.render_chat_base()?;
-        let report = self.normalize_chat_capabilities(
-            caps,
-            rendered
-                .as_object_mut()
-                .expect("chat renderer always returns an object"),
-        )?;
-        Ok((rendered, report))
+        let mut rendered = self.render_chat_base();
+        let report = self.normalize_chat_capabilities(caps, &mut rendered)?;
+        Ok((Value::Object(rendered), report))
     }
 
     fn base_output(&self) -> Map<String, Value> {
@@ -595,7 +584,7 @@ impl RequestIr {
         out
     }
 
-    fn render_chat_base(&self) -> Result<Value, ConversionError> {
+    fn render_chat_base(&self) -> Map<String, Value> {
         let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
         for key in [
@@ -683,7 +672,7 @@ impl RequestIr {
         if let Some(choice) = &self.tool_choice {
             out.insert("tool_choice".to_owned(), choice.clone());
         }
-        Ok(Value::Object(out))
+        out
     }
 
     fn normalize_chat_capabilities(
@@ -714,17 +703,7 @@ impl RequestIr {
         if let Some(split) = caps.reasoning_split {
             out.insert("reasoning_split".to_owned(), Value::Bool(split));
         }
-        if self
-            .transcript
-            .iter()
-            .filter_map(|item| match item {
-                IrConversationItem::Message(message) => Some(message),
-                IrConversationItem::Reasoning(_) => None,
-            })
-            .flat_map(|message| message.content.iter())
-            .any(|content| matches!(content, IrContent::Image(_)))
-            && !caps.image_input
-        {
+        if self.has_image_content() && !caps.image_input {
             return Err(ConversionError::unsupported(
                 "messages[].content.image",
                 "upstream does not support image input",
@@ -762,7 +741,11 @@ impl RequestIr {
                 };
                 let mapped = if self.original.contains_key("thinking") {
                     // A Messages thinking block maps its type; a missing type means on.
-                    Some(if thinking_type == Some("disabled") { "disabled" } else { on })
+                    Some(if thinking_type == Some("disabled") {
+                        "disabled"
+                    } else {
+                        on
+                    })
                 } else {
                     // A Responses request has no thinking parameter; synthesize one
                     // from reasoning.effort.
@@ -775,10 +758,7 @@ impl RequestIr {
                     })
                 };
                 if let Some(mapped) = mapped {
-                    out.insert(
-                        "thinking".to_owned(),
-                        serde_json::json!({"type": mapped}),
-                    );
+                    out.insert("thinking".to_owned(), serde_json::json!({"type": mapped}));
                 }
             }
             ThinkingParam::EnableThinking => {
@@ -786,10 +766,7 @@ impl RequestIr {
                     || effort
                         .as_deref()
                         .is_some_and(|effort| effort == "none" || effort == "minimal");
-                out.insert(
-                    "enable_thinking".to_owned(),
-                    Value::Bool(!disabled),
-                );
+                out.insert("enable_thinking".to_owned(), Value::Bool(!disabled));
                 out.remove("thinking");
             }
             ThinkingParam::None => {
@@ -916,6 +893,7 @@ impl RequestIr {
             }
         }
         let mut report = RequestConversionReport::default();
+        let last_user_text = self.last_user_text();
         let rendered_tools = render_tools_with_policy(
             &self.tools,
             caps,
@@ -928,14 +906,14 @@ impl RequestIr {
                     "function": {"name": name, "description": description, "parameters": parameters}
                 })
             },
-            self.last_user_text().as_deref(),
+            last_user_text.as_deref(),
         );
         if !rendered_tools.is_empty() {
             out.insert("tools".to_owned(), Value::Array(rendered_tools));
         } else {
             out.remove("tools");
         }
-        merge_native_params(out, caps, &mut report, self.last_user_text().as_deref());
+        merge_native_params(out, caps, &mut report, last_user_text.as_deref());
         Ok(report)
     }
 
@@ -958,12 +936,8 @@ impl RequestIr {
         })
     }
 
-    fn render_messages(
-        &self,
-        caps: &ModelCapabilities,
-    ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        if self
-            .transcript
+    fn has_image_content(&self) -> bool {
+        self.transcript
             .iter()
             .filter_map(|item| match item {
                 IrConversationItem::Message(message) => Some(message),
@@ -971,8 +945,13 @@ impl RequestIr {
             })
             .flat_map(|message| message.content.iter())
             .any(|content| matches!(content, IrContent::Image(_)))
-            && !caps.image_input
-        {
+    }
+
+    fn render_messages(
+        &self,
+        caps: &ModelCapabilities,
+    ) -> Result<(Value, RequestConversionReport), ConversionError> {
+        if self.has_image_content() && !caps.image_input {
             return Err(ConversionError::unsupported(
                 "messages[].content.image",
                 "upstream does not support image input",
@@ -991,9 +970,7 @@ impl RequestIr {
             .unwrap_or(Value::Null);
         if !max_tokens.is_null() {
             let max_tokens = max_tokens.as_u64().map_or(max_tokens, |value| {
-                serde_json::json!(
-                    caps.max_tokens_cap.map_or(value, |cap| value.min(cap))
-                )
+                serde_json::json!(caps.max_tokens_cap.map_or(value, |cap| value.min(cap)))
             });
             out.insert("max_tokens".to_owned(), max_tokens);
         }
@@ -1105,17 +1082,7 @@ impl RequestIr {
         &self,
         caps: &ModelCapabilities,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        if self
-            .transcript
-            .iter()
-            .filter_map(|item| match item {
-                IrConversationItem::Message(message) => Some(message),
-                IrConversationItem::Reasoning(_) => None,
-            })
-            .flat_map(|message| message.content.iter())
-            .any(|content| matches!(content, IrContent::Image(_)))
-            && !caps.image_input
-        {
+        if self.has_image_content() && !caps.image_input {
             return Err(ConversionError::unsupported(
                 "messages[].content.image",
                 "upstream does not support image input",
@@ -1151,10 +1118,7 @@ impl RequestIr {
                         } else {
                             on
                         };
-                        out.insert(
-                            "thinking".to_owned(),
-                            serde_json::json!({"type": mapped}),
-                        );
+                        out.insert("thinking".to_owned(), serde_json::json!({"type": mapped}));
                     }
                     ThinkingParam::EnableThinking => {
                         // qwen responses: reasoning.effort is the documented control;
@@ -1202,6 +1166,7 @@ impl RequestIr {
         }
         out.insert("input".to_owned(), Value::Array(input));
         let mut report = RequestConversionReport::default();
+        let last_user_text = self.last_user_text();
         let rendered_tools = render_tools_with_policy(
             &self.tools,
             caps,
@@ -1216,14 +1181,14 @@ impl RequestIr {
                     "parameters": parameters,
                 })
             },
-            self.last_user_text().as_deref(),
+            last_user_text.as_deref(),
         );
         if !rendered_tools.is_empty() {
             out.insert("tools".to_owned(), Value::Array(rendered_tools));
         } else {
             out.remove("tools");
         }
-        merge_native_params(&mut out, caps, &mut report, self.last_user_text().as_deref());
+        merge_native_params(&mut out, caps, &mut report, last_user_text.as_deref());
         if let Some(choice) = &self.tool_choice {
             out.insert(
                 "tool_choice".to_owned(),
@@ -1373,11 +1338,12 @@ fn render_tools_with_policy(
             match caps.server_tools {
                 ServerToolPolicy::Drop => report.dropped_server_tools.push(name),
                 ServerToolPolicy::MapToFunction => {
-                    if matches!(server_tool_short_name(tool), Some("web_search" | "web_fetch")) {
+                    if matches!(
+                        server_tool_short_name(tool),
+                        Some("web_search" | "web_fetch")
+                    ) {
                         let short = server_tool_short_name(tool).expect("matched above");
-                        report
-                            .mapped_server_tools
-                            .push(short.to_owned());
+                        report.mapped_server_tools.push(short.to_owned());
                         rendered_tools.push(render_mapped(tool));
                     } else {
                         report.dropped_server_tools.push(name);
@@ -1393,13 +1359,9 @@ fn render_tools_with_policy(
                                     last_user_query,
                                 ),
                             );
-                            report
-                                .mapped_server_tools
-                                .push("web_search".to_owned());
+                            report.mapped_server_tools.push("web_search".to_owned());
                         } else if caps.search_request_params.is_some() {
-                            report
-                                .mapped_server_tools
-                                .push("web_search".to_owned());
+                            report.mapped_server_tools.push("web_search".to_owned());
                         } else {
                             report.dropped_server_tools.push(name);
                         }
@@ -1408,9 +1370,7 @@ fn render_tools_with_policy(
                         report.mapped_server_tools.push("web_fetch".to_owned());
                     }
                     Some("code_execution") if caps.code_interpreter_request_params.is_some() => {
-                        report
-                            .mapped_server_tools
-                            .push("code_execution".to_owned());
+                        report.mapped_server_tools.push("code_execution".to_owned());
                     }
                     _ => report.dropped_server_tools.push(name),
                 },
@@ -1475,9 +1435,7 @@ fn merge_native_params(
         {
             continue;
         }
-        report
-            .mapped_server_tools
-            .push(normalized.to_owned());
+        report.mapped_server_tools.push(normalized.to_owned());
         let params = match normalized {
             "web_search" => caps.search_request_params.as_ref(),
             "web_fetch" => caps.fetch_request_params.as_ref(),
@@ -1560,7 +1518,11 @@ fn server_tool_short_name(tool: &IrTool) -> Option<&str> {
 fn server_tool_function_shape(tool: &IrTool) -> (String, String, Value) {
     let name = server_tool_short_name(tool)
         .map(str::to_owned)
-        .unwrap_or_else(|| tool.name.clone().unwrap_or_else(|| tool.kind.replace('-', "_")));
+        .unwrap_or_else(|| {
+            tool.name
+                .clone()
+                .unwrap_or_else(|| tool.kind.replace('-', "_"))
+        });
     match server_tool_short_name(tool) {
         Some("web_search") => (
             name,
@@ -2156,7 +2118,9 @@ impl IrToolCall {
         // Anthropic tool_use.input must be an object; Chat/Responses carry arguments
         // as a JSON string, so parse it.
         let input = match &self.arguments {
-            Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({})),
+            Value::String(text) => {
+                serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}))
+            }
             value => value.clone(),
         };
         serde_json::json!({"type":"tool_use", "id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "name":self.name, "input":input})
@@ -2596,13 +2560,15 @@ mod tests {
 
     #[test]
     fn responses_reasoning_effort_maps_to_thinking_and_effort() {
-        let mut caps = ModelCapabilities::default();
-        caps.thinking_param = ThinkingParam::TopLevel;
-        caps.reasoning_effort = Some(crate::dialect::ReasoningEffortConfig {
-            enabled: true,
-            levels: vec!["low".into(), "high".into(), "max".into()],
-            default: None,
-        });
+        let caps = ModelCapabilities {
+            thinking_param: ThinkingParam::TopLevel,
+            reasoning_effort: Some(crate::dialect::ReasoningEffortConfig {
+                enabled: true,
+                levels: vec!["low".into(), "high".into(), "max".into()],
+                default: None,
+            }),
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "max_output_tokens": 1,
@@ -2622,8 +2588,10 @@ mod tests {
 
     #[test]
     fn responses_reasoning_effort_minimal_disables_thinking() {
-        let mut caps = ModelCapabilities::default();
-        caps.thinking_param = ThinkingParam::Adaptive;
+        let caps = ModelCapabilities {
+            thinking_param: ThinkingParam::Adaptive,
+            ..Default::default()
+        };
         let request = json!({"model": "m", "input": "hi", "reasoning": {"effort": "minimal"}});
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
         let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
@@ -2639,7 +2607,10 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         assert_eq!(chat["tool_choice"]["type"], "function");
         assert_eq!(chat["tool_choice"]["function"]["name"], "f");
@@ -2651,20 +2622,25 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         assert_eq!(chat["tool_choice"], "auto");
     }
 
     #[test]
     fn responses_server_tools_map_to_native_params_with_query_substitution() {
-        let mut caps = ModelCapabilities::default();
-        caps.server_tools = ServerToolPolicy::ProviderNative;
-        caps.always_enable_tools = vec!["web_search".to_string(), "code_execution".to_string()];
-        caps.search_request_params = Some(json!({
-            "web_search": {"enable": true, "search_query": "{search_query}"}
-        }));
-        caps.code_interpreter_request_params = Some(json!({"enable_code_interpreter": true}));
+        let caps = ModelCapabilities {
+            server_tools: ServerToolPolicy::ProviderNative,
+            always_enable_tools: vec!["web_search".to_string(), "code_execution".to_string()],
+            search_request_params: Some(json!({
+                "web_search": {"enable": true, "search_query": "{search_query}"}
+            })),
+            code_interpreter_request_params: Some(json!({"enable_code_interpreter": true})),
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "input": "what's the weather in Paris?",
@@ -2672,7 +2648,9 @@ mod tests {
             "tools": [{"type": "web_search_preview"}]
         });
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
-        let (chat, report) = ir.render_chat_with_capabilities(&caps).unwrap();
+        let (chat, report) = ir
+            .render_with_report(Protocol::OpenAiChatCompletions, &caps)
+            .unwrap();
         assert_eq!(chat["web_search"]["enable"], true);
         assert!(chat["web_search"]["search_query"]
             .as_str()
@@ -2687,8 +2665,10 @@ mod tests {
     #[test]
     fn broad_server_tool_kinds_are_dropped_or_mapped() {
         // file_search / bash / camelCase custom tools must be treated as server tools.
-        let mut caps = ModelCapabilities::default();
-        caps.server_tools = ServerToolPolicy::MapToFunction;
+        let caps = ModelCapabilities {
+            server_tools: ServerToolPolicy::MapToFunction,
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2700,7 +2680,9 @@ mod tests {
             ]
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
-        let (chat, report) = ir.render_chat_with_capabilities(&caps).unwrap();
+        let (chat, report) = ir
+            .render_with_report(Protocol::OpenAiChatCompletions, &caps)
+            .unwrap();
         let tools = chat["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2); // WebSearch mapped + Read kept
         assert_eq!(tools[0]["function"]["name"], "web_search");
@@ -2710,8 +2692,10 @@ mod tests {
 
     #[test]
     fn responses_to_messages_maps_effort_to_thinking() {
-        let mut caps = ModelCapabilities::default();
-        caps.thinking_param = ThinkingParam::Adaptive;
+        let caps = ModelCapabilities {
+            thinking_param: ThinkingParam::Adaptive,
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
@@ -2725,21 +2709,21 @@ mod tests {
 
     #[test]
     fn responses_renderer_applies_server_tool_policy() {
-        let mut caps = ModelCapabilities::default();
-        caps.server_tools = ServerToolPolicy::ProviderNative;
-        caps.search_tool_template = Some(json!({
-            "type": "web_search",
-            "web_search": {"search_context_size": "medium"}
-        }));
+        let caps = ModelCapabilities {
+            server_tools: ServerToolPolicy::ProviderNative,
+            search_tool_template: Some(json!({
+                "type": "web_search",
+                "web_search": {"search_context_size": "medium"}
+            })),
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
             "tools": [{"type": "web_search_preview"}]
         });
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
-        let responses = ir
-            .render(Protocol::OpenAiResponses, &caps)
-            .unwrap();
+        let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
         let tools = responses["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "web_search");
@@ -2817,7 +2801,10 @@ mod tests {
         assert_eq!(tools[0]["name"], "exec_command");
         assert!(tools[0].get("parameters").is_none(), "parameters stripped");
         assert!(tools[0].get("strict").is_none(), "strict stripped");
-        assert_eq!(tools[0]["input_schema"]["properties"]["cmd"]["type"], "string");
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["cmd"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -2835,9 +2822,11 @@ mod tests {
             .unwrap();
         assert!(messages.get("max_tokens").is_none());
 
-        let mut caps = ModelCapabilities::default();
-        caps.default_max_tokens = Some(8192);
-        caps.max_tokens_cap = Some(4096);
+        let caps = ModelCapabilities {
+            default_max_tokens: Some(8192),
+            max_tokens_cap: Some(4096),
+            ..Default::default()
+        };
         let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
         assert_eq!(messages["max_tokens"], 4096, "default clamped by cap");
     }
@@ -2846,8 +2835,10 @@ mod tests {
     fn responses_render_maps_anthropic_thinking_per_dialect() {
         // Native-thinking dialect (Ark, TopLevel): the object is kept with a
         // normalized type; adaptive collapses to enabled.
-        let mut caps = ModelCapabilities::default();
-        caps.thinking_param = ThinkingParam::TopLevel;
+        let caps = ModelCapabilities {
+            thinking_param: ThinkingParam::TopLevel,
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "thinking": {"type": "adaptive", "display": "omitted"},
@@ -2860,8 +2851,10 @@ mod tests {
         // qwen-style dialect (EnableThinking): the thinking object has no
         // documented Responses form and is consumed; disabled without an explicit
         // effort becomes reasoning.effort=none (the documented off switch).
-        let mut caps = ModelCapabilities::default();
-        caps.thinking_param = ThinkingParam::EnableThinking;
+        let caps = ModelCapabilities {
+            thinking_param: ThinkingParam::EnableThinking,
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "thinking": {"type": "disabled"},
@@ -2869,7 +2862,10 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
         let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
-        assert!(responses.get("thinking").is_none(), "thinking object consumed");
+        assert!(
+            responses.get("thinking").is_none(),
+            "thinking object consumed"
+        );
         assert_eq!(responses["reasoning"]["effort"], "none");
 
         // An explicit effort is respected over the disabled thinking flag.

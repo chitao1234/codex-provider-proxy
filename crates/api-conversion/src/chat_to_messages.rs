@@ -165,7 +165,8 @@ mod tests {
         body: &Value,
         caps: &ModelCapabilities,
     ) -> Result<(Value, crate::dialect::RequestConversionReport), ConversionError> {
-        RequestIr::parse(Protocol::AnthropicMessages, body)?.render_chat_with_capabilities(caps)
+        RequestIr::parse(Protocol::AnthropicMessages, body)?
+            .render_with_report(Protocol::OpenAiChatCompletions, caps)
     }
 
     #[test]

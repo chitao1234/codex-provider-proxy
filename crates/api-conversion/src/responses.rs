@@ -8,8 +8,7 @@ use crate::chat::{
 };
 use crate::error::ConversionError;
 
-/// Apply Ark-style parameter normalization directly to a Responses request object
-/// (for same-protocol passthrough where the downstream already speaks Responses).
+/// Apply Ark-style parameter normalization to a rendered Responses request object.
 ///
 /// - `reasoning.effort` -> Ark `thinking: {"type": "enabled"|"disabled"}`.
 /// - web_search tools: `search_context_size` -> `max_keyword`.
@@ -68,9 +67,7 @@ fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_default();
-        if kind != "web_search"
-            && kind != "web_search_preview"
-            && !kind.starts_with("web_search_")
+        if kind != "web_search" && kind != "web_search_preview" && !kind.starts_with("web_search_")
         {
             continue;
         }
@@ -78,9 +75,7 @@ fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
         if let Some(nested) = object.remove("web_search") {
             if let Some(nested) = nested.as_object() {
                 for (key, value) in nested {
-                    object
-                        .entry(key.clone())
-                        .or_insert_with(|| value.clone());
+                    object.entry(key.clone()).or_insert_with(|| value.clone());
                 }
             }
         }
