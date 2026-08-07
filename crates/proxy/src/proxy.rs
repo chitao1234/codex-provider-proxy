@@ -1537,7 +1537,7 @@ fn maybe_convert_request_body(
         // Hold the transcript recorder for the response side of this attempt so the
         // synthesized response can be continued with previous_response_id.
         if let Some(request_ir) = request_ir {
-            let model = request_ir.model.clone().unwrap_or_default();
+            let model = request_ir.model().unwrap_or_default().to_owned();
             attempt.response_recorder = Some(crate::api_conversion::ResponseRecorder::new(
                 state.runtime.response_states(),
                 attempt.provider_name.clone(),

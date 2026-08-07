@@ -8,27 +8,18 @@
 //! This crate is intentionally pure: no axum, no reqwest, no proxy runtime state. The proxy
 //! crate owns networking, routing, configuration, and logging.
 
-pub mod chat;
+pub(crate) mod chat;
 pub mod chat_parser;
 pub mod chat_to_messages;
 pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
-pub mod messages;
 pub mod messages_parser;
 pub mod messages_renderer;
 pub mod request_ir;
-pub mod request_renderers;
 pub mod responses;
 pub mod responses_parser;
 pub mod responses_renderer;
+pub(crate) mod server_tools;
 pub mod sse;
 pub mod stream;
-
-pub use chat_to_messages::convert_chat_response;
-pub use dialect::{
-    DownstreamApi, MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
-    ServerToolPolicy, ThinkingParam, UpstreamApi,
-};
-pub use error::ConversionError;
-pub use responses::convert_chat_response_to_responses;

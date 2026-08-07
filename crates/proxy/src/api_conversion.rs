@@ -24,7 +24,7 @@ use codex_provider_proxy_api_conversion::responses::{
     chat_response_assistant_turn, convert_chat_response_to_responses,
 };
 use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
-use codex_provider_proxy_api_conversion::{sse, ConversionError};
+use codex_provider_proxy_api_conversion::{error::ConversionError, sse};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;

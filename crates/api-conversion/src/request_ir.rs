@@ -21,26 +21,26 @@ pub enum Protocol {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestIr {
-    pub protocol: Protocol,
-    pub original: Map<String, Value>,
-    pub model: Option<String>,
-    pub stream: Option<bool>,
+    protocol: Protocol,
+    original: Map<String, Value>,
+    model: Option<String>,
+    stream: Option<bool>,
     /// Output-token budget, protocol-neutral: Messages `max_tokens`, Chat
     /// `max_tokens`/`max_completion_tokens`, Responses `max_output_tokens`.
     /// Optional in Chat/Responses; required by the Messages API.
-    pub max_output_tokens: Option<Value>,
-    pub transcript: Vec<IrConversationItem>,
-    pub instructions: Vec<Value>,
-    pub tools: Vec<IrTool>,
-    pub tool_choice: Option<Value>,
+    max_output_tokens: Option<Value>,
+    transcript: Vec<IrConversationItem>,
+    instructions: Vec<Value>,
+    tools: Vec<IrTool>,
+    tool_choice: Option<Value>,
     /// Top-level fields not modeled by the neutral IR. They are opaque provider/client
     /// extensions and are preserved without participating in semantic mapping.
-    pub opaque_extensions: BTreeMap<String, Value>,
-    pub context: RequestContext,
+    opaque_extensions: BTreeMap<String, Value>,
+    context: RequestContext,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum IrConversationItem {
+enum IrConversationItem {
     Message(IrMessage),
     Reasoning(Value),
 }
@@ -50,19 +50,19 @@ pub enum IrConversationItem {
 /// These fields affect conversation affinity, abuse attribution, or prompt-cache reuse. They are
 /// modeled separately from sampling parameters so continuation can inherit them intentionally.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct RequestContext {
-    pub previous_response_id: Option<String>,
-    pub conversation: Option<Value>,
-    pub end_user_id: Option<String>,
-    pub safety_identifier: Option<String>,
-    pub metadata: Option<Value>,
-    pub cache: CacheContext,
-    pub store: Option<Value>,
-    pub include: Option<Value>,
-    pub truncation: Option<Value>,
+struct RequestContext {
+    previous_response_id: Option<String>,
+    conversation: Option<Value>,
+    end_user_id: Option<String>,
+    safety_identifier: Option<String>,
+    metadata: Option<Value>,
+    cache: CacheContext,
+    store: Option<Value>,
+    include: Option<Value>,
+    truncation: Option<Value>,
     /// Provider-specific identity/session/cache keys that the IR understands as context
     /// extensions and maps when a target protocol has an equivalent boundary field.
-    pub represented_extensions: BTreeMap<String, Value>,
+    represented_extensions: BTreeMap<String, Value>,
 }
 
 /// Protocol-neutral prompt-cache semantics.
@@ -70,24 +70,24 @@ pub struct RequestContext {
 /// `key` is the stable cache-affinity identity. Protocols expose it under different names
 /// (`prompt_cache_key`, `metadata.user_id`, or `user`), so renderers map it only at the boundary.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct CacheContext {
-    pub key: Option<String>,
-    pub retention: Option<Value>,
-    pub control: Option<Value>,
+struct CacheContext {
+    key: Option<String>,
+    retention: Option<Value>,
+    control: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct IrMessage {
-    pub role: String,
-    pub content: Vec<IrContent>,
-    pub item_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_calls: Vec<IrToolCall>,
-    pub extra: Map<String, Value>,
+struct IrMessage {
+    role: String,
+    content: Vec<IrContent>,
+    item_id: Option<String>,
+    tool_call_id: Option<String>,
+    tool_calls: Vec<IrToolCall>,
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum IrContent {
+enum IrContent {
     Text {
         text: String,
         extra: Map<String, Value>,
@@ -109,21 +109,21 @@ pub enum IrContent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct IrToolCall {
-    pub id: Option<String>,
-    pub call_id: Option<String>,
-    pub name: String,
-    pub arguments: Value,
-    pub extra: Map<String, Value>,
+struct IrToolCall {
+    id: Option<String>,
+    call_id: Option<String>,
+    name: String,
+    arguments: Value,
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct IrTool {
-    pub kind: String,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub parameters: Option<Value>,
-    pub raw: Value,
+struct IrTool {
+    kind: String,
+    name: Option<String>,
+    description: Option<String>,
+    parameters: Option<Value>,
+    raw: Value,
 }
 
 impl RequestIr {
@@ -307,6 +307,10 @@ impl RequestIr {
             return;
         };
         self.transcript.extend(parsed.transcript);
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     fn parse_messages(&mut self) {
@@ -539,11 +543,8 @@ impl RequestIr {
         }
     }
 
-    pub fn render(
-        &self,
-        target: Protocol,
-        caps: &ModelCapabilities,
-    ) -> Result<Value, ConversionError> {
+    #[cfg(test)]
+    fn render(&self, target: Protocol, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
         self.render_with_report(target, caps)
             .map(|(rendered, _)| rendered)
     }
@@ -1474,7 +1475,7 @@ fn is_server_tool(tool: &IrTool) -> bool {
     }
     tool.name
         .as_deref()
-        .is_some_and(crate::messages::is_known_server_tool_name)
+        .is_some_and(crate::server_tools::is_known_name)
 }
 
 /// Short name for a server tool, used to match provider-native policies and map to a
@@ -1483,7 +1484,7 @@ fn is_server_tool(tool: &IrTool) -> bool {
 /// `code_execution`.
 fn server_tool_short_name(tool: &IrTool) -> Option<&str> {
     if let Some(name) = tool.name.as_deref() {
-        if crate::messages::is_known_server_tool_name(name) {
+        if crate::server_tools::is_known_name(name) {
             return Some(match name {
                 "WebSearch" => "web_search",
                 "WebFetch" => "web_fetch",
@@ -1496,12 +1497,12 @@ fn server_tool_short_name(tool: &IrTool) -> Option<&str> {
         "web_search" | "web_search_preview" => Some("web_search"),
         "web_fetch" | "web_fetch_preview" => Some("web_fetch"),
         "code_interpreter" => Some("code_execution"),
-        _ => crate::messages::is_known_server_tool_name(kind).then_some(kind),
+        _ => crate::server_tools::is_known_name(kind).then_some(kind),
     };
     if normalized.is_some() {
         return normalized;
     }
-    for prefix in crate::messages::SERVER_TOOL_TYPE_PREFIXES {
+    for prefix in crate::server_tools::TYPE_PREFIXES {
         if kind.starts_with(prefix) {
             // Versioned Anthropic type (`web_search_20260209`) or a preview variant
             // (`web_search_preview`): the short name is the prefix without the
