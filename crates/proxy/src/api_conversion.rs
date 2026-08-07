@@ -968,6 +968,48 @@ reasoning_effort = { enabled = true, levels = ["high"], default = "high" }
     }
 
     #[test]
+    fn ark_responses_server_tools_render_native_template() {
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "ark"
+listen_addr = "127.0.0.1:0"
+[providers.ark]
+base_url = "https://ark.example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["openai_responses"]
+[providers.ark.capabilities]
+ark_style = true
+server_tools = "provider_native"
+search_tool_template = { type = "web_search", web_search = { search_context_size = "medium" } }
+"#,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "ark-model",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let converted = convert_request_body(
+            &config,
+            "ark",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        let tools = converted["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        // Ark declares the tool flat; normalization flattens the template's OpenAI
+        // sub-object and maps search_context_size to max_keyword.
+        assert!(tools[0].get("web_search").is_none(), "nested object flattened");
+        assert_eq!(tools[0]["max_keyword"], 3);
+    }
+
+    #[test]
     fn strips_previous_response_id_when_responses_translation_is_enabled() {
         let config = Config::from_toml_str(
             r#"

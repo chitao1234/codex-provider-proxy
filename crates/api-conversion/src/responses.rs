@@ -26,6 +26,18 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
         request.insert("thinking".to_string(), json!({"type": thinking_type}));
         request.remove("reasoning");
     }
+    // Ark rejects the official `metadata` and legacy `user` fields (`unknown field
+    // "metadata"` / `unknown field "user"`, observed in practice); the identity/cache
+    // keys they carry are mapped to Ark's `prompt_cache_key` separately. Ark also
+    // enforces a 64-character limit on `prompt_cache_key`; claude's device-id
+    // metadata.user_id JSON exceeds it, so the unusable key is dropped.
+    request.remove("metadata");
+    request.remove("user");
+    if let Some(key) = request.get("prompt_cache_key").and_then(Value::as_str) {
+        if key.len() > 64 {
+            request.remove("prompt_cache_key");
+        }
+    }
     normalize_ark_web_search_tools(request);
 }
 
@@ -37,28 +49,51 @@ fn ark_thinking_type(effort: &str) -> &'static str {
     }
 }
 
+/// Normalize OpenAI-style web_search tools to Ark's flat shape.
+///
+/// Ark declares the tool flat (`{"type":"web_search","max_keyword":3}`) without the
+/// OpenAI `web_search` sub-object; `search_context_size` maps to `max_keyword`
+/// (low=1, medium=3, else 5). Preview/versioned variants (`web_search_preview`,
+/// `web_search_20260209`) normalize to `web_search`.
 fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
-    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
-        for tool in tools {
-            let Some(object) = tool.as_object_mut() else {
-                continue;
-            };
-            if object.get("type").and_then(Value::as_str) != Some("web_search") {
-                continue;
-            }
-            let search = object
-                .entry("web_search".to_string())
-                .or_insert_with(|| json!({}));
-            if let Some(search) = search.as_object_mut() {
-                if let Some(context) = search.remove("search_context_size") {
-                    let max_keyword = match context.as_str() {
-                        Some("low") => 1,
-                        Some("medium") => 3,
-                        _ => 5,
-                    };
-                    search.insert("max_keyword".to_string(), Value::from(max_keyword));
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if kind != "web_search"
+            && kind != "web_search_preview"
+            && !kind.starts_with("web_search_")
+        {
+            continue;
+        }
+        // Flatten the OpenAI sub-object onto the tool.
+        if let Some(nested) = object.remove("web_search") {
+            if let Some(nested) = nested.as_object() {
+                for (key, value) in nested {
+                    object
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
                 }
             }
+        }
+        if let Some(context) = object.remove("search_context_size") {
+            let max_keyword = match context.as_str() {
+                Some("low") => 1,
+                Some("medium") => 3,
+                _ => 5,
+            };
+            object.insert("max_keyword".to_owned(), Value::from(max_keyword));
+        }
+        if kind != "web_search" {
+            object.insert("type".to_owned(), Value::String("web_search".to_owned()));
         }
     }
 }

@@ -25,6 +25,10 @@ pub struct RequestIr {
     pub original: Map<String, Value>,
     pub model: Option<String>,
     pub stream: Option<bool>,
+    /// Output-token budget, protocol-neutral: Messages `max_tokens`, Chat
+    /// `max_tokens`/`max_completion_tokens`, Responses `max_output_tokens`.
+    /// Optional in Chat/Responses; required by the Messages API.
+    pub max_output_tokens: Option<Value>,
     pub transcript: Vec<IrConversationItem>,
     pub instructions: Vec<Value>,
     pub tools: Vec<IrTool>,
@@ -134,11 +138,17 @@ impl RequestIr {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let stream = original.get("stream").and_then(Value::as_bool);
+        let max_output_tokens = original
+            .get("max_tokens")
+            .or_else(|| original.get("max_completion_tokens"))
+            .or_else(|| original.get("max_output_tokens"))
+            .cloned();
         let mut ir = Self {
             protocol,
             original,
             model,
             stream,
+            max_output_tokens,
             transcript: Vec::new(),
             instructions: Vec::new(),
             tools: Vec::new(),
@@ -364,6 +374,12 @@ impl RequestIr {
                     if let Some(content) = value.get("content") {
                         self.instructions.push(content.clone());
                     }
+                } else if value.get("role").and_then(Value::as_str) == Some("developer") {
+                    // Fold OpenAI developer messages into the system instructions; the
+                    // Messages dialect has no developer role.
+                    if let Some(text) = value.get("content").and_then(Value::as_str) {
+                        self.instructions.push(Value::String(text.to_owned()));
+                    }
                 } else {
                     self.parse_message(value, Protocol::OpenAiChatCompletions);
                 }
@@ -409,7 +425,26 @@ impl RequestIr {
         {
             for value in &input {
                 match value.get("type").and_then(Value::as_str) {
-                    Some("message") => self.parse_message(value, Protocol::OpenAiResponses),
+                    Some("message") => {
+                        if value.get("role").and_then(Value::as_str) == Some("developer") {
+                            // OpenAI developer messages carry system-level instructions;
+                            // Anthropic upstreams reject the role, so fold the text into
+                            // the top-level system/instructions.
+                            let text = value
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            if !text.is_empty() {
+                                self.instructions.push(Value::String(text));
+                            }
+                        } else {
+                            self.parse_message(value, Protocol::OpenAiResponses);
+                        }
+                    }
                     Some("function_call") => self.transcript.push(IrConversationItem::Message(
                         IrMessage::assistant_tool_call(IrToolCall::from_responses_call(value)),
                     )),
@@ -417,11 +452,18 @@ impl RequestIr {
                         .transcript
                         .push(IrConversationItem::Reasoning(value.clone())),
                     Some("function_call_output") => {
+                        // A string output is text; a non-string (JSON object) is kept raw.
+                        let output = value.get("output").cloned().unwrap_or(Value::Null);
+                        let content = match output {
+                            Value::String(text) => vec![IrContent::Text {
+                                text,
+                                extra: Map::new(),
+                            }],
+                            other => vec![IrContent::Raw(other)],
+                        };
                         self.transcript.push(IrConversationItem::Message(IrMessage {
                             role: "tool".to_owned(),
-                            content: vec![IrContent::Raw(
-                                value.get("output").cloned().unwrap_or(Value::Null),
-                            )],
+                            content,
                             item_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
                             tool_call_id: value
                                 .get("call_id")
@@ -492,6 +534,9 @@ impl RequestIr {
             "tool_choice",
             "previous_response_id",
             "stream",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
         ];
         for (key, value) in &self.original {
             if !STRUCTURAL.contains(&key.as_str()) {
@@ -518,7 +563,7 @@ impl RequestIr {
         &self,
         caps: &ModelCapabilities,
     ) -> Result<(Value, RequestConversionReport), ConversionError> {
-        let mut rendered = self.render_chat_base(caps)?;
+        let mut rendered = self.render_chat_base()?;
         let report = self.normalize_chat_capabilities(
             caps,
             rendered
@@ -541,7 +586,7 @@ impl RequestIr {
         out
     }
 
-    fn render_chat_base(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+    fn render_chat_base(&self) -> Result<Value, ConversionError> {
         let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiChatCompletions, &mut out);
         for key in [
@@ -553,6 +598,18 @@ impl RequestIr {
             if self.protocol == Protocol::AnthropicMessages {
                 out.remove(key);
             }
+        }
+        // Responses-owned top-level parameters are consumed by the capability
+        // normalization (reasoning.effort, text.format) and must not leak into a
+        // Chat Completions request the upstream does not recognize.
+        if self.protocol == Protocol::OpenAiResponses {
+            out.remove("reasoning");
+            out.remove("text");
+        }
+        // The output budget renders under the provider's preferred field name;
+        // `normalize_chat_capabilities` later clamps and renames it.
+        if let Some(value) = &self.max_output_tokens {
+            out.insert("max_tokens".to_owned(), value.clone());
         }
         let mut messages = Vec::new();
         for instruction in &self.instructions {
@@ -617,7 +674,6 @@ impl RequestIr {
         if let Some(choice) = &self.tool_choice {
             out.insert("tool_choice".to_owned(), choice.clone());
         }
-        normalize_chat_parameters(&mut out, caps);
         Ok(Value::Object(out))
     }
 
@@ -665,36 +721,71 @@ impl RequestIr {
                 "upstream does not support image input",
             ));
         }
-        if let Some(thinking) = self.original.get("thinking") {
-            let thinking_type = thinking.get("type").and_then(Value::as_str);
-            match caps.thinking_param {
-                ThinkingParam::TopLevel => {
+        // Downstream effort arrives as Messages `output_config.effort` or Responses
+        // `reasoning.effort`; both map to the upstream thinking/reasoning controls.
+        let effort = self
+            .original
+            .get("output_config")
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.original
+                    .get("reasoning")
+                    .and_then(Value::as_object)
+                    .and_then(|reasoning| reasoning.get("effort"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let thinking_type = self
+            .original
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str);
+        match caps.thinking_param {
+            ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+                // A Messages thinking block maps its type; a Responses request has no
+                // thinking parameter, so one is synthesized from reasoning.effort.
+                let on = match caps.thinking_param {
+                    ThinkingParam::Adaptive => "adaptive",
+                    _ => "enabled",
+                };
+                let mapped = if self.original.contains_key("thinking") {
+                    // A Messages thinking block maps its type; a missing type means on.
+                    Some(if thinking_type == Some("disabled") { "disabled" } else { on })
+                } else {
+                    // A Responses request has no thinking parameter; synthesize one
+                    // from reasoning.effort.
+                    effort.as_deref().map(|effort| {
+                        if effort == "none" || effort == "minimal" {
+                            "disabled"
+                        } else {
+                            on
+                        }
+                    })
+                };
+                if let Some(mapped) = mapped {
                     out.insert(
                         "thinking".to_owned(),
-                        serde_json::json!({
-                            "type": if thinking_type == Some("disabled") { "disabled" } else { "enabled" }
-                        }),
+                        serde_json::json!({"type": mapped}),
                     );
                 }
-                ThinkingParam::Adaptive => {
-                    out.insert(
-                        "thinking".to_owned(),
-                        serde_json::json!({
-                            "type": if thinking_type == Some("disabled") { "disabled" } else { "adaptive" }
-                        }),
-                    );
-                }
-                ThinkingParam::EnableThinking => {
-                    out.insert(
-                        "enable_thinking".to_owned(),
-                        Value::Bool(thinking_type != Some("disabled")),
-                    );
-                    out.remove("thinking");
-                }
-                ThinkingParam::None => {
-                    out.remove("thinking");
-                    out.remove("enable_thinking");
-                }
+            }
+            ThinkingParam::EnableThinking => {
+                let disabled = thinking_type == Some("disabled")
+                    || effort
+                        .as_deref()
+                        .is_some_and(|effort| effort == "none" || effort == "minimal");
+                out.insert(
+                    "enable_thinking".to_owned(),
+                    Value::Bool(!disabled),
+                );
+                out.remove("thinking");
+            }
+            ThinkingParam::None => {
+                out.remove("thinking");
+                out.remove("enable_thinking");
             }
         }
         if let Some(config) = caps
@@ -702,16 +793,12 @@ impl RequestIr {
             .as_ref()
             .filter(|config| config.enabled)
         {
-            let effort = self
-                .original
-                .get("output_config")
-                .and_then(Value::as_object)
-                .and_then(|config| config.get("effort"))
-                .and_then(Value::as_str)
+            let level = effort
+                .as_deref()
                 .or(config.default.as_deref())
                 .and_then(|effort| caps.clamp_effort(effort));
-            if let Some(effort) = effort {
-                out.insert("reasoning_effort".to_owned(), Value::String(effort));
+            if let Some(level) = level {
+                out.insert("reasoning_effort".to_owned(), Value::String(level));
             }
         }
         if !caps.accept_stop {
@@ -753,6 +840,12 @@ impl RequestIr {
                     Some("tool") => object.get("name").map(
                         |name| serde_json::json!({"type":"function", "function":{"name":name}}),
                     ),
+                    // OpenAI Responses shape: {"type":"function","name":...}.
+                    Some("function") => object.get("name").map(
+                        |name| serde_json::json!({"type":"function", "function":{"name":name}}),
+                    ),
+                    // allowed_tools limits the subset; map to auto (upstream has no equivalent).
+                    Some("allowed_tools") => Some(serde_json::json!("auto")),
                     _ => None,
                 };
                 if let Some(mapped) = mapped {
@@ -760,14 +853,28 @@ impl RequestIr {
                 }
             }
         }
-        if let Some(format) = self
+        let format = self
             .original
             .get("output_config")
             .and_then(Value::as_object)
             .and_then(|config| config.get("format"))
-        {
+            .or_else(|| {
+                // OpenAI Responses shape: {"text": {"format": ...}}.
+                self.original
+                    .get("text")
+                    .and_then(Value::as_object)
+                    .and_then(|text| text.get("format"))
+            });
+        if let Some(format) = format {
             match format.get("type").and_then(Value::as_str).unwrap_or("text") {
                 "text" => {}
+                "json_object" => {
+                    // The simple json_object format is broadly supported; keep it.
+                    out.insert(
+                        "response_format".to_owned(),
+                        serde_json::json!({"type":"json_object"}),
+                    );
+                }
                 "json_schema" => match caps.response_format {
                     ResponseFormatCap::JsonSchema => {
                         out.insert(
@@ -800,96 +907,26 @@ impl RequestIr {
             }
         }
         let mut report = RequestConversionReport::default();
-        let mut rendered_tools = Vec::new();
-        for tool in &self.tools {
-            if is_server_tool_kind(&tool.kind) {
-                let name = tool.name.clone().unwrap_or_else(|| tool.kind.clone());
-                match caps.server_tools {
-                    ServerToolPolicy::Drop => report.dropped_server_tools.push(name),
-                    ServerToolPolicy::MapToFunction => {
-                        if matches!(tool.kind.as_str(), kind if kind.starts_with("web_search") || kind.starts_with("web_fetch"))
-                        {
-                            report.mapped_server_tools.push(name.clone());
-                            rendered_tools.push(server_tool_as_function(tool));
-                        } else {
-                            report.dropped_server_tools.push(name);
-                        }
-                    }
-                    ServerToolPolicy::Passthrough => rendered_tools.push(tool.raw.clone()),
-                    ServerToolPolicy::ProviderNative => {
-                        if tool.kind.starts_with("web_search") {
-                            if let Some(template) = &caps.search_tool_template {
-                                rendered_tools.push(
-                                    crate::conversion_utils::render_search_tool_template(
-                                        template,
-                                        self.last_user_text().as_deref(),
-                                    ),
-                                );
-                                report.mapped_server_tools.push(name);
-                            } else if caps.search_request_params.is_some() {
-                                report.mapped_server_tools.push(name);
-                            } else {
-                                report.dropped_server_tools.push(name);
-                            }
-                        } else if (tool.kind.starts_with("web_fetch")
-                            && caps.fetch_request_params.is_some())
-                            || (tool.kind.starts_with("code_execution")
-                                && caps.code_interpreter_request_params.is_some())
-                        {
-                            report.mapped_server_tools.push(name);
-                        } else {
-                            report.dropped_server_tools.push(name);
-                        }
-                    }
-                }
-            } else {
-                rendered_tools.push(tool.to_chat());
-            }
-        }
+        let rendered_tools = render_tools_with_policy(
+            &self.tools,
+            caps,
+            &mut report,
+            IrTool::to_chat,
+            |tool| {
+                let (name, description, parameters) = server_tool_function_shape(tool);
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": name, "description": description, "parameters": parameters}
+                })
+            },
+            self.last_user_text().as_deref(),
+        );
         if !rendered_tools.is_empty() {
             out.insert("tools".to_owned(), Value::Array(rendered_tools));
         } else {
             out.remove("tools");
         }
-        if !report.mapped_server_tools.is_empty() {
-            for (tool_name, params) in [
-                ("web_search", caps.search_request_params.as_ref()),
-                ("web_fetch", caps.fetch_request_params.as_ref()),
-                (
-                    "code_execution",
-                    caps.code_interpreter_request_params.as_ref(),
-                ),
-            ] {
-                if report
-                    .mapped_server_tools
-                    .iter()
-                    .any(|name| name == tool_name)
-                {
-                    if let Some(Value::Object(params)) = params {
-                        out.extend(params.clone());
-                    }
-                }
-            }
-        }
-        for tool_name in &caps.always_enable_tools {
-            report.mapped_server_tools.push(tool_name.clone());
-            let params = match tool_name.as_str() {
-                "web_search" => caps.search_request_params.as_ref(),
-                "web_fetch" => caps.fetch_request_params.as_ref(),
-                "code_execution" => caps.code_interpreter_request_params.as_ref(),
-                _ => None,
-            };
-            if let Some(Value::Object(params)) = params {
-                out.extend(params.clone());
-            }
-        }
-        if report
-            .mapped_server_tools
-            .iter()
-            .any(|name| name == "code_execution")
-        {
-            out.insert("stream".to_owned(), Value::Bool(true));
-        }
+        merge_native_params(out, caps, &mut report, self.last_user_text().as_deref());
         Ok(report)
     }
 
@@ -912,31 +949,99 @@ impl RequestIr {
         })
     }
 
-    fn render_messages(&self, _caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+    fn render_messages(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+        if self
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                IrConversationItem::Message(message) => Some(message),
+                IrConversationItem::Reasoning(_) => None,
+            })
+            .flat_map(|message| message.content.iter())
+            .any(|content| matches!(content, IrContent::Image(_)))
+            && !caps.image_input
+        {
+            return Err(ConversionError::unsupported(
+                "messages[].content.image",
+                "upstream does not support image input",
+            ));
+        }
         let mut out = self.base_output();
         self.apply_context(Protocol::AnthropicMessages, &mut out);
-        if let Some(value) = out.remove("max_completion_tokens") {
-            out.insert("max_tokens".to_owned(), value);
+        // The Messages API requires max_tokens (no default; Kimi rejects a missing
+        // field with 400). Clients speaking Chat/Responses may omit their optional
+        // output budget (e.g. Codex without model metadata), so use the provider's
+        // configured default when present, then clamp to the provider cap.
+        let max_tokens = self
+            .max_output_tokens
+            .clone()
+            .or_else(|| caps.default_max_tokens.map(Value::from))
+            .unwrap_or(Value::Null);
+        if !max_tokens.is_null() {
+            let max_tokens = max_tokens.as_u64().map_or(max_tokens, |value| {
+                serde_json::json!(
+                    caps.max_tokens_cap.map_or(value, |cap| value.min(cap))
+                )
+            });
+            out.insert("max_tokens".to_owned(), max_tokens);
         }
-        if let Some(value) = out.remove("max_output_tokens") {
-            out.insert("max_tokens".to_owned(), value);
-        }
+        // Responses reasoning.effort maps to the upstream Messages thinking parameter
+        // (Messages providers do not speak `output_config`).
         if let Some(reasoning) = out.remove("reasoning") {
-            if let Some(effort) = reasoning.get("effort") {
-                out.insert(
-                    "output_config".to_owned(),
-                    serde_json::json!({"effort": effort}),
-                );
+            let effort = reasoning
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match caps.thinking_param {
+                ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+                    let on = match caps.thinking_param {
+                        ThinkingParam::Adaptive => "adaptive",
+                        _ => "enabled",
+                    };
+                    if let Some(effort) = &effort {
+                        let thinking_type = if effort == "none" || effort == "minimal" {
+                            "disabled"
+                        } else {
+                            on
+                        };
+                        out.insert(
+                            "thinking".to_owned(),
+                            serde_json::json!({"type": thinking_type}),
+                        );
+                    }
+                }
+                ThinkingParam::EnableThinking => {
+                    let enabled = effort
+                        .as_deref()
+                        .is_none_or(|effort| effort != "none" && effort != "minimal");
+                    out.insert("enable_thinking".to_owned(), Value::Bool(enabled));
+                }
+                ThinkingParam::None => {}
+            }
+        }
+        if self.protocol == Protocol::OpenAiResponses {
+            // `text` carries Responses output configuration; consumed by the
+            // thinking mapping above (format has no Messages equivalent).
+            out.remove("text");
+        }
+        // Chat `stop` maps to the Messages `stop_sequences` array.
+        if let Some(stop) = out.remove("stop") {
+            let sequences = match stop {
+                Value::String(text) if !text.is_empty() => vec![Value::String(text)],
+                Value::Array(values) => values
+                    .into_iter()
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !sequences.is_empty() {
+                out.insert("stop_sequences".to_owned(), Value::Array(sequences));
             }
         }
         if !self.instructions.is_empty() {
             out.insert(
                 "system".to_owned(),
-                if self.instructions.len() == 1 {
-                    self.instructions[0].clone()
-                } else {
-                    Value::Array(self.instructions.clone())
-                },
+                Value::String(instructions_text(&self.instructions)),
             );
         }
         let mut messages = Vec::new();
@@ -954,29 +1059,71 @@ impl RequestIr {
             }
         }
         out.insert("messages".to_owned(), Value::Array(messages));
-        if !self.tools.is_empty() {
-            out.insert(
-                "tools".to_owned(),
-                Value::Array(self.tools.iter().map(IrTool::to_messages).collect()),
-            );
+        let mut report = RequestConversionReport::default();
+        let rendered_tools = render_tools_with_policy(
+            &self.tools,
+            caps,
+            &mut report,
+            IrTool::to_messages,
+            |tool| {
+                let (name, description, parameters) = server_tool_function_shape(tool);
+                serde_json::json!({
+                    "name": name,
+                    "description": description,
+                    "input_schema": parameters,
+                })
+            },
+            self.last_user_text().as_deref(),
+        );
+        if !rendered_tools.is_empty() {
+            out.insert("tools".to_owned(), Value::Array(rendered_tools));
+        } else {
+            out.remove("tools");
         }
         if let Some(choice) = &self.tool_choice {
-            out.insert("tool_choice".to_owned(), choice.clone());
+            out.insert(
+                "tool_choice".to_owned(),
+                render_messages_tool_choice(choice),
+            );
         }
         Ok(Value::Object(out))
     }
 
     fn render_responses(&self, caps: &ModelCapabilities) -> Result<Value, ConversionError> {
+        if self
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                IrConversationItem::Message(message) => Some(message),
+                IrConversationItem::Reasoning(_) => None,
+            })
+            .flat_map(|message| message.content.iter())
+            .any(|content| matches!(content, IrContent::Image(_)))
+            && !caps.image_input
+        {
+            return Err(ConversionError::unsupported(
+                "messages[].content.image",
+                "upstream does not support image input",
+            ));
+        }
         let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiResponses, &mut out);
+        // Anthropic-owned parameters with no Responses equivalent are dropped
+        // (`context_management` carries claude's edit-tool directives such as
+        // clear_thinking, rejected by Ark). `metadata` and `cache_control` are
+        // legal Responses fields or mapped by `apply_context` and stay; Ark
+        // strips `metadata` under `ark_style`.
+        if self.protocol == Protocol::AnthropicMessages {
+            out.remove("context_management");
+        }
+        // Responses `max_output_tokens` is optional; pass the client budget through.
+        if let Some(value) = &self.max_output_tokens {
+            out.insert("max_output_tokens".to_owned(), value.clone());
+        }
         if !self.instructions.is_empty() {
             out.insert(
                 "instructions".to_owned(),
-                if self.instructions.len() == 1 {
-                    self.instructions[0].clone()
-                } else {
-                    Value::Array(self.instructions.clone())
-                },
+                Value::String(instructions_text(&self.instructions)),
             );
         }
         let mut input = Vec::new();
@@ -989,14 +1136,34 @@ impl RequestIr {
             }
         }
         out.insert("input".to_owned(), Value::Array(input));
-        if !self.tools.is_empty() {
-            out.insert(
-                "tools".to_owned(),
-                Value::Array(self.tools.iter().map(IrTool::to_responses).collect()),
-            );
+        let mut report = RequestConversionReport::default();
+        let rendered_tools = render_tools_with_policy(
+            &self.tools,
+            caps,
+            &mut report,
+            IrTool::to_responses,
+            |tool| {
+                let (name, description, parameters) = server_tool_function_shape(tool);
+                serde_json::json!({
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                })
+            },
+            self.last_user_text().as_deref(),
+        );
+        if !rendered_tools.is_empty() {
+            out.insert("tools".to_owned(), Value::Array(rendered_tools));
+        } else {
+            out.remove("tools");
         }
+        merge_native_params(&mut out, caps, &mut report, self.last_user_text().as_deref());
         if let Some(choice) = &self.tool_choice {
-            out.insert("tool_choice".to_owned(), choice.clone());
+            out.insert(
+                "tool_choice".to_owned(),
+                render_responses_tool_choice(choice),
+            );
         }
         normalize_responses_parameters(&mut out, caps);
         Ok(Value::Object(out))
@@ -1123,60 +1290,240 @@ fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
     }
 }
 
-fn normalize_chat_parameters(out: &mut Map<String, Value>, caps: &ModelCapabilities) {
-    if let Some(value) = out.remove("max_output_tokens") {
-        out.insert(
-            match caps.max_tokens_field {
-                crate::dialect::MaxTokensField::MaxTokens => "max_tokens",
-                crate::dialect::MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+/// Render the tools array under the provider's server-tool policy, shared by the
+/// Chat and Responses renderers. `render_plain` renders a normal function tool in the
+/// target dialect; `render_mapped` renders a mapped server tool as a function tool.
+fn render_tools_with_policy(
+    tools: &[IrTool],
+    caps: &ModelCapabilities,
+    report: &mut RequestConversionReport,
+    render_plain: impl Fn(&IrTool) -> Value,
+    render_mapped: impl Fn(&IrTool) -> Value,
+    last_user_query: Option<&str>,
+) -> Vec<Value> {
+    let mut rendered_tools = Vec::new();
+    for tool in tools {
+        if is_server_tool(tool) {
+            let name = tool.name.clone().unwrap_or_else(|| tool.kind.clone());
+            match caps.server_tools {
+                ServerToolPolicy::Drop => report.dropped_server_tools.push(name),
+                ServerToolPolicy::MapToFunction => {
+                    if matches!(server_tool_short_name(tool), Some("web_search" | "web_fetch")) {
+                        let short = server_tool_short_name(tool).expect("matched above");
+                        report
+                            .mapped_server_tools
+                            .push(short.to_owned());
+                        rendered_tools.push(render_mapped(tool));
+                    } else {
+                        report.dropped_server_tools.push(name);
+                    }
+                }
+                ServerToolPolicy::Passthrough => rendered_tools.push(tool.raw.clone()),
+                ServerToolPolicy::ProviderNative => match server_tool_short_name(tool) {
+                    Some("web_search") => {
+                        if let Some(template) = &caps.search_tool_template {
+                            rendered_tools.push(
+                                crate::conversion_utils::render_search_tool_template(
+                                    template,
+                                    last_user_query,
+                                ),
+                            );
+                            report
+                                .mapped_server_tools
+                                .push("web_search".to_owned());
+                        } else if caps.search_request_params.is_some() {
+                            report
+                                .mapped_server_tools
+                                .push("web_search".to_owned());
+                        } else {
+                            report.dropped_server_tools.push(name);
+                        }
+                    }
+                    Some("web_fetch") if caps.fetch_request_params.is_some() => {
+                        report.mapped_server_tools.push("web_fetch".to_owned());
+                    }
+                    Some("code_execution") if caps.code_interpreter_request_params.is_some() => {
+                        report
+                            .mapped_server_tools
+                            .push("code_execution".to_owned());
+                    }
+                    _ => report.dropped_server_tools.push(name),
+                },
             }
-            .to_owned(),
-            value,
-        );
+        } else {
+            rendered_tools.push(render_plain(tool));
+        }
+    }
+    rendered_tools
+}
+
+/// Merge top-level provider-native request parameters for mapped and always-enabled
+/// server tools (e.g. qwen's `enable_search`). Search parameters may embed a
+/// `{search_query}` placeholder resolved with the last user text.
+fn merge_native_params(
+    out: &mut Map<String, Value>,
+    caps: &ModelCapabilities,
+    report: &mut RequestConversionReport,
+    last_user_query: Option<&str>,
+) {
+    if !report.mapped_server_tools.is_empty() {
+        for (tool_name, params) in [
+            ("web_search", caps.search_request_params.as_ref()),
+            ("web_fetch", caps.fetch_request_params.as_ref()),
+            (
+                "code_execution",
+                caps.code_interpreter_request_params.as_ref(),
+            ),
+        ] {
+            if report
+                .mapped_server_tools
+                .iter()
+                .any(|name| name == tool_name)
+            {
+                if let Some(params) = params {
+                    let rendered = if tool_name == "web_search" {
+                        crate::conversion_utils::render_search_tool_template(
+                            params,
+                            last_user_query,
+                        )
+                    } else {
+                        params.clone()
+                    };
+                    if let Value::Object(rendered) = rendered {
+                        out.extend(rendered);
+                    }
+                }
+            }
+        }
+    }
+    for tool_name in &caps.always_enable_tools {
+        let normalized = match tool_name.as_str() {
+            "WebSearch" => "web_search",
+            "WebFetch" => "web_fetch",
+            "CodeExecution" => "code_execution",
+            other => other,
+        };
+        if report
+            .mapped_server_tools
+            .iter()
+            .any(|mapped| mapped == normalized)
+        {
+            continue;
+        }
+        report
+            .mapped_server_tools
+            .push(normalized.to_owned());
+        let params = match normalized {
+            "web_search" => caps.search_request_params.as_ref(),
+            "web_fetch" => caps.fetch_request_params.as_ref(),
+            "code_execution" => caps.code_interpreter_request_params.as_ref(),
+            _ => None,
+        };
+        if let Some(params) = params {
+            let rendered = if normalized == "web_search" {
+                crate::conversion_utils::render_search_tool_template(params, last_user_query)
+            } else {
+                params.clone()
+            };
+            if let Value::Object(rendered) = rendered {
+                out.extend(rendered);
+            }
+        }
+    }
+    if report
+        .mapped_server_tools
+        .iter()
+        .any(|name| name == "code_execution")
+    {
+        out.insert("stream".to_owned(), Value::Bool(true));
     }
 }
 
-fn is_server_tool_kind(kind: &str) -> bool {
-    kind.starts_with("web_search")
-        || kind.starts_with("web_fetch")
-        || kind.starts_with("code_execution")
-        || kind.starts_with("tool_search")
-        || kind.starts_with("computer_")
+/// Whether a parsed tool is a server-side tool (has a non-function type, or a recognized
+/// server tool name). Mirrors the Messages-dialect `is_server_tool`: any explicit
+/// non-`function`/`custom` type (`web_search_20260209`, `file_search`, `bash`, ...) and
+/// the well-known camelCase names (`WebSearch`, `WebFetch`) count as server tools, so the
+/// `ServerToolPolicy` applies to them instead of leaking a raw definition upstream.
+fn is_server_tool(tool: &IrTool) -> bool {
+    let kind = tool.kind.as_str();
+    if kind != "function" && kind != "custom" && !kind.is_empty() {
+        return true;
+    }
+    tool.name
+        .as_deref()
+        .is_some_and(crate::messages::is_known_server_tool_name)
 }
 
-fn server_tool_as_function(tool: &IrTool) -> Value {
-    let name = tool
-        .name
-        .clone()
-        .unwrap_or_else(|| tool.kind.replace('-', "_"));
-    let parameters = match tool.kind.as_str() {
-        kind if kind.starts_with("web_search") => {
-            serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
+/// Short name for a server tool, used to match provider-native policies and map to a
+/// function tool: `web_search_20260209` -> `web_search`, `WebSearch` -> `web_search`,
+/// OpenAI-style `web_search_preview` -> `web_search`, `code_interpreter` ->
+/// `code_execution`.
+fn server_tool_short_name(tool: &IrTool) -> Option<&str> {
+    if let Some(name) = tool.name.as_deref() {
+        if crate::messages::is_known_server_tool_name(name) {
+            return Some(match name {
+                "WebSearch" => "web_search",
+                "WebFetch" => "web_fetch",
+                other => other,
+            });
         }
-        kind if kind.starts_with("web_fetch") => {
-            serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})
-        }
-        _ => tool
-            .parameters
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+    }
+    let kind = tool.kind.as_str();
+    let normalized = match kind {
+        "web_search" | "web_search_preview" => Some("web_search"),
+        "web_fetch" | "web_fetch_preview" => Some("web_fetch"),
+        "code_interpreter" => Some("code_execution"),
+        _ => crate::messages::is_known_server_tool_name(kind).then_some(kind),
     };
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": tool.description.clone().unwrap_or_default(),
-            "parameters": parameters
+    if normalized.is_some() {
+        return normalized;
+    }
+    for prefix in crate::messages::SERVER_TOOL_TYPE_PREFIXES {
+        if kind.starts_with(prefix) {
+            // Versioned Anthropic type (`web_search_20260209`) or a preview variant
+            // (`web_search_preview`): the short name is the prefix without the
+            // trailing underscore.
+            return Some(prefix.trim_end_matches('_'));
         }
-    })
+    }
+    None
 }
 
-fn normalize_responses_parameters(out: &mut Map<String, Value>, _caps: &ModelCapabilities) {
-    if let Some(value) = out.remove("max_tokens") {
-        out.insert("max_output_tokens".to_owned(), value);
+/// The function-tool shape for a mapped server tool (`ServerToolPolicy::MapToFunction`).
+/// The mapped function name is the normalized short name (`web_search`), matching what
+/// the upstream's own search function would be called.
+fn server_tool_function_shape(tool: &IrTool) -> (String, String, Value) {
+    let name = server_tool_short_name(tool)
+        .map(str::to_owned)
+        .unwrap_or_else(|| tool.name.clone().unwrap_or_else(|| tool.kind.replace('-', "_")));
+    match server_tool_short_name(tool) {
+        Some("web_search") => (
+            name,
+            "Search the web for current information. Call this when the user asks about current events, recent information, or anything that may have changed since the model's knowledge cutoff.".to_owned(),
+            serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]}),
+        ),
+        Some("web_fetch") => (
+            name,
+            "Fetch the content of a specific URL. Call this when you need the full content of a page the user referenced.".to_owned(),
+            serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"}},"required":["url"]}),
+        ),
+        _ => (
+            name,
+            tool.description.clone().unwrap_or_default(),
+            tool.parameters
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+        ),
     }
-    if let Some(value) = out.remove("max_completion_tokens") {
-        out.insert("max_output_tokens".to_owned(), value);
+}
+
+fn normalize_responses_parameters(out: &mut Map<String, Value>, caps: &ModelCapabilities) {
+    if let Some(value) = out.get_mut("max_output_tokens") {
+        if let Some(cap) = caps.max_tokens_cap {
+            if let Some(number) = value.as_u64() {
+                *value = Value::Number(number.min(cap).into());
+            }
+        }
     }
     if let Some(value) = out.remove("reasoning_effort") {
         out.insert("reasoning".to_owned(), serde_json::json!({"effort": value}));
@@ -1187,9 +1534,97 @@ fn normalize_responses_parameters(out: &mut Map<String, Value>, _caps: &ModelCap
                 "reasoning".to_owned(),
                 serde_json::json!({"effort": effort}),
             );
-        } else {
-            out.insert("output_config".to_owned(), value);
         }
+        if let Some(format) = value.get("format") {
+            // Messages structured-output request maps to Responses text.format.
+            let text = out
+                .entry("text".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(text) = text.as_object_mut() {
+                text.insert("format".to_owned(), format.clone());
+            }
+        }
+    }
+    // Messages stop_sequences -> Responses `stop`.
+    if let Some(sequences) = out
+        .remove("stop_sequences")
+        .and_then(|value| value.as_array().cloned())
+    {
+        let sequences: Vec<Value> = sequences
+            .iter()
+            .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+            .cloned()
+            .collect();
+        if !sequences.is_empty() {
+            out.insert(
+                "stop".to_owned(),
+                if sequences.len() == 1 {
+                    sequences[0].clone()
+                } else {
+                    Value::Array(sequences)
+                },
+            );
+        }
+    }
+}
+
+/// Map a chat/responses tool_choice into the Messages dialect
+/// (`{"type": "auto"|"any"|"none"|"tool", "name": ...}`).
+fn render_messages_tool_choice(choice: &Value) -> Value {
+    match choice {
+        Value::String(value) => match value.as_str() {
+            "required" => serde_json::json!({"type": "any"}),
+            other => serde_json::json!({"type": other}),
+        },
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("auto") | Some("any") | Some("none") | Some("tool") => choice.clone(),
+            Some("function") => object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| object.get("name").and_then(Value::as_str))
+                .map(|name| serde_json::json!({"type":"tool", "name": name}))
+                .unwrap_or_else(|| serde_json::json!({"type":"auto"})),
+            _ => serde_json::json!({"type":"auto"}),
+        },
+        _ => serde_json::json!({"type":"auto"}),
+    }
+}
+
+/// Map a messages/chat tool_choice into the Responses dialect
+/// (`"auto"|"required"|"none"` or `{"type": "function", "name": ...}`).
+fn render_responses_tool_choice(choice: &Value) -> Value {
+    match choice {
+        Value::String(value) => Value::String(value.clone()),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => object
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    object
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .map(|name| serde_json::json!({"type":"function", "name": name}))
+                .unwrap_or_else(|| serde_json::json!("auto")),
+            Some("tool") => object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| serde_json::json!({"type":"function", "name": name}))
+                .unwrap_or_else(|| serde_json::json!("auto")),
+            Some("auto") | Some("any") | Some("none") | Some("required") => {
+                match object.get("type").and_then(Value::as_str) {
+                    Some("any") => serde_json::json!("required"),
+                    Some(other) => serde_json::json!(other),
+                    _ => serde_json::json!("auto"),
+                }
+            }
+            _ => serde_json::json!("auto"),
+        },
+        _ => serde_json::json!("auto"),
     }
 }
 
@@ -1472,6 +1907,14 @@ impl IrMessage {
                     "output":content
                 })),
                 IrContent::ToolUse(call) => values.push(call.to_responses()),
+                // Anthropic thinking blocks have no Responses content type; they become
+                // standalone reasoning items preceding the assistant message.
+                IrContent::Thinking { text, .. } if !text.trim().is_empty() => {
+                    values.push(serde_json::json!({
+                        "type":"reasoning",
+                        "summary":[{"type":"summary_text","text":text}]
+                    }));
+                }
                 _ => content.push(part.to_responses(&self.role)),
             }
         }
@@ -1481,6 +1924,28 @@ impl IrMessage {
         values.extend(self.tool_calls.iter().map(IrToolCall::to_responses));
         values
     }
+}
+
+/// Join the collected system instructions into one string. Instruction entries may be
+/// strings or Anthropic system block arrays; the Messages/Responses dialects take a
+/// single system string, and some Anthropic-compatible upstreams (GLM) reject arrays.
+fn instructions_text(instructions: &[Value]) -> String {
+    instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(blocks) => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn content_as_chat(content: &[IrContent]) -> Value {
@@ -1623,11 +2088,23 @@ impl IrToolCall {
     }
 
     fn to_messages_block(&self) -> Value {
-        serde_json::json!({"type":"tool_use", "id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "name":self.name, "input":self.arguments})
+        // Anthropic tool_use.input must be an object; Chat/Responses carry arguments
+        // as a JSON string, so parse it.
+        let input = match &self.arguments {
+            Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({})),
+            value => value.clone(),
+        };
+        serde_json::json!({"type":"tool_use", "id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "name":self.name, "input":input})
     }
 
     fn to_responses(&self) -> Value {
-        serde_json::json!({"type":"function_call", "id":self.id, "call_id":self.call_id.clone().or(self.id.clone()), "name":self.name, "arguments":self.arguments})
+        // Responses function_call.arguments must be a JSON string; Messages input is an
+        // object, so serialize it.
+        let arguments = match &self.arguments {
+            Value::String(value) => value.clone(),
+            value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
+        };
+        serde_json::json!({"type":"function_call", "id":self.id, "call_id":self.call_id.clone().or(self.id.clone()), "name":self.name, "arguments":arguments})
     }
 }
 
@@ -1697,6 +2174,7 @@ impl IrTool {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| self.raw.as_object().cloned().unwrap_or_default());
+        function.remove("input_schema");
         function.insert(
             "name".to_owned(),
             Value::String(self.name.clone().unwrap_or_default()),
@@ -1724,6 +2202,11 @@ impl IrTool {
         let mut object = self.raw.as_object().cloned().unwrap_or_default();
         object.remove("type");
         object.remove("function");
+        // Chat/Responses tool definitions carry `parameters`/`strict`/nested `tools`;
+        // the Messages dialect accepts only `input_schema`.
+        object.remove("parameters");
+        object.remove("strict");
+        object.remove("tools");
         object.insert(
             "name".to_owned(),
             Value::String(self.name.clone().unwrap_or_default()),
@@ -1746,6 +2229,7 @@ impl IrTool {
             return self.raw.clone();
         }
         let mut object = self.raw.as_object().cloned().unwrap_or_default();
+        object.remove("input_schema");
         object.insert("type".to_owned(), Value::String("function".to_owned()));
         object.insert(
             "name".to_owned(),
@@ -2043,6 +2527,254 @@ mod tests {
             .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
         assert_eq!(responses["prompt_cache_key"], "anthropic-cache-user");
+    }
+
+    #[test]
+    fn responses_reasoning_effort_maps_to_thinking_and_effort() {
+        let mut caps = ModelCapabilities::default();
+        caps.thinking_param = ThinkingParam::TopLevel;
+        caps.reasoning_effort = Some(crate::dialect::ReasoningEffortConfig {
+            enabled: true,
+            levels: vec!["low".into(), "high".into(), "max".into()],
+            default: None,
+        });
+        let request = json!({
+            "model": "m",
+            "max_output_tokens": 1,
+            "input": "hi",
+            "reasoning": {"effort": "xhigh"},
+            "text": {"format": {"type": "json_object"}}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
+        assert_eq!(chat["thinking"]["type"], "enabled");
+        assert_eq!(chat["reasoning_effort"], "high");
+        assert_eq!(chat["response_format"]["type"], "json_object");
+        // Responses-owned parameters are consumed, not leaked.
+        assert!(chat.get("reasoning").is_none());
+        assert!(chat.get("text").is_none());
+    }
+
+    #[test]
+    fn responses_reasoning_effort_minimal_disables_thinking() {
+        let mut caps = ModelCapabilities::default();
+        caps.thinking_param = ThinkingParam::Adaptive;
+        let request = json!({"model": "m", "input": "hi", "reasoning": {"effort": "minimal"}});
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
+        assert_eq!(chat["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn responses_tool_choice_function_maps_to_chat_shape() {
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "tool_choice": {"type": "function", "name": "f"}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(chat["tool_choice"]["type"], "function");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "f");
+
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "tool_choice": {"type": "allowed_tools", "allowed_tools": ["web_search"]}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn responses_server_tools_map_to_native_params_with_query_substitution() {
+        let mut caps = ModelCapabilities::default();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.always_enable_tools = vec!["web_search".to_string(), "code_execution".to_string()];
+        caps.search_request_params = Some(json!({
+            "web_search": {"enable": true, "search_query": "{search_query}"}
+        }));
+        caps.code_interpreter_request_params = Some(json!({"enable_code_interpreter": true}));
+        let request = json!({
+            "model": "m",
+            "input": "what's the weather in Paris?",
+            "stream": false,
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let (chat, report) = ir.render_chat_with_capabilities(&caps).unwrap();
+        assert_eq!(chat["web_search"]["enable"], true);
+        assert!(chat["web_search"]["search_query"]
+            .as_str()
+            .unwrap()
+            .contains("Paris"));
+        assert_eq!(chat["enable_code_interpreter"], true);
+        assert_eq!(chat["stream"], true);
+        assert_eq!(report.mapped_server_tools.len(), 2);
+        assert!(report.dropped_server_tools.is_empty());
+    }
+
+    #[test]
+    fn broad_server_tool_kinds_are_dropped_or_mapped() {
+        // file_search / bash / camelCase custom tools must be treated as server tools.
+        let mut caps = ModelCapabilities::default();
+        caps.server_tools = ServerToolPolicy::MapToFunction;
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "file_search", "name": "file_search"},
+                {"type": "custom", "name": "WebSearch"},
+                {"type": "bash_20250124", "name": "bash"},
+                {"name": "Read", "input_schema": {"type": "object"}}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let (chat, report) = ir.render_chat_with_capabilities(&caps).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2); // WebSearch mapped + Read kept
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+        assert_eq!(report.mapped_server_tools, vec!["web_search"]);
+        assert_eq!(report.dropped_server_tools, vec!["file_search", "bash"]);
+    }
+
+    #[test]
+    fn responses_to_messages_maps_effort_to_thinking() {
+        let mut caps = ModelCapabilities::default();
+        caps.thinking_param = ThinkingParam::Adaptive;
+        let request = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "reasoning": {"effort": "high"}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
+        assert_eq!(messages["thinking"]["type"], "adaptive");
+        assert!(messages.get("output_config").is_none());
+    }
+
+    #[test]
+    fn responses_renderer_applies_server_tool_policy() {
+        let mut caps = ModelCapabilities::default();
+        caps.server_tools = ServerToolPolicy::ProviderNative;
+        caps.search_tool_template = Some(json!({
+            "type": "web_search",
+            "web_search": {"search_context_size": "medium"}
+        }));
+        let request = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &caps)
+            .unwrap();
+        let tools = responses["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["web_search"]["search_context_size"], "medium");
+    }
+
+    #[test]
+    fn messages_to_responses_maps_tool_choice() {
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "f"}
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["tool_choice"]["type"], "function");
+        assert_eq!(responses["tool_choice"]["name"], "f");
+    }
+
+    #[test]
+    fn chat_to_messages_maps_stop_and_tool_choice() {
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["END"],
+            "tool_choice": {"type": "function", "function": {"name": "f"}}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(messages["stop_sequences"][0], "END");
+        assert_eq!(messages["tool_choice"]["type"], "tool");
+        assert_eq!(messages["tool_choice"]["name"], "f");
+    }
+
+    #[test]
+    fn responses_to_messages_stop_sequences_map_to_stop() {
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["END"]
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["stop"], "END");
+    }
+
+    #[test]
+    fn render_messages_drops_namespace_tools_and_strips_chat_fields() {
+        // Codex declares a `multi_agent_v1` namespace tool (nested `tools`, no schema)
+        // alongside plain function tools with `parameters`/`strict`. The Messages renderer
+        // must apply the server-tool policy (dropping the namespace) and strip the
+        // chat-only `parameters`/`strict` fields.
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "name": "exec_command",
+                 "description": "run", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}, "strict": false},
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "description": "subagents", "tools": [{"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        let tools = messages["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "namespace tool dropped, function tool kept");
+        assert_eq!(tools[0]["name"], "exec_command");
+        assert!(tools[0].get("parameters").is_none(), "parameters stripped");
+        assert!(tools[0].get("strict").is_none(), "strict stripped");
+        assert_eq!(tools[0]["input_schema"]["properties"]["cmd"]["type"], "string");
+    }
+
+    #[test]
+    fn messages_render_default_max_tokens_when_client_omits_budget() {
+        // Chat/Responses clients may omit the optional output budget; the Messages
+        // API requires max_tokens, so the provider-configured default is rendered.
+        let request = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+        // Without a configured default the omission is preserved.
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert!(messages.get("max_tokens").is_none());
+
+        let mut caps = ModelCapabilities::default();
+        caps.default_max_tokens = Some(8192);
+        caps.max_tokens_cap = Some(4096);
+        let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
+        assert_eq!(messages["max_tokens"], 4096, "default clamped by cap");
     }
 
     #[test]

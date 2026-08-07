@@ -151,6 +151,11 @@ pub struct ModelCapabilities {
     /// `None` passes the downstream value through unchanged.
     #[serde(default)]
     pub max_tokens_cap: Option<u64>,
+    /// Default output-token budget rendered when the client omits its optional budget
+    /// (Chat/Responses allow omission) and the target Messages API requires `max_tokens`
+    /// (e.g. Kimi rejects a missing field). `None` keeps the omission.
+    #[serde(default)]
+    pub default_max_tokens: Option<u64>,
     /// Native search tool template for `ServerToolPolicy::ProviderNative` (e.g.
     /// `{"type":"web_search","web_search":{"search_result":true}}` for glm). The optional
     /// `{search_query}` placeholder is replaced with the last user message.
@@ -210,6 +215,7 @@ impl Default for ModelCapabilities {
             response_format: ResponseFormatCap::JsonObject,
             stream_include_usage: true,
             max_tokens_cap: None,
+            default_max_tokens: None,
             search_tool_template: None,
             search_request_params: None,
             fetch_request_params: None,
