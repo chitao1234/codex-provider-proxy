@@ -87,19 +87,44 @@ struct IrMessage {
     item_id: Option<String>,
     tool_call_id: Option<String>,
     tool_calls: Vec<IrToolCall>,
-    extra: Map<String, Value>,
+    opaque_extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ContentExtensions {
+    cache_control: Option<Value>,
+    opaque: Map<String, Value>,
+}
+
+impl ContentExtensions {
+    fn parse(object: &Map<String, Value>, structural: &[&str]) -> Self {
+        Self {
+            cache_control: object.get("cache_control").cloned(),
+            opaque: opaque_fields(object, structural),
+        }
+    }
+
+    fn render(&self, keep_cache_control: bool) -> Map<String, Value> {
+        let mut object = self.opaque.clone();
+        if keep_cache_control {
+            if let Some(cache_control) = &self.cache_control {
+                object.insert("cache_control".to_owned(), cache_control.clone());
+            }
+        }
+        object
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum IrContent {
     Text {
         text: String,
-        extra: Map<String, Value>,
+        extensions: ContentExtensions,
     },
     Thinking {
         text: String,
         signature: Option<String>,
-        extra: Map<String, Value>,
+        extensions: ContentExtensions,
     },
     Image(Value),
     ToolUse(IrToolCall),
@@ -107,7 +132,7 @@ enum IrContent {
         call_id: String,
         content: Value,
         is_error: bool,
-        extra: Map<String, Value>,
+        extensions: ContentExtensions,
     },
     Raw(Value),
 }
@@ -118,7 +143,6 @@ struct IrToolCall {
     call_id: Option<String>,
     name: String,
     arguments: Value,
-    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -395,12 +419,12 @@ impl RequestIr {
                     role: "user".to_owned(),
                     content: vec![IrContent::Text {
                         text: text.to_owned(),
-                        extra: Map::new(),
+                        extensions: ContentExtensions::default(),
                     }],
                     item_id: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
-                    extra: Map::new(),
+                    opaque_extensions: Map::new(),
                 }));
             }
         }
@@ -429,7 +453,7 @@ impl RequestIr {
                         let content = match output {
                             Value::String(text) => vec![IrContent::Text {
                                 text,
-                                extra: Map::new(),
+                                extensions: ContentExtensions::default(),
                             }],
                             other => vec![IrContent::Raw(other)],
                         };
@@ -442,7 +466,10 @@ impl RequestIr {
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
                             tool_calls: Vec::new(),
-                            extra: Map::new(),
+                            opaque_extensions: opaque_fields(
+                                value.as_object().unwrap_or(&Map::new()),
+                                &["id", "type", "call_id", "output"],
+                            ),
                         }))
                     }
                     _ => self
@@ -485,7 +512,18 @@ impl RequestIr {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             tool_calls: Vec::new(),
-            extra: object.clone(),
+            opaque_extensions: opaque_fields(
+                object,
+                &[
+                    "id",
+                    "type",
+                    "role",
+                    "content",
+                    "tool_calls",
+                    "tool_call_id",
+                    "call_id",
+                ],
+            ),
         };
         if protocol != Protocol::AnthropicMessages {
             if let Some(calls) = object.get("tool_calls").and_then(Value::as_array) {
@@ -1429,11 +1467,19 @@ fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
         Some(Value::Array(values)) => values.iter().map(IrContent::parse).collect(),
         Some(Value::String(text)) => vec![IrContent::Text {
             text: text.clone(),
-            extra: Map::new(),
+            extensions: ContentExtensions::default(),
         }],
         Some(value) if !value.is_null() => vec![IrContent::Raw(value.clone())],
         _ => Vec::new(),
     }
+}
+
+fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()) && key.as_str() != "cache_control")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// Render the tools array under the provider's server-tool policy, shared by the
@@ -1812,7 +1858,7 @@ impl IrContent {
             if let Some(text) = value.as_str() {
                 return Self::Text {
                     text: text.to_owned(),
-                    extra: Map::new(),
+                    extensions: ContentExtensions::default(),
                 };
             }
             return Self::Raw(value.clone());
@@ -1824,7 +1870,7 @@ impl IrContent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
-                extra: object.clone(),
+                extensions: ContentExtensions::parse(object, &["type", "text", "cache_control"]),
             },
             Some("thinking" | "reasoning_text") => Self::Thinking {
                 text: object
@@ -1837,7 +1883,10 @@ impl IrContent {
                     .get("signature")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                extra: object.clone(),
+                extensions: ContentExtensions::parse(
+                    object,
+                    &["type", "thinking", "text", "signature", "cache_control"],
+                ),
             },
             Some("image" | "input_image" | "image_url") => Self::Image(value.clone()),
             Some("tool_use") => Self::ToolUse(IrToolCall::from_messages_block(value)),
@@ -1852,7 +1901,16 @@ impl IrContent {
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                extra: object.clone(),
+                extensions: ContentExtensions::parse(
+                    object,
+                    &[
+                        "type",
+                        "tool_use_id",
+                        "content",
+                        "is_error",
+                        "cache_control",
+                    ],
+                ),
             },
             _ => Self::Raw(value.clone()),
         }
@@ -1860,8 +1918,8 @@ impl IrContent {
 
     fn raw_value(&self) -> Value {
         match self {
-            Self::Text { text, extra } => {
-                let mut object = extra.clone();
+            Self::Text { text, extensions } => {
+                let mut object = extensions.render(true);
                 object.insert("type".to_owned(), Value::String("text".to_owned()));
                 object.insert("text".to_owned(), Value::String(text.clone()));
                 Value::Object(object)
@@ -1869,9 +1927,9 @@ impl IrContent {
             Self::Thinking {
                 text,
                 signature,
-                extra,
+                extensions,
             } => {
-                let mut object = extra.clone();
+                let mut object = extensions.render(true);
                 object.insert("type".to_owned(), Value::String("thinking".to_owned()));
                 object.insert("thinking".to_owned(), Value::String(text.clone()));
                 if let Some(signature) = signature {
@@ -1885,9 +1943,9 @@ impl IrContent {
                 call_id,
                 content,
                 is_error,
-                extra,
+                extensions,
             } => {
-                let mut object = extra.clone();
+                let mut object = extensions.render(true);
                 object.insert("type".to_owned(), Value::String("tool_result".to_owned()));
                 object.insert("tool_use_id".to_owned(), Value::String(call_id.clone()));
                 object.insert("content".to_owned(), content.clone());
@@ -1899,8 +1957,8 @@ impl IrContent {
 
     fn to_chat(&self) -> Value {
         match self {
-            Self::Text { text, extra } => {
-                let mut object = extra.clone();
+            Self::Text { text, extensions } => {
+                let mut object = extensions.render(true);
                 object.insert("type".to_owned(), Value::String("text".to_owned()));
                 object.insert("text".to_owned(), Value::String(text.clone()));
                 Value::Object(object)
@@ -1917,8 +1975,8 @@ impl IrContent {
 
     fn to_responses(&self, role: &str) -> Value {
         match self {
-            Self::Text { text, extra } => {
-                let mut object = extra.clone();
+            Self::Text { text, extensions } => {
+                let mut object = extensions.render(true);
                 object.insert(
                     "type".to_owned(),
                     Value::String(
@@ -1953,25 +2011,25 @@ fn prepared_content(content: &[IrContent], keep_cache_control: bool) -> Vec<IrCo
     content
         .iter()
         .map(|part| match part {
-            IrContent::Text { text, extra } => {
-                let mut extra = extra.clone();
-                extra.remove("cache_control");
+            IrContent::Text { text, extensions } => {
+                let mut extensions = extensions.clone();
+                extensions.cache_control = None;
                 IrContent::Text {
                     text: text.clone(),
-                    extra,
+                    extensions,
                 }
             }
             IrContent::Thinking {
                 text,
                 signature,
-                extra,
+                extensions,
             } => {
-                let mut extra = extra.clone();
-                extra.remove("cache_control");
+                let mut extensions = extensions.clone();
+                extensions.cache_control = None;
                 IrContent::Thinking {
                     text: text.clone(),
                     signature: signature.clone(),
-                    extra,
+                    extensions,
                 }
             }
             IrContent::Image(value) => {
@@ -1992,7 +2050,7 @@ impl IrMessage {
             item_id: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
-            extra: Map::new(),
+            opaque_extensions: Map::new(),
         }
     }
 
@@ -2003,7 +2061,7 @@ impl IrMessage {
             item_id: None,
             tool_call_id: None,
             tool_calls: vec![call],
-            extra: Map::new(),
+            opaque_extensions: Map::new(),
         }
     }
 
@@ -2012,10 +2070,7 @@ impl IrMessage {
         if self.role == "custom" {
             return content.iter().map(IrContent::raw_value).collect();
         }
-        let mut object = self.extra.clone();
-        for key in ["role", "content", "tool_calls", "tool_call_id", "id"] {
-            object.remove(key);
-        }
+        let mut object = self.opaque_extensions.clone();
         object.insert("role".to_owned(), Value::String(self.role.clone()));
         if self.role == "tool" {
             object.insert(
@@ -2103,10 +2158,7 @@ impl IrMessage {
         if self.role == "assistant" {
             blocks.extend(self.tool_calls.iter().map(IrToolCall::to_messages_block));
         }
-        let mut object = self.extra.clone();
-        for key in ["role", "content", "tool_calls", "tool_call_id", "id"] {
-            object.remove(key);
-        }
+        let mut object = self.opaque_extensions.clone();
         object.insert("role".to_owned(), Value::String(self.role.clone()));
         object.insert("content".to_owned(), Value::Array(blocks));
         vec![Value::Object(object)]
@@ -2285,7 +2337,6 @@ impl IrToolCall {
                 .and_then(|f| f.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| Value::String("{}".to_owned())),
-            extra: value.as_object().cloned().unwrap_or_default(),
         }
     }
 
@@ -2302,7 +2353,6 @@ impl IrToolCall {
                 .get("input")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
-            extra: value.as_object().cloned().unwrap_or_default(),
         }
     }
 
@@ -2322,7 +2372,6 @@ impl IrToolCall {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| Value::String("{}".to_owned())),
-            extra: value.as_object().cloned().unwrap_or_default(),
         }
     }
 
@@ -2533,10 +2582,13 @@ mod tests {
         let IrConversationItem::Message(message) = &ir.transcript[0] else {
             panic!("expected message");
         };
-        let IrContent::Text { extra, .. } = &message.content[0] else {
+        let IrContent::Text { extensions, .. } = &message.content[0] else {
             panic!("expected text block");
         };
-        assert_eq!(extra["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            extensions.cache_control.as_ref().unwrap()["type"],
+            "ephemeral"
+        );
         let responses = ir
             .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
