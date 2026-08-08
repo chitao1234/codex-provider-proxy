@@ -1274,14 +1274,20 @@ impl RequestIr {
         Ok((Value::Object(out), report))
     }
 
-    fn apply_context(&self, target: Protocol, caps: &ModelCapabilities, out: &mut Map<String, Value>) {
+    fn apply_context(
+        &self,
+        target: Protocol,
+        caps: &ModelCapabilities,
+        out: &mut Map<String, Value>,
+    ) {
         // Cache controls are emitted only when the upstream supports them
         // (conservative; see docs/cache-adaptation-design.md §1.2).
         // `prompt_cache_key` is a chat/responses routing hint (Kimi, MiniMax
         // responses, Grok); the Messages dialect maps the identity to metadata.user_id.
-        let keep_key =
-            matches!(target, Protocol::OpenAiChatCompletions | Protocol::OpenAiResponses)
-                && caps.cache.prompt_cache_key;
+        let keep_key = matches!(
+            target,
+            Protocol::OpenAiChatCompletions | Protocol::OpenAiResponses
+        ) && caps.cache.prompt_cache_key;
         // Top-level `cache_control` is the Anthropic auto-breakpoint; the
         // Responses/Chat dialects have no such field.
         let keep_top_level_cache_control =
@@ -1301,8 +1307,13 @@ impl RequestIr {
             out.remove("cache_control");
         }
         for (key, value) in &self.context.represented_extensions {
-            if matches!(key.as_str(), "prompt_cache_key" | "prompt_cache_retention" | "prompt_cache_options" | "cache_control")
-                && !(key == "prompt_cache_key" && keep_key)
+            if matches!(
+                key.as_str(),
+                "prompt_cache_key"
+                    | "prompt_cache_retention"
+                    | "prompt_cache_options"
+                    | "cache_control"
+            ) && !(key == "prompt_cache_key" && keep_key)
                 && !(key == "cache_control" && keep_top_level_cache_control)
             {
                 continue;
@@ -1612,9 +1623,7 @@ fn is_server_tool(tool: &IrTool) -> bool {
 /// client function). The Responses dialect supports it natively; chat and messages
 /// do not.
 fn is_freeform_tool(tool: &IrTool) -> bool {
-    tool.kind == "custom"
-        && tool.parameters.is_none()
-        && tool.raw.get("format").is_some()
+    tool.kind == "custom" && tool.parameters.is_none() && tool.raw.get("format").is_some()
 }
 
 /// Short name for a server tool, used to match provider-native policies and map to a
@@ -2013,7 +2022,10 @@ impl IrMessage {
                 "tool_call_id".to_owned(),
                 Value::String(self.tool_call_id.clone().unwrap_or_default()),
             );
-            object.insert("content".to_owned(), Value::String(content_as_string(&content)));
+            object.insert(
+                "content".to_owned(),
+                Value::String(content_as_string(&content)),
+            );
             return vec![Value::Object(object)];
         }
         if self.role == "user"
@@ -2028,7 +2040,9 @@ impl IrMessage {
                 } = content
                 {
                     let text = content_as_string(&[IrContent::parse(content)]);
-                    values.push(serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":text}));
+                    values.push(
+                        serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":text}),
+                    );
                 }
             }
             let visible = content
@@ -2531,7 +2545,9 @@ mod tests {
         assert_eq!(responses["input"][0]["content"][0]["type"], "input_text");
         // Responses has no block-level cache_control; it is stripped at render
         // (no provider supports it on the responses endpoint).
-        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
+        assert!(responses["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -3136,16 +3152,19 @@ mod tests {
                 &ModelCapabilities::default(),
             )
             .unwrap();
-        assert!(chat.get("tools").is_none(), "freeform tool dropped for chat");
+        assert!(
+            chat.get("tools").is_none(),
+            "freeform tool dropped for chat"
+        );
         assert_eq!(report.dropped_server_tools, vec!["freeform"]);
         // Messages: dropped (no custom free-text type).
         let (messages, report) = ir
-            .render_with_report(
-                Protocol::AnthropicMessages,
-                &ModelCapabilities::default(),
-            )
+            .render_with_report(Protocol::AnthropicMessages, &ModelCapabilities::default())
             .unwrap();
-        assert!(messages.get("tools").is_none(), "freeform tool dropped for messages");
+        assert!(
+            messages.get("tools").is_none(),
+            "freeform tool dropped for messages"
+        );
         assert_eq!(report.dropped_server_tools, vec!["freeform"]);
     }
 
@@ -3167,10 +3186,7 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
         let (responses, report) = ir
-            .render_with_report(
-                Protocol::OpenAiResponses,
-                &ModelCapabilities::default(),
-            )
+            .render_with_report(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
         let tools = responses["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -3236,7 +3252,10 @@ mod tests {
 
         // Chat render keeps the developer message.
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         assert_eq!(chat["messages"][0]["role"], "developer");
         assert_eq!(chat["messages"][0]["content"][0]["text"], "be precise");
@@ -3300,7 +3319,10 @@ mod tests {
         assert_eq!(roles, vec!["user", "system", "assistant"]);
 
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         let rendered = chat["messages"].as_array().unwrap();
         assert_eq!(rendered[1]["role"], "user");
@@ -3363,7 +3385,10 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         let messages = chat["messages"].as_array().unwrap();
         // system, user, assistant: array form.
@@ -3373,7 +3398,10 @@ mod tests {
             (2, "assistant", "ok"),
         ] {
             assert_eq!(messages[index]["role"], role);
-            assert!(messages[index]["content"].is_array(), "{role} content is array");
+            assert!(
+                messages[index]["content"].is_array(),
+                "{role} content is array"
+            );
             assert_eq!(messages[index]["content"][0]["type"], "text");
             assert_eq!(messages[index]["content"][0]["text"], text);
         }
@@ -3388,7 +3416,10 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
         assert_eq!(
             chat["messages"][0]["content"],
@@ -3408,22 +3439,34 @@ mod tests {
 
         // No capability: block cache_control stripped from chat and responses.
         let chat = ir
-            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
             .unwrap();
-        assert!(chat["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(chat["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
         let responses = ir
             .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
             .unwrap();
-        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
+        assert!(responses["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
 
         // Capability on: kept for chat (Qwen chat endpoint), stripped for responses
         // (no provider supports block-level cache_control on responses).
         let mut caps = ModelCapabilities::default();
         caps.cache.block_cache_control = true;
         let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
-        assert_eq!(chat["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            chat["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
-        assert!(responses["input"][0]["content"][0].get("cache_control").is_none());
+        assert!(responses["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
 
         // Messages target keeps the block per capability: Anthropic-native for
         // supporting upstreams (MiniMax anthropic endpoint, Qwen), stripped for
@@ -3431,9 +3474,14 @@ mod tests {
         let messages = ir
             .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
             .unwrap();
-        assert!(messages["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(messages["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
         let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
-        assert_eq!(messages["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            messages["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]
@@ -3475,10 +3523,7 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
         let (messages, report) = ir
-            .render_with_report(
-                Protocol::AnthropicMessages,
-                &ModelCapabilities::default(),
-            )
+            .render_with_report(Protocol::AnthropicMessages, &ModelCapabilities::default())
             .unwrap();
         let tools = messages["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -3491,8 +3536,10 @@ mod tests {
     fn developer_folds_when_upstream_rejects_role() {
         // accept_developer_role=false folds developer messages into system for both
         // chat and responses renderings; content is preserved.
-        let mut caps = ModelCapabilities::default();
-        caps.accept_developer_role = false;
+        let caps = ModelCapabilities {
+            accept_developer_role: false,
+            ..Default::default()
+        };
         let request = json!({
             "model": "m",
             "input": [

@@ -4867,7 +4867,10 @@ mod tests {
         assert_eq!(captured["model"], "deepseek-v4-pro");
         assert_eq!(captured["max_tokens"], 100);
         assert_eq!(captured["messages"][0]["role"], "system");
-        assert_eq!(captured["messages"][0]["content"][0]["text"], "You are helpful");
+        assert_eq!(
+            captured["messages"][0]["content"][0]["text"],
+            "You are helpful"
+        );
         assert_eq!(captured["messages"][1]["role"], "user");
         assert_eq!(captured["messages"][1]["content"][0]["text"], "hi");
         assert_eq!(captured["thinking"]["type"], "enabled");

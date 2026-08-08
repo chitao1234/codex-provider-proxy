@@ -391,21 +391,21 @@ fn inject_ark_explicit_cache(caps: &ModelCapabilities, original: &Value, request
         // previous_response_id is the upstream id.
         object.insert(
             "previous_response_id".to_owned(),
-            original.get("previous_response_id").cloned().unwrap_or(Value::Null),
+            original
+                .get("previous_response_id")
+                .cloned()
+                .unwrap_or(Value::Null),
         );
-        object.insert(
-            "caching".to_owned(),
-            serde_json::json!({"type": "enabled"}),
-        );
+        object.insert("caching".to_owned(), serde_json::json!({"type": "enabled"}));
         return;
     }
-    let streaming = object.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let streaming = object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if streaming {
         // Prefix-cache creation requires stream=false; use session caching instead.
-        object.insert(
-            "caching".to_owned(),
-            serde_json::json!({"type": "enabled"}),
-        );
+        object.insert("caching".to_owned(), serde_json::json!({"type": "enabled"}));
     } else {
         object.insert(
             "caching".to_owned(),
@@ -420,7 +420,8 @@ fn normalize_rendered_request(
     renderer: RequestRendererKind,
     caps: &ModelCapabilities,
     request: &mut Value,
-) {    if normalizer == Some(RequestNormalizerKind::ArkResponses)
+) {
+    if normalizer == Some(RequestNormalizerKind::ArkResponses)
         && caps.ark_style
         && renderer == RequestRendererKind::OpenAiResponses
     {
@@ -1086,9 +1087,7 @@ cache = { ark_explicit_cache = true }
 "#,
         )
         .unwrap();
-        let request = |input: Value| {
-            serde_json::json!({"model": "ark-model", "input": input})
-        };
+        let request = |input: Value| serde_json::json!({"model": "ark-model", "input": input});
         let render = |body: Value| {
             let converted = convert_request_body(
                 &config,
