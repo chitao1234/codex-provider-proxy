@@ -14,11 +14,11 @@
 
 ## Request IR extension boundary
 
-The current `extra` maps clone complete source objects, including fields already represented by
-the IR. Renderers then repeatedly remove `role`, `content`, `type`, `text`, and similar keys. This
-makes ownership unclear and lets protocol syntax leak through the neutral layer.
+The former `extra` maps cloned complete source objects, including fields already represented by
+the IR. That convention has now been removed: protocol-owned fields are parsed into typed IR
+members, while only genuinely unknown fields remain in `opaque_extensions`.
 
-Replace that convention with these rules:
+The resulting rules are:
 
 1. Parsers extract every protocol-owned field before constructing an IR value.
 2. `cache_control` is a represented content extension, not an opaque field.
@@ -28,7 +28,7 @@ Replace that convention with these rules:
 5. Raw protocol objects may exist only for genuinely unknown/custom conversation items whose
    semantics cannot be represented without dropping information.
 
-The first migration covers message, text/thinking/tool-result content, tool calls, and tools.
+The migration covers message, text/thinking/tool-result content, tool calls, and tools.
 Image normalization and unknown custom item normalization remain separate future work.
 
 ## Final response IR
