@@ -14,15 +14,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
-use codex_provider_proxy_api_conversion::chat_to_messages::convert_chat_response;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
-use codex_provider_proxy_api_conversion::responses::{
-    chat_response_assistant_turn, convert_chat_response_to_responses,
-};
+use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
 use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
 use codex_provider_proxy_api_conversion::{error::ConversionError, sse};
 use futures_util::Stream;
@@ -99,10 +96,29 @@ pub enum ResponseParserKind {
     OpenAiResponses,
 }
 
+impl ResponseParserKind {
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::OpenAiChatCompletions => Protocol::OpenAiChatCompletions,
+            Self::AnthropicMessages => Protocol::AnthropicMessages,
+            Self::OpenAiResponses => Protocol::OpenAiResponses,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseRendererKind {
     AnthropicMessages,
     OpenAiResponses,
+}
+
+impl ResponseRendererKind {
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::AnthropicMessages => Protocol::AnthropicMessages,
+            Self::OpenAiResponses => Protocol::OpenAiResponses,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,27 +579,14 @@ pub fn convert_non_streaming_body_with_pipeline(
             "upstream response is not valid JSON",
         )
     })?;
-    let converted = match (pipeline.parser, pipeline.renderer) {
-        (ResponseParserKind::OpenAiChatCompletions, ResponseRendererKind::AnthropicMessages) => {
-            convert_chat_response(&json)
-        }
-        (ResponseParserKind::OpenAiChatCompletions, ResponseRendererKind::OpenAiResponses) => {
-            convert_chat_response_to_responses(&json)
-        }
-        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::AnthropicMessages) => {
-            return Ok(body);
-        }
-        (ResponseParserKind::AnthropicMessages, ResponseRendererKind::OpenAiResponses) => {
-            codex_provider_proxy_api_conversion::responses_renderer::convert_messages_response_to_responses(&json)
-        }
-        (ResponseParserKind::OpenAiResponses, ResponseRendererKind::AnthropicMessages) => {
-            codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_messages(&json)
-        }
-        (ResponseParserKind::OpenAiResponses, ResponseRendererKind::OpenAiResponses) => {
-            codex_provider_proxy_api_conversion::messages_renderer::convert_responses_response_to_responses(&json)
-        }
+    if pipeline.parser == ResponseParserKind::AnthropicMessages
+        && pipeline.renderer == ResponseRendererKind::AnthropicMessages
+    {
+        return Ok(body);
     }
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let converted = ResponseIr::parse(pipeline.parser.protocol(), &json)
+        .and_then(|response| response.render(pipeline.renderer.protocol()))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     serde_json::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| {
@@ -852,7 +855,7 @@ where
                     let buffered = std::mem::take(this.buffered).freeze();
                     if let Some(recorder) = &this.recorder {
                         if let Ok(json) = serde_json::from_slice::<Value>(&buffered) {
-                            let turn = chat_response_assistant_turn(&json);
+                            let turn = ResponseIr::chat_assistant_turn(&json);
                             let converted = convert_non_streaming_body_with_pipeline(
                                 buffered.clone(),
                                 *this.pipeline,

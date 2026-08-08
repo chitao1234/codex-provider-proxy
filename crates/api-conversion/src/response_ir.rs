@@ -1,0 +1,1001 @@
+//! Protocol-neutral representation of a completed, non-streaming response.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Map, Value};
+
+use crate::chat::{extract_usage, first_choice, first_choice_message, upstream_id, upstream_model};
+use crate::conversion_utils::format_url_citations;
+use crate::error::ConversionError;
+use crate::request_ir::Protocol;
+use crate::stream::{map_chat_finish_reason, StopReason};
+
+#[derive(Debug, Clone)]
+pub struct ResponseIr {
+    id: String,
+    model: String,
+    created_at: Option<Value>,
+    status: String,
+    incomplete_details: Option<Value>,
+    error: Option<Value>,
+    items: Vec<ResponseItem>,
+    usage: ResponseUsage,
+    opaque_extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+enum ResponseItem {
+    Reasoning {
+        id: Option<String>,
+        status: Option<String>,
+        text: String,
+        signature: Option<String>,
+        opaque_extensions: Map<String, Value>,
+    },
+    Message {
+        id: Option<String>,
+        status: Option<String>,
+        content: Vec<ResponseText>,
+        opaque_extensions: Map<String, Value>,
+    },
+    ToolCall {
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        arguments: Value,
+        status: Option<String>,
+        opaque_extensions: Map<String, Value>,
+    },
+    Opaque(Value),
+}
+
+#[derive(Debug, Clone)]
+struct ResponseText {
+    text: String,
+    annotations: Vec<Value>,
+    opaque_extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResponseUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    cache_miss_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    opaque_extensions: Map<String, Value>,
+}
+
+impl ResponseIr {
+    pub fn parse(source: Protocol, body: &Value) -> Result<Self, ConversionError> {
+        match source {
+            Protocol::OpenAiChatCompletions => Self::parse_chat(body),
+            Protocol::AnthropicMessages => Self::parse_messages(body),
+            Protocol::OpenAiResponses => Self::parse_responses(body),
+        }
+    }
+
+    pub fn render(&self, target: Protocol) -> Result<Value, ConversionError> {
+        match target {
+            Protocol::AnthropicMessages => Ok(self.render_messages()),
+            Protocol::OpenAiResponses => Ok(self.render_responses()),
+            Protocol::OpenAiChatCompletions => Err(ConversionError::unsupported(
+                "response",
+                "Chat Completions is not a downstream response format",
+            )),
+        }
+    }
+
+    pub fn chat_assistant_turn(body: &Value) -> Option<Value> {
+        let message = first_choice_message(body)?;
+        let has_text = message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
+        let has_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        (has_text || has_calls).then(|| message.clone())
+    }
+
+    fn parse_chat(body: &Value) -> Result<Self, ConversionError> {
+        if first_choice(body).is_none() {
+            return Err(ConversionError::invalid(
+                "upstream chat response missing choices",
+            ));
+        }
+        let message = first_choice_message(body)
+            .ok_or_else(|| ConversionError::invalid("upstream chat response missing message"))?;
+        let id = upstream_id(body).unwrap_or_default().to_owned();
+        let model = upstream_model(body).unwrap_or_default().to_owned();
+        let mut items = Vec::new();
+        if let Some(text) = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            items.push(ResponseItem::Reasoning {
+                id: None,
+                status: Some("completed".to_owned()),
+                text: text.to_owned(),
+                signature: Some(synth_message_id(&id)),
+                opaque_extensions: Map::new(),
+            });
+        }
+        let mut content = Vec::new();
+        if let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            content.push(ResponseText {
+                text: text.to_owned(),
+                annotations: message
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                opaque_extensions: Map::new(),
+            });
+        }
+        if !content.is_empty() {
+            items.push(ResponseItem::Message {
+                id: None,
+                status: Some("completed".to_owned()),
+                content,
+                opaque_extensions: Map::new(),
+            });
+        }
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let Some(call) = call.as_object() else {
+                    continue;
+                };
+                let function = call.get("function").and_then(Value::as_object);
+                let name = function
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                items.push(ResponseItem::ToolCall {
+                    id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                    call_id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: name.to_owned(),
+                    arguments: function
+                        .and_then(|function| function.get("arguments"))
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("{}".to_owned())),
+                    status: Some("completed".to_owned()),
+                    opaque_extensions: Map::new(),
+                });
+            }
+        }
+        let saw_tool_call = items
+            .iter()
+            .any(|item| matches!(item, ResponseItem::ToolCall { .. }));
+        let stop_reason = map_chat_finish_reason(
+            body.get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(Value::as_str),
+            saw_tool_call,
+        );
+        let usage = extract_usage(body);
+        Ok(Self {
+            id,
+            model,
+            created_at: Some(json!(now_unix_seconds())),
+            status: status_for_stop(stop_reason).to_owned(),
+            incomplete_details: incomplete_details_for_stop(stop_reason),
+            error: None,
+            items,
+            usage: ResponseUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cached_tokens: usage.cached_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                opaque_extensions: body
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(|usage| {
+                        opaque_fields(
+                            usage,
+                            &[
+                                "prompt_tokens",
+                                "completion_tokens",
+                                "total_tokens",
+                                "cached_tokens",
+                                "prompt_cache_hit_tokens",
+                                "prompt_cache_miss_tokens",
+                                "prompt_tokens_details",
+                                "completion_tokens_details",
+                            ],
+                        )
+                    })
+                    .unwrap_or_default(),
+            },
+            opaque_extensions: Map::new(),
+        })
+    }
+
+    fn parse_messages(body: &Value) -> Result<Self, ConversionError> {
+        let message = body
+            .as_object()
+            .ok_or_else(|| ConversionError::invalid("Messages response is not an object"))?;
+        let id = string_field(message, "id");
+        let model = string_field(message, "model");
+        let mut reasoning_items = Vec::new();
+        let mut opaque_items = Vec::new();
+        let mut tool_items = Vec::new();
+        let mut message_content = Vec::new();
+        if let Some(content) = message.get("content").and_then(Value::as_array) {
+            for block in content {
+                let Some(object) = block.as_object() else {
+                    opaque_items.push(ResponseItem::Opaque(block.clone()));
+                    continue;
+                };
+                match object.get("type").and_then(Value::as_str) {
+                    Some("thinking") => reasoning_items.push(ResponseItem::Reasoning {
+                        id: None,
+                        status: Some("completed".to_owned()),
+                        text: object
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        signature: object
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        opaque_extensions: opaque_fields(
+                            object,
+                            &["type", "thinking", "signature"],
+                        ),
+                    }),
+                    Some("text") => message_content.push(ResponseText {
+                        text: object
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        annotations: Vec::new(),
+                        opaque_extensions: opaque_fields(object, &["type", "text"]),
+                    }),
+                    Some("tool_use") => tool_items.push(ResponseItem::ToolCall {
+                        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                        call_id: object
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        name: object
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        arguments: object.get("input").cloned().unwrap_or_else(|| json!({})),
+                        status: Some("completed".to_owned()),
+                        opaque_extensions: opaque_fields(object, &["type", "id", "name", "input"]),
+                    }),
+                    _ => opaque_items.push(ResponseItem::Opaque(block.clone())),
+                }
+            }
+        }
+        let mut items = reasoning_items;
+        if !message_content.is_empty() {
+            items.push(ResponseItem::Message {
+                id: None,
+                status: Some("completed".to_owned()),
+                content: message_content,
+                opaque_extensions: Map::new(),
+            });
+        }
+        items.extend(tool_items);
+        items.extend(opaque_items);
+        let stop_reason = match message.get("stop_reason").and_then(Value::as_str) {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            Some("end_turn" | "stop_sequence") => StopReason::Stop,
+            _ => StopReason::Other,
+        };
+        Ok(Self {
+            id,
+            model,
+            created_at: None,
+            status: status_for_stop(stop_reason).to_owned(),
+            incomplete_details: incomplete_details_for_stop(stop_reason),
+            error: None,
+            items,
+            usage: parse_messages_usage(message.get("usage")),
+            opaque_extensions: opaque_fields(
+                message,
+                &[
+                    "id",
+                    "type",
+                    "role",
+                    "model",
+                    "content",
+                    "stop_reason",
+                    "stop_sequence",
+                    "usage",
+                ],
+            ),
+        })
+    }
+
+    fn parse_responses(body: &Value) -> Result<Self, ConversionError> {
+        let response = body
+            .as_object()
+            .ok_or_else(|| ConversionError::invalid("Responses response is not an object"))?;
+        let mut items = Vec::new();
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            for item in output {
+                let Some(object) = item.as_object() else {
+                    items.push(ResponseItem::Opaque(item.clone()));
+                    continue;
+                };
+                match object.get("type").and_then(Value::as_str) {
+                    Some("reasoning") => items.push(ResponseItem::Reasoning {
+                        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                        status: object
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        text: object
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|summary| summary.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        signature: None,
+                        opaque_extensions: opaque_fields(
+                            object,
+                            &["id", "type", "status", "summary"],
+                        ),
+                    }),
+                    Some("message") => {
+                        let content = object
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| {
+                                let part = part.as_object()?;
+                                Some(ResponseText {
+                                    text: part
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    annotations: part
+                                        .get("annotations")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    opaque_extensions: opaque_fields(
+                                        part,
+                                        &["type", "text", "annotations"],
+                                    ),
+                                })
+                            })
+                            .collect();
+                        items.push(ResponseItem::Message {
+                            id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                            status: object
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            content,
+                            opaque_extensions: opaque_fields(
+                                object,
+                                &["id", "type", "status", "role", "content"],
+                            ),
+                        });
+                    }
+                    Some("function_call") => items.push(ResponseItem::ToolCall {
+                        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                        call_id: object
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        name: object
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        arguments: object
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| Value::String("{}".to_owned())),
+                        status: object
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        opaque_extensions: opaque_fields(
+                            object,
+                            &["id", "type", "status", "call_id", "name", "arguments"],
+                        ),
+                    }),
+                    _ => items.push(ResponseItem::Opaque(item.clone())),
+                }
+            }
+        }
+        Ok(Self {
+            id: string_field(response, "id"),
+            model: string_field(response, "model"),
+            created_at: response.get("created_at").cloned(),
+            status: response
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+                .to_owned(),
+            incomplete_details: response.get("incomplete_details").cloned(),
+            error: response.get("error").cloned(),
+            items,
+            usage: parse_responses_usage(response.get("usage")),
+            opaque_extensions: opaque_fields(
+                response,
+                &[
+                    "id",
+                    "object",
+                    "created_at",
+                    "status",
+                    "incomplete_details",
+                    "error",
+                    "model",
+                    "output",
+                    "usage",
+                ],
+            ),
+        })
+    }
+
+    fn render_messages(&self) -> Value {
+        let mut content = Vec::new();
+        let mut saw_tool_call = false;
+        for item in &self.items {
+            match item {
+                ResponseItem::Reasoning {
+                    text,
+                    signature,
+                    opaque_extensions,
+                    ..
+                } if !text.trim().is_empty() => {
+                    let mut block = opaque_extensions.clone();
+                    block.insert("type".to_owned(), json!("thinking"));
+                    block.insert("thinking".to_owned(), json!(text));
+                    block.insert(
+                        "signature".to_owned(),
+                        json!(signature.as_deref().unwrap_or_default()),
+                    );
+                    content.push(Value::Object(block));
+                }
+                ResponseItem::Message { content: parts, .. } => {
+                    for part in parts {
+                        let mut block = part.opaque_extensions.clone();
+                        block.insert("type".to_owned(), json!("text"));
+                        block.insert("text".to_owned(), json!(part.text));
+                        content.push(Value::Object(block));
+                        if !part.annotations.is_empty() {
+                            if let Some(sources) =
+                                format_url_citations(Some(&Value::Array(part.annotations.clone())))
+                            {
+                                content.push(json!({"type":"text", "text":sources}));
+                            }
+                        }
+                    }
+                }
+                ResponseItem::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    opaque_extensions,
+                    ..
+                } => {
+                    saw_tool_call = true;
+                    let mut block = opaque_extensions.clone();
+                    block.insert("type".to_owned(), json!("tool_use"));
+                    block.insert("id".to_owned(), json!(call_id));
+                    block.insert("name".to_owned(), json!(name));
+                    block.insert("input".to_owned(), arguments_as_object(arguments));
+                    content.push(Value::Object(block));
+                }
+                ResponseItem::Opaque(_) | ResponseItem::Reasoning { .. } => {}
+            }
+        }
+        let stop_reason = if self.status == "incomplete" {
+            "max_tokens"
+        } else if saw_tool_call {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        let mut out = Map::new();
+        out.insert("id".to_owned(), json!(synth_message_id(&self.id)));
+        out.insert("type".to_owned(), json!("message"));
+        out.insert("role".to_owned(), json!("assistant"));
+        out.insert("model".to_owned(), json!(self.model));
+        out.insert("content".to_owned(), Value::Array(content));
+        out.insert("stop_reason".to_owned(), json!(stop_reason));
+        out.insert("stop_sequence".to_owned(), Value::Null);
+        out.insert("usage".to_owned(), self.usage.render_messages());
+        Value::Object(out)
+    }
+
+    fn render_responses(&self) -> Value {
+        let response_id = synth_response_id(&self.id);
+        let suffix = response_id.strip_prefix("resp_").unwrap_or(&response_id);
+        let mut output = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                ResponseItem::Reasoning {
+                    id,
+                    status,
+                    text,
+                    opaque_extensions,
+                    ..
+                } if !text.trim().is_empty() => {
+                    let mut rendered = opaque_extensions.clone();
+                    rendered.insert(
+                        "id".to_owned(),
+                        json!(id.clone().unwrap_or_else(|| format!("rs_{suffix}"))),
+                    );
+                    rendered.insert("type".to_owned(), json!("reasoning"));
+                    rendered.insert(
+                        "status".to_owned(),
+                        json!(status.as_deref().unwrap_or("completed")),
+                    );
+                    rendered.insert(
+                        "summary".to_owned(),
+                        json!([{"type":"summary_text", "text":text}]),
+                    );
+                    output.push(Value::Object(rendered));
+                }
+                ResponseItem::Message {
+                    id,
+                    status,
+                    content,
+                    opaque_extensions,
+                } => {
+                    let mut rendered_content = Vec::new();
+                    for part in content {
+                        let mut rendered = part.opaque_extensions.clone();
+                        rendered.insert("type".to_owned(), json!("output_text"));
+                        rendered.insert("text".to_owned(), json!(part.text));
+                        rendered.insert(
+                            "annotations".to_owned(),
+                            Value::Array(part.annotations.clone()),
+                        );
+                        rendered_content.push(Value::Object(rendered));
+                    }
+                    let mut rendered = opaque_extensions.clone();
+                    rendered.insert(
+                        "id".to_owned(),
+                        json!(id.clone().unwrap_or_else(|| format!("msg_{suffix}"))),
+                    );
+                    rendered.insert("type".to_owned(), json!("message"));
+                    rendered.insert(
+                        "status".to_owned(),
+                        json!(status.as_deref().unwrap_or("completed")),
+                    );
+                    rendered.insert("role".to_owned(), json!("assistant"));
+                    rendered.insert("content".to_owned(), Value::Array(rendered_content));
+                    output.push(Value::Object(rendered));
+                }
+                ResponseItem::ToolCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                    status,
+                    opaque_extensions,
+                } => {
+                    let mut rendered = opaque_extensions.clone();
+                    rendered.insert(
+                        "id".to_owned(),
+                        json!(id.clone().unwrap_or_else(|| format!("fc_{suffix}_{index}"))),
+                    );
+                    rendered.insert("type".to_owned(), json!("function_call"));
+                    rendered.insert(
+                        "status".to_owned(),
+                        json!(status.as_deref().unwrap_or("completed")),
+                    );
+                    rendered.insert("call_id".to_owned(), json!(call_id));
+                    rendered.insert("name".to_owned(), json!(name));
+                    rendered.insert(
+                        "arguments".to_owned(),
+                        json!(arguments_as_string(arguments)),
+                    );
+                    output.push(Value::Object(rendered));
+                }
+                ResponseItem::Opaque(value) => output.push(value.clone()),
+                ResponseItem::Reasoning { .. } => {}
+            }
+        }
+        let mut out = self.opaque_extensions.clone();
+        out.insert("id".to_owned(), json!(response_id));
+        out.insert("object".to_owned(), json!("response"));
+        if let Some(created_at) = &self.created_at {
+            out.insert("created_at".to_owned(), created_at.clone());
+        }
+        out.insert("status".to_owned(), json!(self.status));
+        out.insert(
+            "incomplete_details".to_owned(),
+            self.incomplete_details.clone().unwrap_or(Value::Null),
+        );
+        out.insert(
+            "error".to_owned(),
+            self.error.clone().unwrap_or(Value::Null),
+        );
+        out.insert("model".to_owned(), json!(self.model));
+        out.insert("output".to_owned(), Value::Array(output));
+        out.insert("usage".to_owned(), self.usage.render_responses());
+        Value::Object(out)
+    }
+}
+
+impl ResponseUsage {
+    fn render_messages(&self) -> Value {
+        let mut out = self.opaque_extensions.clone();
+        insert_u64(&mut out, "input_tokens", self.input_tokens);
+        insert_u64(&mut out, "output_tokens", self.output_tokens);
+        insert_u64(&mut out, "cache_read_input_tokens", self.cached_tokens);
+        insert_u64(
+            &mut out,
+            "cache_creation_input_tokens",
+            self.cache_write_tokens,
+        );
+        if let Some(reasoning) = self.reasoning_tokens {
+            out.insert(
+                "output_tokens_details".to_owned(),
+                json!({"thinking_tokens":reasoning}),
+            );
+        }
+        Value::Object(out)
+    }
+
+    fn render_responses(&self) -> Value {
+        let mut out = self.opaque_extensions.clone();
+        insert_u64(&mut out, "input_tokens", self.input_tokens);
+        insert_u64(&mut out, "output_tokens", self.output_tokens);
+        if let (Some(input), Some(output)) = (self.input_tokens, self.output_tokens) {
+            out.insert("total_tokens".to_owned(), json!(input + output));
+        }
+        let mut input_details = Map::new();
+        insert_u64(&mut input_details, "cached_tokens", self.cached_tokens);
+        insert_u64(
+            &mut input_details,
+            "cache_write_tokens",
+            self.cache_write_tokens,
+        );
+        insert_u64(
+            &mut input_details,
+            "cache_miss_tokens",
+            self.cache_miss_tokens,
+        );
+        if !input_details.is_empty() {
+            out.insert(
+                "input_tokens_details".to_owned(),
+                Value::Object(input_details),
+            );
+        }
+        if let Some(reasoning) = self.reasoning_tokens {
+            out.insert(
+                "output_tokens_details".to_owned(),
+                json!({"reasoning_tokens":reasoning}),
+            );
+        }
+        Value::Object(out)
+    }
+}
+
+fn parse_messages_usage(usage: Option<&Value>) -> ResponseUsage {
+    let usage = usage.and_then(Value::as_object);
+    ResponseUsage {
+        input_tokens: nested_u64(usage, "input_tokens"),
+        output_tokens: nested_u64(usage, "output_tokens"),
+        cached_tokens: nested_u64(usage, "cache_read_input_tokens"),
+        cache_write_tokens: nested_u64(usage, "cache_creation_input_tokens"),
+        cache_miss_tokens: None,
+        reasoning_tokens: usage
+            .and_then(|usage| usage.get("output_tokens_details"))
+            .and_then(Value::as_object)
+            .and_then(|details| details.get("thinking_tokens"))
+            .and_then(Value::as_u64),
+        opaque_extensions: usage
+            .map(|usage| {
+                opaque_fields(
+                    usage,
+                    &[
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                        "output_tokens_details",
+                    ],
+                )
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_responses_usage(usage: Option<&Value>) -> ResponseUsage {
+    let usage = usage.and_then(Value::as_object);
+    let input_details = usage
+        .and_then(|usage| usage.get("input_tokens_details"))
+        .and_then(Value::as_object);
+    let output_details = usage
+        .and_then(|usage| usage.get("output_tokens_details"))
+        .and_then(Value::as_object);
+    ResponseUsage {
+        input_tokens: nested_u64(usage, "input_tokens"),
+        output_tokens: nested_u64(usage, "output_tokens"),
+        cached_tokens: nested_u64(input_details, "cached_tokens"),
+        cache_write_tokens: nested_u64(input_details, "cache_write_tokens"),
+        cache_miss_tokens: nested_u64(input_details, "cache_miss_tokens"),
+        reasoning_tokens: nested_u64(output_details, "reasoning_tokens"),
+        opaque_extensions: usage
+            .map(|usage| {
+                opaque_fields(
+                    usage,
+                    &[
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "input_tokens_details",
+                        "output_tokens_details",
+                    ],
+                )
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn string_field(object: &Map<String, Value>, field: &str) -> String {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn nested_u64(object: Option<&Map<String, Value>>, field: &str) -> Option<u64> {
+    object
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_u64)
+}
+
+fn insert_u64(object: &mut Map<String, Value>, field: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        object.insert(field.to_owned(), json!(value));
+    }
+}
+
+fn arguments_as_object(arguments: &Value) -> Value {
+    match arguments {
+        Value::String(arguments) => serde_json::from_str(arguments)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({})),
+        Value::Object(_) => arguments.clone(),
+        _ => json!({}),
+    }
+}
+
+fn arguments_as_string(arguments: &Value) -> String {
+    match arguments {
+        Value::String(arguments) => arguments.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
+    }
+}
+
+fn synth_message_id(id: &str) -> String {
+    if id.starts_with("msg_") {
+        id.to_owned()
+    } else {
+        format!("msg_{id}")
+    }
+}
+
+fn synth_response_id(id: &str) -> String {
+    if id.starts_with("resp_") {
+        id.to_owned()
+    } else {
+        format!("resp_{id}")
+    }
+}
+
+fn status_for_stop(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::MaxTokens | StopReason::ContentFilter => "incomplete",
+        _ => "completed",
+    }
+}
+
+fn incomplete_details_for_stop(reason: StopReason) -> Option<Value> {
+    match reason {
+        StopReason::MaxTokens => Some(json!({"reason":"max_output_tokens"})),
+        StopReason::ContentFilter => Some(json!({"reason":"content_filter"})),
+        _ => None,
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn convert(source: Protocol, target: Protocol, body: Value) -> Value {
+        ResponseIr::parse(source, &body)
+            .unwrap()
+            .render(target)
+            .unwrap()
+    }
+
+    #[test]
+    fn chat_to_messages_preserves_reasoning_tools_usage_and_citations() {
+        let output = convert(
+            Protocol::OpenAiChatCompletions,
+            Protocol::AnthropicMessages,
+            json!({
+                "id": "chat-1",
+                "model": "m",
+                "choices": [{
+                    "message": {
+                        "content": "answer",
+                        "reasoning_content": "thought",
+                        "annotations": [{"type":"url_citation", "url":"https://example.com", "title":"Source"}],
+                        "tool_calls": [{"id":"call-1", "function":{"name":"lookup", "arguments":"{\"q\":1}"}}]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "completion_tokens_details": {"reasoning_tokens": 2}
+                }
+            }),
+        );
+        assert_eq!(output["id"], "msg_chat-1");
+        assert_eq!(output["stop_reason"], "tool_use");
+        assert_eq!(output["content"][0]["type"], "thinking");
+        assert_eq!(output["content"][1]["text"], "answer");
+        assert!(output["content"][2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Source: https://example.com"));
+        assert_eq!(output["content"][3]["input"]["q"], 1);
+        assert_eq!(output["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(
+            output["usage"]["output_tokens_details"]["thinking_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn chat_to_responses_renders_neutral_items() {
+        let output = convert(
+            Protocol::OpenAiChatCompletions,
+            Protocol::OpenAiResponses,
+            json!({
+                "id": "chat-1",
+                "model": "m",
+                "choices": [{
+                    "message": {
+                        "content": "answer",
+                        "reasoning_content": "thought",
+                        "tool_calls": [{"id":"call-1", "function":{"name":"lookup", "arguments":"{}"}}]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+            }),
+        );
+        assert_eq!(output["id"], "resp_chat-1");
+        assert_eq!(output["output"][0]["type"], "reasoning");
+        assert_eq!(output["output"][1]["type"], "message");
+        assert_eq!(output["output"][2]["type"], "function_call");
+        assert_eq!(output["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn messages_to_responses_preserves_semantics() {
+        let output = convert(
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            json!({
+                "id": "msg-1",
+                "model": "m",
+                "content": [
+                    {"type":"thinking", "thinking":"thought", "signature":"sig"},
+                    {"type":"text", "text":"answer"},
+                    {"type":"tool_use", "id":"call-1", "name":"lookup", "input":{"q":1}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 4, "output_tokens": 6, "cache_read_input_tokens": 2}
+            }),
+        );
+        assert_eq!(output["id"], "resp_msg-1");
+        assert_eq!(output["output"][0]["summary"][0]["text"], "thought");
+        assert_eq!(output["output"][1]["content"][0]["text"], "answer");
+        assert_eq!(output["output"][2]["arguments"], "{\"q\":1}");
+        assert_eq!(output["usage"]["input_tokens_details"]["cached_tokens"], 2);
+    }
+
+    #[test]
+    fn responses_to_messages_preserves_semantics() {
+        let output = convert(
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+            json!({
+                "id": "resp-1",
+                "model": "m",
+                "status": "incomplete",
+                "output": [
+                    {"type":"reasoning", "summary":[{"type":"summary_text", "text":"thought"}]},
+                    {"type":"message", "content":[{"type":"output_text", "text":"answer", "annotations":[]}]},
+                    {"type":"function_call", "call_id":"call-1", "name":"lookup", "arguments":"{\"q\":1}"}
+                ],
+                "usage": {"input_tokens": 4, "output_tokens": 6, "input_tokens_details":{"cached_tokens":2}}
+            }),
+        );
+        assert_eq!(output["id"], "msg_resp-1");
+        assert_eq!(output["stop_reason"], "max_tokens");
+        assert_eq!(output["content"][0]["thinking"], "thought");
+        assert_eq!(output["content"][1]["text"], "answer");
+        assert_eq!(output["content"][2]["input"]["q"], 1);
+    }
+
+    #[test]
+    fn responses_roundtrip_preserves_opaque_fields() {
+        let output = convert(
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiResponses,
+            json!({
+                "id": "third-party-id",
+                "object": "response",
+                "status": "completed",
+                "model": "m",
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 3, "x_details":{"cached":true}},
+                "conversation": "conv-1",
+                "x_provider": {"trace":"t"}
+            }),
+        );
+        assert_eq!(output["id"], "resp_third-party-id");
+        assert_eq!(output["usage"]["total_tokens"], 5);
+        assert_eq!(output["usage"]["x_details"]["cached"], true);
+        assert_eq!(output["conversation"], "conv-1");
+        assert_eq!(output["x_provider"]["trace"], "t");
+    }
+}
