@@ -151,7 +151,12 @@ struct IrTool {
     name: Option<String>,
     description: Option<String>,
     parameters: Option<Value>,
-    raw: Value,
+    format: Option<Value>,
+    opaque_extensions: Map<String, Value>,
+    function_extensions: Map<String, Value>,
+    /// Complete source definition only for tools whose semantics are intentionally
+    /// opaque (server tools and schema-less freeform tools).
+    opaque_definition: Option<Value>,
 }
 
 impl RequestIr {
@@ -1500,7 +1505,7 @@ fn render_tools_with_policy(
             // Codex's freeform tool (`type: "custom"` + `format`) is natively
             // supported by the Responses dialect (custom free-text tool); keep it
             // instead of treating it as a server-side tool.
-            rendered_tools.push(tool.raw.clone());
+            rendered_tools.push(tool.opaque_value());
             continue;
         }
         if is_server_tool(tool) {
@@ -1519,7 +1524,7 @@ fn render_tools_with_policy(
                         report.dropped_server_tools.push(name);
                     }
                 }
-                ServerToolPolicy::Passthrough => rendered_tools.push(tool.raw.clone()),
+                ServerToolPolicy::Passthrough => rendered_tools.push(tool.opaque_value()),
                 ServerToolPolicy::ProviderNative => match server_tool_short_name(tool) {
                     Some("web_search") => {
                         if let Some(template) = &caps.search_tool_template {
@@ -1637,11 +1642,6 @@ fn merge_native_params(
 /// non-`function`/`custom` type (`web_search_20260209`, `file_search`, `bash`, ...) and
 /// the well-known camelCase names (`WebSearch`, `WebFetch`) count as server tools, so the
 /// `ServerToolPolicy` applies to them instead of leaking a raw definition upstream.
-/// Whether a parsed tool is a server-side tool (has a non-function type, or a recognized
-/// server tool name). Mirrors the Messages-dialect `is_server_tool`: any explicit
-/// non-`function`/`custom` type (`web_search_20260209`, `file_search`, `bash`, ...) and
-/// the well-known camelCase names (`WebSearch`, `WebFetch`) count as server tools, so the
-/// `ServerToolPolicy` applies to them instead of leaking a raw definition upstream.
 ///
 /// Codex's freeform tool also reuses `type: "custom"` but carries no schema (a `format`
 /// descriptor instead); see `is_freeform_tool`. It is a server-side tool for dialects
@@ -1669,7 +1669,7 @@ fn is_server_tool(tool: &IrTool) -> bool {
 /// client function). The Responses dialect supports it natively; chat and messages
 /// do not.
 fn is_freeform_tool(tool: &IrTool) -> bool {
-    tool.kind == "custom" && tool.parameters.is_none() && tool.raw.get("format").is_some()
+    tool.kind == "custom" && tool.parameters.is_none() && tool.format.is_some()
 }
 
 /// Short name for a server tool, used to match provider-native policies and map to a
@@ -2408,30 +2408,50 @@ impl IrToolCall {
 
 impl IrTool {
     fn from_messages(value: &Value) -> Self {
+        let object = value.as_object().cloned().unwrap_or_default();
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let parameters = value.get("input_schema").cloned();
+        let opaque_definition = (!(kind == "function"
+            || (kind == "custom" && parameters.is_some())))
+        .then(|| value.clone());
         Self {
-            kind: value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("function")
-                .to_owned(),
+            kind,
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             description: value
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            parameters: value.get("input_schema").cloned(),
-            raw: value.clone(),
+            parameters,
+            format: value.get("format").cloned(),
+            opaque_extensions: opaque_fields(
+                &object,
+                &["type", "name", "description", "input_schema", "format"],
+            ),
+            function_extensions: Map::new(),
+            opaque_definition,
         }
     }
 
     fn from_chat(value: &Value) -> Self {
+        let object = value.as_object().cloned().unwrap_or_default();
         let function = value.get("function").and_then(Value::as_object);
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let parameters = function
+            .and_then(|function| function.get("parameters"))
+            .cloned();
+        let opaque_definition = (!(kind == "function"
+            || (kind == "custom" && parameters.is_some())))
+        .then(|| value.clone());
         Self {
-            kind: value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("function")
-                .to_owned(),
+            kind,
             name: function
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
@@ -2440,25 +2460,42 @@ impl IrTool {
                 .and_then(|f| f.get("description"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            parameters: function.and_then(|f| f.get("parameters")).cloned(),
-            raw: value.clone(),
+            parameters,
+            format: value.get("format").cloned(),
+            opaque_extensions: opaque_fields(&object, &["type", "function", "format"]),
+            function_extensions: function
+                .map(|function| opaque_fields(function, &["name", "description", "parameters"]))
+                .unwrap_or_default(),
+            opaque_definition,
         }
     }
 
     fn from_responses(value: &Value) -> Self {
+        let object = value.as_object().cloned().unwrap_or_default();
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        let parameters = value.get("parameters").cloned();
+        let opaque_definition = (!(kind == "function"
+            || (kind == "custom" && parameters.is_some())))
+        .then(|| value.clone());
         Self {
-            kind: value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("function")
-                .to_owned(),
+            kind,
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             description: value
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            parameters: value.get("parameters").cloned(),
-            raw: value.clone(),
+            parameters,
+            format: value.get("format").cloned(),
+            opaque_extensions: opaque_fields(
+                &object,
+                &["type", "name", "description", "parameters", "format"],
+            ),
+            function_extensions: Map::new(),
+            opaque_definition,
         }
     }
 
@@ -2471,18 +2508,9 @@ impl IrTool {
 
     fn to_chat(&self) -> Value {
         if !self.has_schema_function_kind() {
-            return self.raw.clone();
+            return self.opaque_value();
         }
-        let mut function = self
-            .raw
-            .get("function")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_else(|| self.raw.as_object().cloned().unwrap_or_default());
-        // A schema'd Anthropic `custom` tool flattens into the function body; the
-        // custom type tag and input_schema have no chat equivalents.
-        function.remove("type");
-        function.remove("input_schema");
+        let mut function = self.function_extensions.clone();
         function.insert(
             "name".to_owned(),
             Value::String(self.name.clone().unwrap_or_default()),
@@ -2500,26 +2528,31 @@ impl IrTool {
                     .unwrap_or_else(|| serde_json::json!({"type":"object"})),
             ),
         );
-        serde_json::json!({"type":"function", "function":function})
+        let mut object = self.opaque_extensions.clone();
+        object.insert("type".to_owned(), Value::String("function".to_owned()));
+        object.insert("function".to_owned(), Value::Object(function));
+        Value::Object(object)
     }
 
     fn to_messages(&self) -> Value {
         // The Messages dialect natively supports `custom` tools (schema'd client
         // functions); keep them as-is. Everything else renders as a plain tool.
+        if !self.has_schema_function_kind() {
+            return self.opaque_value();
+        }
+        let mut object = self.opaque_extensions.clone();
+        for key in ["parameters", "strict", "tools", "function"] {
+            object.remove(key);
+        }
+        object.extend(
+            self.function_extensions
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "parameters" | "strict" | "tools"))
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         if self.kind == "custom" {
-            return self.raw.clone();
+            object.insert("type".to_owned(), Value::String("custom".to_owned()));
         }
-        if self.kind != "function" {
-            return self.raw.clone();
-        }
-        let mut object = self.raw.as_object().cloned().unwrap_or_default();
-        object.remove("type");
-        object.remove("function");
-        // Chat/Responses tool definitions carry `parameters`/`strict`/nested `tools`;
-        // the Messages dialect accepts only `input_schema`.
-        object.remove("parameters");
-        object.remove("strict");
-        object.remove("tools");
         object.insert(
             "name".to_owned(),
             Value::String(self.name.clone().unwrap_or_default()),
@@ -2539,10 +2572,10 @@ impl IrTool {
 
     fn to_responses(&self) -> Value {
         if !self.has_schema_function_kind() {
-            return self.raw.clone();
+            return self.opaque_value();
         }
-        let mut object = self.raw.as_object().cloned().unwrap_or_default();
-        object.remove("input_schema");
+        let mut object = self.opaque_extensions.clone();
+        object.extend(self.function_extensions.clone());
         object.insert("type".to_owned(), Value::String("function".to_owned()));
         object.insert(
             "name".to_owned(),
@@ -2559,6 +2592,23 @@ impl IrTool {
                 .unwrap_or_else(|| serde_json::json!({"type":"object"})),
         );
         Value::Object(object)
+    }
+
+    fn opaque_value(&self) -> Value {
+        self.opaque_definition.clone().unwrap_or_else(|| {
+            let mut object = self.opaque_extensions.clone();
+            object.insert("type".to_owned(), Value::String(self.kind.clone()));
+            if let Some(name) = &self.name {
+                object.insert("name".to_owned(), Value::String(name.clone()));
+            }
+            if let Some(description) = &self.description {
+                object.insert("description".to_owned(), Value::String(description.clone()));
+            }
+            if let Some(format) = &self.format {
+                object.insert("format".to_owned(), format.clone());
+            }
+            Value::Object(object)
+        })
     }
 }
 

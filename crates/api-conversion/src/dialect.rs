@@ -242,7 +242,7 @@ impl Default for ModelCapabilities {
 
 /// Provider cache-control capabilities, driving which cache controls the renderer
 /// keeps or strips. Research: docs/cache-adaptation-design.md §1.2.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct CacheCapabilities {
     /// Supports Anthropic-style block-level `cache_control` (ephemeral).
     /// MiniMax (anthropic endpoint) and Qwen (chat/dashscope/anthropic); false
@@ -257,14 +257,10 @@ pub struct CacheCapabilities {
     /// Supports `prompt_cache_options` { mode, ttl } (OpenAI protocol).
     #[serde(default)]
     pub prompt_cache_options: bool,
-    /// Reports cached tokens at `usage.cached_tokens` (Kimi) instead of
-    /// `usage.prompt_tokens_details.cached_tokens`.
+    /// Optional header carrying the cache identity when the upstream does not accept
+    /// `prompt_cache_key` as a request field (for example `x-grok-conv-id`).
     #[serde(default)]
-    pub cached_tokens_top_level: bool,
-    /// Reports cache via `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`
-    /// (DeepSeek) instead of `prompt_tokens_details.cached_tokens`.
-    #[serde(default)]
-    pub prompt_cache_hit_tokens: bool,
+    pub prompt_cache_key_header: Option<String>,
     /// Ark Responses explicit caching via `caching` + `previous_response_id` +
     /// `store` (proxy layer injects the state chain).
     #[serde(default)]

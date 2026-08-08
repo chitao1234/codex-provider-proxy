@@ -10,6 +10,7 @@
   are preserved only where the target boundary can carry them safely.
 - Existing proxy behavior and conversion coverage remain locked by tests.
 - Ark explicit-cache injection is outside this cleanup and remains unchanged.
+- Cache identity headers are opt-in capabilities, not implied by a generic cache key.
 
 ## Request IR extension boundary
 

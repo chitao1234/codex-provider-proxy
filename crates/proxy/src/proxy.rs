@@ -1576,42 +1576,38 @@ fn inject_cache_routing_header(
     let Some(provider) = cfg.providers.get(&attempt.provider_name) else {
         return;
     };
-    let Some(model) = serde_json::from_slice::<serde_json::Value>(converted)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-    else {
+    let Ok(converted) = serde_json::from_slice::<serde_json::Value>(converted) else {
+        return;
+    };
+    let Some(model) = converted.get("model").and_then(serde_json::Value::as_str) else {
         return;
     };
     let caps = codex_provider_proxy_api_conversion::dialect::ModelCapabilities::resolve(
-        &model,
+        model,
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
+    let Some(header_name) = caps.cache.prompt_cache_key_header.as_deref() else {
+        return;
+    };
     if !caps.cache.prompt_cache_key
         || provider.upstream_api
             != codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions
     {
         return;
     }
-    let Some(key) = serde_json::from_slice::<serde_json::Value>(converted)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("prompt_cache_key")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+    let Some(key) = converted
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
         .filter(|key| !key.is_empty())
     else {
         return;
     };
-    if let Ok(value) = http::HeaderValue::from_str(&key) {
-        attempt.headers.insert("x-grok-conv-id", value);
+    let Ok(header_name) = http::header::HeaderName::from_bytes(header_name.as_bytes()) else {
+        return;
+    };
+    if let Ok(value) = http::HeaderValue::from_str(key) {
+        attempt.headers.insert(header_name, value);
     }
 }
 

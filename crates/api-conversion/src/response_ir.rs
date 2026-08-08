@@ -12,6 +12,7 @@ use crate::stream::{map_chat_finish_reason, StopReason};
 
 #[derive(Debug, Clone)]
 pub struct ResponseIr {
+    source: Protocol,
     id: String,
     model: String,
     created_at: Option<Value>,
@@ -191,6 +192,7 @@ impl ResponseIr {
         );
         let usage = extract_usage(body);
         Ok(Self {
+            source: Protocol::OpenAiChatCompletions,
             id,
             model,
             created_at: Some(json!(now_unix_seconds())),
@@ -310,6 +312,7 @@ impl ResponseIr {
             _ => StopReason::Other,
         };
         Ok(Self {
+            source: Protocol::AnthropicMessages,
             id,
             model,
             created_at: None,
@@ -435,6 +438,7 @@ impl ResponseIr {
             }
         }
         Ok(Self {
+            source: Protocol::OpenAiResponses,
             id: string_field(response, "id"),
             model: string_field(response, "model"),
             created_at: response.get("created_at").cloned(),
@@ -643,7 +647,11 @@ impl ResponseIr {
         );
         out.insert("model".to_owned(), json!(self.model));
         out.insert("output".to_owned(), Value::Array(output));
-        out.insert("usage".to_owned(), self.usage.render_responses());
+        out.insert(
+            "usage".to_owned(),
+            self.usage
+                .render_responses(self.source != Protocol::AnthropicMessages),
+        );
         Value::Object(out)
     }
 }
@@ -668,12 +676,14 @@ impl ResponseUsage {
         Value::Object(out)
     }
 
-    fn render_responses(&self) -> Value {
+    fn render_responses(&self, include_total_tokens: bool) -> Value {
         let mut out = self.opaque_extensions.clone();
         insert_u64(&mut out, "input_tokens", self.input_tokens);
         insert_u64(&mut out, "output_tokens", self.output_tokens);
-        if let (Some(input), Some(output)) = (self.input_tokens, self.output_tokens) {
-            out.insert("total_tokens".to_owned(), json!(input + output));
+        if include_total_tokens {
+            if let (Some(input), Some(output)) = (self.input_tokens, self.output_tokens) {
+                out.insert("total_tokens".to_owned(), json!(input + output));
+            }
         }
         let mut input_details = Map::new();
         insert_u64(&mut input_details, "cached_tokens", self.cached_tokens);
