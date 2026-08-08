@@ -273,8 +273,8 @@ mod tests {
         assert!(out.get("metadata").is_none());
         assert!(out.get("cache_control").is_none());
         assert!(out.get("service_tier").is_none());
-        assert_eq!(out["messages"][0]["content"], "real system");
-        assert_eq!(out["messages"][1]["content"], "hi");
+        assert_eq!(out["messages"][0]["content"][0]["text"], "real system");
+        assert_eq!(out["messages"][1]["content"][0]["text"], "hi");
     }
 
     #[test]
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "toolu_1");
         assert_eq!(messages[2]["content"], "sunny");
         assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"], "now summarize");
+        assert_eq!(messages[3]["content"][0]["text"], "now summarize");
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
         let (out, _) = render_messages_as_chat(&body, &caps()).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages[1]["role"], "user");
-        assert!(messages[1]["content"]
+        assert!(messages[1]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("<system-reminder>"));

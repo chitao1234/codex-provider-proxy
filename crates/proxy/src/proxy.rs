@@ -4867,9 +4867,9 @@ mod tests {
         assert_eq!(captured["model"], "deepseek-v4-pro");
         assert_eq!(captured["max_tokens"], 100);
         assert_eq!(captured["messages"][0]["role"], "system");
-        assert_eq!(captured["messages"][0]["content"], "You are helpful");
+        assert_eq!(captured["messages"][0]["content"][0]["text"], "You are helpful");
         assert_eq!(captured["messages"][1]["role"], "user");
-        assert_eq!(captured["messages"][1]["content"], "hi");
+        assert_eq!(captured["messages"][1]["content"][0]["text"], "hi");
         assert_eq!(captured["thinking"]["type"], "enabled");
 
         let captured_headers = headers.lock().unwrap();
@@ -5161,11 +5161,11 @@ mod tests {
         let messages = second["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "hi");
+        assert_eq!(messages[0]["content"][0]["text"], "hi");
         assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["content"], "hello");
+        assert_eq!(messages[1]["content"][0]["text"], "hello");
         assert_eq!(messages[2]["role"], "user");
-        assert_eq!(messages[2]["content"], "how are you?");
+        assert_eq!(messages[2]["content"][0]["text"], "how are you?");
         assert_eq!(second["user"], "conversation-cache-7");
         assert!(second.get("prompt_cache_key").is_none());
         assert_eq!(second["session_id"], "provider-session-9");

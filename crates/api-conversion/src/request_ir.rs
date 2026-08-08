@@ -588,7 +588,10 @@ impl RequestIr {
         for instruction in &self.instructions {
             match instruction {
                 Value::String(text) => {
-                    messages.push(serde_json::json!({"role":"system", "content":text}));
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": [{"type": "text", "text": text}]
+                    }));
                 }
                 Value::Array(blocks) => {
                     for block in blocks {
@@ -598,13 +601,17 @@ impl RequestIr {
                         if text.starts_with("x-anthropic-billing-header:") {
                             continue;
                         }
-                        messages.push(serde_json::json!({"role":"system", "content":text}));
+                        messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": [{"type": "text", "text": text}]
+                        }));
                     }
                 }
                 _ => {}
             }
         }
         let mut pending_reasoning = None;
+        let mut saw_non_system = false;
         for item in &self.transcript {
             match item {
                 IrConversationItem::Reasoning(reasoning) => {
@@ -614,10 +621,9 @@ impl RequestIr {
                 }
                 IrConversationItem::Message(message) => {
                     if message.role == "system" {
-                        // Mid-conversation system messages keep their position as a
-                        // system-reminder user message (many chat providers mishandle
-                        // a system message mid-conversation). Leading system messages
-                        // were already collected into instructions.
+                        // The Chat dialect natively supports a leading system message;
+                        // a mid-conversation one becomes a system-reminder user message
+                        // (many chat providers mishandle a system message mid-conversation).
                         let text = message
                             .content
                             .iter()
@@ -628,13 +634,24 @@ impl RequestIr {
                             .collect::<Vec<_>>()
                             .join("\n\n");
                         if !text.is_empty() {
-                            messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": format!("<system-reminder>\n{text}\n</system-reminder>")
-                            }));
+                            if !saw_non_system {
+                                messages.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": [{"type": "text", "text": text}]
+                                }));
+                            } else {
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("<system-reminder>\n{text}\n</system-reminder>")
+                                    }]
+                                }));
+                            }
                         }
                         continue;
                     }
+                    saw_non_system = true;
                     if message.role == "developer" && !caps.accept_developer_role {
                         // The upstream rejects the developer role; fold into a system
                         // message (content preserved).
@@ -648,7 +665,10 @@ impl RequestIr {
                             .collect::<Vec<_>>()
                             .join("\n\n");
                         if !text.is_empty() {
-                            messages.push(serde_json::json!({"role": "system", "content": text}));
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": [{"type": "text", "text": text}]
+                            }));
                         }
                         continue;
                     }
@@ -1778,6 +1798,14 @@ fn render_responses_tool_choice(choice: &Value) -> Value {
 impl IrContent {
     fn parse(value: &Value) -> Self {
         let Some(object) = value.as_object() else {
+            // A plain string is a text block (shorthand form); keep it as text so
+            // content_as_string and friends treat it uniformly.
+            if let Some(text) = value.as_str() {
+                return Self::Text {
+                    text: text.to_owned(),
+                    extra: Map::new(),
+                };
+            }
             return Self::Raw(value.clone());
         };
         match object.get("type").and_then(Value::as_str) {
@@ -1985,7 +2013,7 @@ impl IrMessage {
                 "tool_call_id".to_owned(),
                 Value::String(self.tool_call_id.clone().unwrap_or_default()),
             );
-            object.insert("content".to_owned(), content_as_chat(&content));
+            object.insert("content".to_owned(), Value::String(content_as_string(&content)));
             return vec![Value::Object(object)];
         }
         if self.role == "user"
@@ -1999,7 +2027,8 @@ impl IrMessage {
                     call_id, content, ..
                 } = content
                 {
-                    values.push(serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":content}));
+                    let text = content_as_string(&[IrContent::parse(content)]);
+                    values.push(serde_json::json!({"role":"tool", "tool_call_id":call_id, "content":text}));
                 }
             }
             let visible = content
@@ -2079,7 +2108,7 @@ impl IrMessage {
             values.push(serde_json::json!({
                 "type":"function_call_output",
                 "call_id":self.tool_call_id.clone().unwrap_or_default(),
-                "output":content_as_chat(&prepared)
+                "output":Value::String(content_as_string(&prepared))
             }));
             return values;
         }
@@ -2135,19 +2164,15 @@ fn instructions_text(instructions: &[Value]) -> String {
         .join("\n\n")
 }
 
+/// Render message content for the Chat dialect. Always uses the extended (array)
+/// form — even a single text block — so converted requests are byte-stable across
+/// turns and clients that pass the shorthand form ("content": "hi") produce the
+/// same prefix as those that pass blocks. Prefix stability matters: every provider
+/// cache is an exact-prefix match. (An empty content stays the empty string, which
+/// the Chat dialect requires for assistant messages without text.)
 fn content_as_chat(content: &[IrContent]) -> Value {
     if content.is_empty() {
         return Value::String(String::new());
-    }
-    if let [IrContent::Text { text, extra }] = content {
-        // Fold a single text block to a plain string only when it carries no
-        // extra fields (cache_control, vendor extensions) that would be lost.
-        let mut meaningful = extra.clone();
-        meaningful.remove("type");
-        meaningful.remove("text");
-        if meaningful.is_empty() {
-            return Value::String(text.clone());
-        }
     }
     let mut values = content
         .iter()
@@ -2161,6 +2186,20 @@ fn content_as_chat(content: &[IrContent]) -> Value {
             .map(IrContent::to_chat),
     );
     Value::Array(values)
+}
+
+/// Render content as a plain string for protocol slots that require one: Chat
+/// `role: "tool"` content and Responses `function_call_output.output`. Text blocks
+/// are joined; other block types (images) are omitted.
+fn content_as_string(content: &[IrContent]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            IrContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn image_to_chat(value: &Value) -> Value {
@@ -3200,7 +3239,7 @@ mod tests {
             .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
             .unwrap();
         assert_eq!(chat["messages"][0]["role"], "developer");
-        assert_eq!(chat["messages"][0]["content"], "be precise");
+        assert_eq!(chat["messages"][0]["content"][0]["text"], "be precise");
     }
 
     #[test]
@@ -3265,7 +3304,7 @@ mod tests {
             .unwrap();
         let rendered = chat["messages"].as_array().unwrap();
         assert_eq!(rendered[1]["role"], "user");
-        assert!(rendered[1]["content"]
+        assert!(rendered[1]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("<system-reminder>"));
@@ -3306,6 +3345,55 @@ mod tests {
         // Messages target never carries the OpenAI options.
         let messages = ir.render(Protocol::AnthropicMessages, &caps).unwrap();
         assert!(messages.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn single_text_block_always_renders_extended_form() {
+        // Even when the client passes the shorthand ("content": "hi"), the chat
+        // renderer emits the extended array form, keeping the converted prefix
+        // byte-stable across turns and clients (exact-prefix caches depend on it).
+        let request = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be concise"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "result"}
+            ]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        // system, user, assistant: array form.
+        for (index, role, text) in [
+            (0, "system", "be concise"),
+            (1, "user", "hi"),
+            (2, "assistant", "ok"),
+        ] {
+            assert_eq!(messages[index]["role"], role);
+            assert!(messages[index]["content"].is_array(), "{role} content is array");
+            assert_eq!(messages[index]["content"][0]["type"], "text");
+            assert_eq!(messages[index]["content"][0]["text"], text);
+        }
+        // tool: string form (Chat dialect requires it).
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["content"], "result");
+
+        // The same message with explicit blocks produces the identical shape.
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiChatCompletions, &request).unwrap();
+        let chat = ir
+            .render(Protocol::OpenAiChatCompletions, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(
+            chat["messages"][0]["content"],
+            serde_json::json!([{"type": "text", "text": "hi"}])
+        );
     }
 
     #[test]
@@ -3418,7 +3506,7 @@ mod tests {
 
         let chat = ir.render(Protocol::OpenAiChatCompletions, &caps).unwrap();
         assert_eq!(chat["messages"][0]["role"], "system");
-        assert_eq!(chat["messages"][0]["content"], "be precise");
+        assert_eq!(chat["messages"][0]["content"][0]["text"], "be precise");
 
         let responses = ir.render(Protocol::OpenAiResponses, &caps).unwrap();
         assert_eq!(responses["input"][0]["role"], "system");
