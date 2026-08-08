@@ -10,7 +10,6 @@
 
 pub(crate) mod chat;
 pub mod chat_parser;
-pub mod chat_to_messages;
 pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
