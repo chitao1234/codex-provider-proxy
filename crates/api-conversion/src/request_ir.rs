@@ -22,7 +22,6 @@ pub enum Protocol {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestIr {
     protocol: Protocol,
-    original: Map<String, Value>,
     model: Option<String>,
     stream: Option<bool>,
     /// Output-token budget, protocol-neutral: Messages `max_tokens`, Chat
@@ -177,7 +176,6 @@ impl RequestIr {
             .cloned();
         let mut ir = Self {
             protocol,
-            original,
             model,
             stream,
             max_output_tokens,
@@ -190,12 +188,12 @@ impl RequestIr {
         };
 
         match protocol {
-            Protocol::AnthropicMessages => ir.parse_messages(),
-            Protocol::OpenAiChatCompletions => ir.parse_chat(),
-            Protocol::OpenAiResponses => ir.parse_responses(),
+            Protocol::AnthropicMessages => ir.parse_messages(&original),
+            Protocol::OpenAiChatCompletions => ir.parse_chat(&original),
+            Protocol::OpenAiResponses => ir.parse_responses(&original),
         }
-        ir.parse_context();
-        ir.collect_opaque_extensions();
+        ir.parse_context(&original);
+        ir.collect_opaque_extensions(&original);
         Ok(ir)
     }
 
@@ -232,34 +230,30 @@ impl RequestIr {
         Ok(ir)
     }
 
-    fn parse_context(&mut self) {
-        self.context.previous_response_id = self
-            .original
+    fn parse_context(&mut self, source: &Map<String, Value>) {
+        self.context.previous_response_id = source
             .get("previous_response_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.context.conversation = self.original.get("conversation").cloned();
-        self.context.metadata = self.original.get("metadata").cloned();
-        self.context.end_user_id = self
-            .original
+        self.context.conversation = source.get("conversation").cloned();
+        self.context.metadata = source.get("metadata").cloned();
+        self.context.end_user_id = source
             .get("user")
-            .or_else(|| self.original.get("user_id"))
+            .or_else(|| source.get("user_id"))
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| {
-                self.original
+                source
                     .get("metadata")
                     .and_then(|metadata| metadata.get("user_id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        self.context.safety_identifier = self
-            .original
+        self.context.safety_identifier = source
             .get("safety_identifier")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.context.cache.key = self
-            .original
+        self.context.cache.key = source
             .get("prompt_cache_key")
             .and_then(Value::as_str)
             .map(str::to_owned)
@@ -271,7 +265,7 @@ impl RequestIr {
             .or_else(|| {
                 (self.protocol == Protocol::AnthropicMessages)
                     .then(|| {
-                        self.original
+                        source
                             .get("metadata")
                             .and_then(|metadata| metadata.get("user_id"))
                             .and_then(Value::as_str)
@@ -279,14 +273,14 @@ impl RequestIr {
                     })
                     .flatten()
             });
-        self.context.cache.options = self.original.get("prompt_cache_options").cloned();
-        self.context.cache.retention = self.original.get("prompt_cache_retention").cloned();
-        self.context.cache.control = self.original.get("cache_control").cloned();
-        self.context.store = self.original.get("store").cloned();
-        self.context.include = self.original.get("include").cloned();
-        self.context.truncation = self.original.get("truncation").cloned();
+        self.context.cache.options = source.get("prompt_cache_options").cloned();
+        self.context.cache.retention = source.get("prompt_cache_retention").cloned();
+        self.context.cache.control = source.get("cache_control").cloned();
+        self.context.store = source.get("store").cloned();
+        self.context.include = source.get("include").cloned();
+        self.context.truncation = source.get("truncation").cloned();
 
-        for (key, value) in &self.original {
+        for (key, value) in source {
             if is_context_extension_key(key) {
                 self.context
                     .represented_extensions
@@ -353,16 +347,11 @@ impl RequestIr {
         self.model.as_deref()
     }
 
-    fn parse_messages(&mut self) {
-        if let Some(system) = self.original.get("system") {
+    fn parse_messages(&mut self, source: &Map<String, Value>) {
+        if let Some(system) = source.get("system") {
             self.instructions.push(system.clone());
         }
-        if let Some(messages) = self
-            .original
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-        {
+        if let Some(messages) = source.get("messages").and_then(Value::as_array).cloned() {
             let mut saw_non_system = false;
             for value in &messages {
                 let is_system = value.get("role").and_then(Value::as_str) == Some("system");
@@ -383,42 +372,35 @@ impl RequestIr {
                 self.parse_message(value, Protocol::AnthropicMessages);
             }
         }
-        self.tools = self
-            .original
+        self.tools = source
             .get("tools")
             .and_then(Value::as_array)
             .map(|tools| tools.iter().map(IrTool::from_messages).collect())
             .unwrap_or_default();
-        self.tool_choice = self.original.get("tool_choice").cloned();
+        self.tool_choice = source.get("tool_choice").cloned();
     }
 
-    fn parse_chat(&mut self) {
-        if let Some(messages) = self
-            .original
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-        {
+    fn parse_chat(&mut self, source: &Map<String, Value>) {
+        if let Some(messages) = source.get("messages").and_then(Value::as_array).cloned() {
             for value in &messages {
                 // Every message keeps its role in the transcript, including system and
                 // developer; the renderer maps them per target dialect.
                 self.parse_message(value, Protocol::OpenAiChatCompletions);
             }
         }
-        self.tools = self
-            .original
+        self.tools = source
             .get("tools")
             .and_then(Value::as_array)
             .map(|tools| tools.iter().map(IrTool::from_chat).collect())
             .unwrap_or_default();
-        self.tool_choice = self.original.get("tool_choice").cloned();
+        self.tool_choice = source.get("tool_choice").cloned();
     }
 
-    fn parse_responses(&mut self) {
-        if let Some(instructions) = self.original.get("instructions") {
+    fn parse_responses(&mut self, source: &Map<String, Value>) {
+        if let Some(instructions) = source.get("instructions") {
             self.instructions.push(instructions.clone());
         }
-        if let Some(input) = self.original.get("input") {
+        if let Some(input) = source.get("input") {
             if let Some(text) = input.as_str() {
                 self.transcript.push(IrConversationItem::Message(IrMessage {
                     role: "user".to_owned(),
@@ -433,12 +415,7 @@ impl RequestIr {
                 }));
             }
         }
-        if let Some(input) = self
-            .original
-            .get("input")
-            .and_then(Value::as_array)
-            .cloned()
-        {
+        if let Some(input) = source.get("input").and_then(Value::as_array).cloned() {
             for value in &input {
                 match value.get("type").and_then(Value::as_str) {
                     Some("message") => {
@@ -485,13 +462,12 @@ impl RequestIr {
                 }
             }
         }
-        self.tools = self
-            .original
+        self.tools = source
             .get("tools")
             .and_then(Value::as_array)
             .map(|tools| tools.iter().map(IrTool::from_responses).collect())
             .unwrap_or_default();
-        self.tool_choice = self.original.get("tool_choice").cloned();
+        self.tool_choice = source.get("tool_choice").cloned();
     }
 
     fn parse_message(&mut self, value: &Value, protocol: Protocol) {
@@ -538,7 +514,7 @@ impl RequestIr {
         self.transcript.push(IrConversationItem::Message(message));
     }
 
-    fn collect_opaque_extensions(&mut self) {
+    fn collect_opaque_extensions(&mut self, source: &Map<String, Value>) {
         const STRUCTURAL: &[&str] = &[
             "model",
             "messages",
@@ -553,7 +529,7 @@ impl RequestIr {
             "max_completion_tokens",
             "max_output_tokens",
         ];
-        for (key, value) in &self.original {
+        for (key, value) in source {
             if !STRUCTURAL.contains(&key.as_str()) {
                 self.opaque_extensions.insert(key.clone(), value.clone());
             }
@@ -789,14 +765,14 @@ impl RequestIr {
         // Downstream effort arrives as Messages `output_config.effort` or Responses
         // `reasoning.effort`; both map to the upstream thinking/reasoning controls.
         let effort = self
-            .original
+            .opaque_extensions
             .get("output_config")
             .and_then(Value::as_object)
             .and_then(|config| config.get("effort"))
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| {
-                self.original
+                self.opaque_extensions
                     .get("reasoning")
                     .and_then(Value::as_object)
                     .and_then(|reasoning| reasoning.get("effort"))
@@ -804,7 +780,7 @@ impl RequestIr {
                     .map(str::to_owned)
             });
         let thinking_type = self
-            .original
+            .opaque_extensions
             .get("thinking")
             .and_then(|thinking| thinking.get("type"))
             .and_then(Value::as_str);
@@ -816,7 +792,7 @@ impl RequestIr {
                     ThinkingParam::Adaptive => "adaptive",
                     _ => "enabled",
                 };
-                let mapped = if self.original.contains_key("thinking") {
+                let mapped = if self.opaque_extensions.contains_key("thinking") {
                     // A Messages thinking block maps its type; a missing type means on.
                     Some(if thinking_type == Some("disabled") {
                         "disabled"
@@ -867,7 +843,7 @@ impl RequestIr {
         if !caps.accept_stop {
             out.remove("stop");
         } else if let Some(sequences) = self
-            .original
+            .opaque_extensions
             .get("stop_sequences")
             .and_then(Value::as_array)
         {
@@ -888,7 +864,7 @@ impl RequestIr {
             }
         }
         if let Some(parallel) = self
-            .original
+            .opaque_extensions
             .get("parallel_tool_use")
             .and_then(Value::as_bool)
         {
@@ -917,13 +893,13 @@ impl RequestIr {
             }
         }
         let format = self
-            .original
+            .opaque_extensions
             .get("output_config")
             .and_then(Value::as_object)
             .and_then(|config| config.get("format"))
             .or_else(|| {
                 // OpenAI Responses shape: {"text": {"format": ...}}.
-                self.original
+                self.opaque_extensions
                     .get("text")
                     .and_then(Value::as_object)
                     .and_then(|text| text.get("format"))
@@ -1198,7 +1174,7 @@ impl RequestIr {
         // accept the thinking object; qwen-style upstreams document reasoning.effort
         // as the control and ignore an unknown thinking object.
         if self.protocol == Protocol::AnthropicMessages {
-            if let Some(thinking) = self.original.get("thinking") {
+            if let Some(thinking) = self.opaque_extensions.get("thinking") {
                 let thinking_type = thinking.get("type").and_then(Value::as_str);
                 match caps.thinking_param {
                     ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
@@ -1223,7 +1199,7 @@ impl RequestIr {
                         // (an explicit output_config.effort is respected).
                         out.remove("thinking");
                         let has_explicit_effort = self
-                            .original
+                            .opaque_extensions
                             .get("output_config")
                             .and_then(Value::as_object)
                             .and_then(|config| config.get("effort"))
