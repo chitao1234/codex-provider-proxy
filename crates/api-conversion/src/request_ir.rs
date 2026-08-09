@@ -1,9 +1,8 @@
 //! Protocol-neutral request representation.
 //!
-//! The IR deliberately keeps the original top-level object alongside its semantic items. A
-//! renderer removes only fields owned by the source protocol and overlays the target shape;
-//! unknown provider/client parameters therefore survive a conversion instead of being silently
-//! discarded.
+//! Standard semantics are modeled explicitly, while unknown provider/client parameters are kept
+//! as opaque extensions. Conversation history uses persistent segments so continuation state can
+//! share prior turns without copying the complete transcript for every response id.
 
 use std::{collections::BTreeMap, sync::Arc};
 

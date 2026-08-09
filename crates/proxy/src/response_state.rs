@@ -1,10 +1,9 @@
 //! Server-side state for the Responses API `previous_response_id` continuation.
 //!
-//! The upstream Chat Completions API is stateless: a Responses client continues a
-//! conversation by passing `previous_response_id`, so the proxy keeps the chat
-//! transcript for every synthesized response it emits. On continuation the stored
-//! transcript is prepended to the messages converted from the new `input`, giving
-//! the upstream model the full conversation.
+//! A Responses client can continue a conversation by passing `previous_response_id`.
+//! While translation is enabled the proxy owns that identifier boundary, so it stores
+//! protocol-neutral request/response history and materializes the complete conversation
+//! for whichever upstream protocol handles the next turn.
 //!
 //! Entries remember the provider that produced them for diagnostics, but continuation remains
 //! intentionally portable across provider or model changes. Entries expire after a TTL to bound
