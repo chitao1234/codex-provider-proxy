@@ -624,6 +624,17 @@ impl RequestIr {
             "tools",
             "tool_choice",
             "previous_response_id",
+            "conversation",
+            "user",
+            "safety_identifier",
+            "metadata",
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "cache_control",
+            "store",
+            "include",
+            "truncation",
             "stream",
             "max_tokens",
             "max_completion_tokens",
@@ -639,7 +650,7 @@ impl RequestIr {
             "reasoning_effort",
         ];
         for (key, value) in source {
-            if !STRUCTURAL.contains(&key.as_str()) {
+            if !STRUCTURAL.contains(&key.as_str()) && !is_context_extension_key(key) {
                 self.opaque_extensions.insert(key.clone(), value.clone());
             }
         }
@@ -1511,23 +1522,48 @@ impl RequestIr {
             }
             out.entry(key.clone()).or_insert_with(|| value.clone());
         }
-        if let Some(metadata) = &self.context.metadata {
-            out.entry("metadata".to_owned())
-                .or_insert_with(|| metadata.clone());
+        if target != Protocol::AnthropicMessages {
+            if let Some(metadata) = &self.context.metadata {
+                out.entry("metadata".to_owned())
+                    .or_insert_with(|| metadata.clone());
+            }
+        }
+        if target == Protocol::OpenAiResponses {
+            if let Some(conversation) = &self.context.conversation {
+                out.entry("conversation".to_owned())
+                    .or_insert_with(|| conversation.clone());
+            }
+        }
+        if target != Protocol::AnthropicMessages {
+            if let Some(identifier) = &self.context.safety_identifier {
+                out.entry("safety_identifier".to_owned())
+                    .or_insert_with(|| Value::String(identifier.clone()));
+            }
+        }
+        if matches!(
+            target,
+            Protocol::OpenAiChatCompletions | Protocol::OpenAiResponses
+        ) {
+            if let Some(store) = &self.context.store {
+                out.entry("store".to_owned())
+                    .or_insert_with(|| store.clone());
+            }
+        }
+        if target == Protocol::OpenAiResponses {
+            for (key, value) in [
+                ("include", self.context.include.as_ref()),
+                ("truncation", self.context.truncation.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    out.entry(key.to_owned()).or_insert_with(|| value.clone());
+                }
+            }
         }
         if keep_top_level_cache_control {
             if let Some(cache_control) = &self.context.cache.control {
                 out.entry("cache_control".to_owned())
                     .or_insert_with(|| cache_control.clone());
             }
-        }
-        if let Some(conversation) = &self.context.conversation {
-            out.entry("conversation".to_owned())
-                .or_insert_with(|| conversation.clone());
-        }
-        if let Some(identifier) = &self.context.safety_identifier {
-            out.entry("safety_identifier".to_owned())
-                .or_insert_with(|| Value::String(identifier.clone()));
         }
         if keep_key {
             if let Some(key) = &self.context.cache.key {
@@ -1545,16 +1581,6 @@ impl RequestIr {
                     .or_insert_with(|| retention.clone());
             }
         }
-        for (key, value) in [
-            ("store", self.context.store.as_ref()),
-            ("include", self.context.include.as_ref()),
-            ("truncation", self.context.truncation.as_ref()),
-        ] {
-            if let Some(value) = value {
-                out.entry(key.to_owned()).or_insert_with(|| value.clone());
-            }
-        }
-
         match target {
             Protocol::AnthropicMessages => {
                 if let Some(user_id) = self
@@ -1598,10 +1624,12 @@ impl RequestIr {
 
 fn is_context_extension_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    [
+    let exact = [
         "session",
-        "conversation",
+        "session_id",
+        "conversation_id",
         "thread",
+        "thread_id",
         "prompt_cache",
         "cache_key",
         "cache_id",
@@ -1610,9 +1638,22 @@ fn is_context_extension_key(key: &str) -> bool {
         "project",
         "trace_id",
         "client_id",
-    ]
-    .iter()
-    .any(|fragment| key.contains(fragment))
+    ];
+    exact.contains(&key.as_str())
+        || [
+            "_session_id",
+            "_conversation_id",
+            "_thread_id",
+            "_cache_key",
+            "_cache_id",
+            "_user_id",
+            "_tenant_id",
+            "_project_id",
+            "_trace_id",
+            "_client_id",
+        ]
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
 }
 
 fn normalize_content(content: Option<&Value>) -> Vec<IrContent> {
@@ -2964,6 +3005,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ir.context.represented_extensions["session_id"], "session-7");
+        assert!(!ir.opaque_extensions.contains_key("session_id"));
         assert_eq!(ir.opaque_extensions["provider_budget"]["tokens"], 123);
     }
 
@@ -3094,13 +3136,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(messages["metadata"]["user_id"], "cache-1");
-        assert_eq!(messages["metadata"]["trace"], "root");
-        assert_eq!(messages["conversation"]["id"], "conv-1");
-        assert_eq!(messages["safety_identifier"], "safe-1");
+        assert!(messages["metadata"].get("trace").is_none());
+        assert!(messages.get("conversation").is_none());
+        assert!(messages.get("safety_identifier").is_none());
         assert!(messages.get("prompt_cache_key").is_none());
         assert!(messages.get("prompt_cache_retention").is_none());
         assert_eq!(messages["session_id"], "vendor-session-1");
         assert!(messages.get("previous_response_id").is_none());
+
+        let responses = continued
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["metadata"]["trace"], "root");
+        assert_eq!(responses["conversation"]["id"], "conv-1");
+        assert_eq!(responses["safety_identifier"], "safe-1");
+    }
+
+    #[test]
+    fn context_extension_detection_does_not_use_substring_matches() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model":"m",
+                "input":"hi",
+                "session_temperature": 0.7,
+                "vendor_session_id": "session-1"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(ir.opaque_extensions["session_temperature"], 0.7);
+        assert!(!ir
+            .context
+            .represented_extensions
+            .contains_key("session_temperature"));
+        assert_eq!(
+            ir.context.represented_extensions["vendor_session_id"],
+            "session-1"
+        );
+    }
+
+    #[test]
+    fn stateful_context_renders_only_on_supported_protocol_boundaries() {
+        let ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "model":"m",
+                "input":"hi",
+                "conversation":{"id":"conv-1"},
+                "user":"user-1",
+                "safety_identifier":"safe-1",
+                "metadata":{"trace":"trace-1"},
+                "store":true,
+                "include":["reasoning.encrypted_content"],
+                "truncation":"auto",
+                "vendor_session_id":"session-1"
+            }),
+        )
+        .unwrap();
+
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(messages["metadata"]["user_id"], "user-1");
+        assert!(messages["metadata"].get("trace").is_none());
+        for key in [
+            "conversation",
+            "safety_identifier",
+            "store",
+            "include",
+            "truncation",
+        ] {
+            assert!(messages.get(key).is_none(), "{key} leaked to Messages");
+        }
+        assert_eq!(messages["vendor_session_id"], "session-1");
+
+        let chat = ir
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        assert!(chat.get("conversation").is_none());
+        assert!(chat.get("include").is_none());
+        assert!(chat.get("truncation").is_none());
+        assert_eq!(chat["metadata"]["trace"], "trace-1");
+        assert_eq!(chat["store"], true);
+        assert_eq!(chat["safety_identifier"], "safe-1");
+
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(responses["conversation"]["id"], "conv-1");
+        assert_eq!(responses["include"][0], "reasoning.encrypted_content");
+        assert_eq!(responses["truncation"], "auto");
     }
 
     #[test]
