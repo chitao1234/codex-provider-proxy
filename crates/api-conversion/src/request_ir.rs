@@ -108,24 +108,6 @@ impl GenerationControls {
         }
     }
 
-    fn apply_source_fields(&self, out: &mut Map<String, Value>) {
-        for (key, value) in [
-            ("output_config", self.output_config.as_ref()),
-            ("reasoning", self.reasoning.as_ref()),
-            ("thinking", self.thinking.as_ref()),
-            ("text", self.text.as_ref()),
-            ("stop", self.stop.as_ref()),
-            ("stop_sequences", self.stop_sequences.as_ref()),
-            ("parallel_tool_use", self.parallel_tool_use.as_ref()),
-            ("parallel_tool_calls", self.parallel_tool_calls.as_ref()),
-            ("reasoning_effort", self.reasoning_effort.as_ref()),
-        ] {
-            if let Some(value) = value {
-                out.insert(key.to_owned(), value.clone());
-            }
-        }
-    }
-
     fn effort(&self) -> Option<String> {
         self.output_config
             .as_ref()
@@ -694,7 +676,6 @@ impl RequestIr {
 
     fn base_output(&self) -> Map<String, Value> {
         let mut out: Map<String, Value> = self.opaque_extensions.clone().into_iter().collect();
-        self.generation.apply_source_fields(&mut out);
         if let Some(model) = &self.model {
             out.insert("model".to_owned(), Value::String(model.clone()));
         }
@@ -861,6 +842,22 @@ impl RequestIr {
         caps: &ModelCapabilities,
         out: &mut Map<String, Value>,
     ) -> Result<RequestConversionReport, ConversionError> {
+        if let Some(stop) = &self.generation.stop {
+            out.insert("stop".to_owned(), stop.clone());
+        }
+        if caps.parallel_tool_calls {
+            if let Some(parallel) = self
+                .generation
+                .parallel_tool_calls
+                .as_ref()
+                .or(self.generation.parallel_tool_use.as_ref())
+                .and_then(Value::as_bool)
+            {
+                out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
+            }
+        } else {
+            out.remove("parallel_tool_calls");
+        }
         if let Some(value) = out.remove("max_tokens") {
             let value = value.as_u64().map_or(value.clone(), |value| {
                 Value::Number(
@@ -973,14 +970,6 @@ impl RequestIr {
                     },
                 );
             }
-        }
-        if let Some(parallel) = self
-            .generation
-            .parallel_tool_use
-            .as_ref()
-            .and_then(Value::as_bool)
-        {
-            out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
         }
         if let Some(choice) = self.tool_choice.as_ref() {
             if let Some(object) = choice.as_object() {
@@ -1129,58 +1118,72 @@ impl RequestIr {
             });
             out.insert("max_tokens".to_owned(), max_tokens);
         }
-        // Responses reasoning.effort maps to the upstream Messages thinking parameter
-        // (Messages providers do not speak `output_config`).
-        if let Some(reasoning) = out.remove("reasoning") {
-            let effort = reasoning
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            match caps.thinking_param {
-                ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+        if let Some(output_config) = &self.generation.output_config {
+            out.insert("output_config".to_owned(), output_config.clone());
+        }
+        let effort = self.generation.effort();
+        let thinking_type = self.generation.thinking_type();
+        match caps.thinking_param {
+            ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+                if self.generation.thinking.is_some() || effort.is_some() {
                     let on = match caps.thinking_param {
                         ThinkingParam::Adaptive => "adaptive",
                         _ => "enabled",
                     };
-                    if let Some(effort) = &effort {
-                        let thinking_type = if effort == "none" || effort == "minimal" {
-                            "disabled"
-                        } else {
-                            on
-                        };
-                        out.insert(
-                            "thinking".to_owned(),
-                            serde_json::json!({"type": thinking_type}),
-                        );
-                    }
+                    let mapped = if thinking_type == Some("disabled")
+                        || effort
+                            .as_deref()
+                            .is_some_and(|effort| effort == "none" || effort == "minimal")
+                    {
+                        "disabled"
+                    } else {
+                        on
+                    };
+                    let mut thinking = self
+                        .generation
+                        .thinking
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    thinking.insert("type".to_owned(), Value::String(mapped.to_owned()));
+                    out.insert("thinking".to_owned(), Value::Object(thinking));
                 }
-                ThinkingParam::EnableThinking => {
-                    let enabled = effort
-                        .as_deref()
-                        .is_none_or(|effort| effort != "none" && effort != "minimal");
+            }
+            ThinkingParam::EnableThinking => {
+                if self.generation.thinking.is_some() || effort.is_some() {
+                    let enabled = thinking_type != Some("disabled")
+                        && effort
+                            .as_deref()
+                            .is_none_or(|effort| effort != "none" && effort != "minimal");
                     out.insert("enable_thinking".to_owned(), Value::Bool(enabled));
                 }
-                ThinkingParam::None => {}
             }
+            ThinkingParam::None => {}
         }
-        if self.protocol == Protocol::OpenAiResponses {
-            // `text` carries Responses output configuration; consumed by the
-            // thinking mapping above (format has no Messages equivalent).
-            out.remove("text");
-        }
-        // Chat `stop` maps to the Messages `stop_sequences` array.
-        if let Some(stop) = out.remove("stop") {
+        if let Some(stop_sequences) = &self.generation.stop_sequences {
+            out.insert("stop_sequences".to_owned(), stop_sequences.clone());
+        } else if let Some(stop) = &self.generation.stop {
             let sequences = match stop {
-                Value::String(text) if !text.is_empty() => vec![Value::String(text)],
+                Value::String(text) if !text.is_empty() => vec![Value::String(text.clone())],
                 Value::Array(values) => values
-                    .into_iter()
+                    .iter()
                     .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .cloned()
                     .collect(),
                 _ => Vec::new(),
             };
             if !sequences.is_empty() {
                 out.insert("stop_sequences".to_owned(), Value::Array(sequences));
             }
+        }
+        if let Some(parallel) = self
+            .generation
+            .parallel_tool_use
+            .as_ref()
+            .or(self.generation.parallel_tool_calls.as_ref())
+        {
+            out.insert("parallel_tool_use".to_owned(), parallel.clone());
         }
         // The Messages dialect has no system/developer message role: those messages
         // fold into the top-level system (collected across the transcript).
@@ -1263,6 +1266,24 @@ impl RequestIr {
         }
         let mut out = self.base_output();
         self.apply_context(Protocol::OpenAiResponses, caps, &mut out);
+        if let Some(reasoning) = &self.generation.reasoning {
+            out.insert("reasoning".to_owned(), reasoning.clone());
+        }
+        if let Some(text) = &self.generation.text {
+            out.insert("text".to_owned(), text.clone());
+        }
+        if let Some(stop) = &self.generation.stop {
+            out.insert("stop".to_owned(), stop.clone());
+        }
+        if let Some(parallel) = self
+            .generation
+            .parallel_tool_calls
+            .as_ref()
+            .or(self.generation.parallel_tool_use.as_ref())
+            .and_then(Value::as_bool)
+        {
+            out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
+        }
         // Anthropic-owned parameters with no Responses equivalent are dropped
         // (`context_management` carries claude's edit-tool directives such as
         // clear_thinking, rejected by Ark). `metadata` and `cache_control` are
@@ -1385,8 +1406,63 @@ impl RequestIr {
                 render_responses_tool_choice(choice),
             );
         }
-        normalize_responses_parameters(&mut out, caps);
+        self.normalize_responses_parameters(&mut out, caps);
         Ok((Value::Object(out), report))
+    }
+
+    fn normalize_responses_parameters(
+        &self,
+        out: &mut Map<String, Value>,
+        caps: &ModelCapabilities,
+    ) {
+        if let Some(value) = out.get_mut("max_output_tokens") {
+            if let Some(cap) = caps.max_tokens_cap {
+                if let Some(number) = value.as_u64() {
+                    *value = Value::Number(number.min(cap).into());
+                }
+            }
+        }
+        if let Some(value) = &self.generation.reasoning_effort {
+            out.insert("reasoning".to_owned(), serde_json::json!({"effort": value}));
+        }
+        if let Some(value) = &self.generation.output_config {
+            if let Some(effort) = value.get("effort") {
+                out.insert(
+                    "reasoning".to_owned(),
+                    serde_json::json!({"effort": effort}),
+                );
+            }
+            if let Some(format) = value.get("format") {
+                let text = out
+                    .entry("text".to_owned())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(text) = text.as_object_mut() {
+                    text.insert("format".to_owned(), format.clone());
+                }
+            }
+        }
+        if let Some(sequences) = self
+            .generation
+            .stop_sequences
+            .as_ref()
+            .and_then(Value::as_array)
+        {
+            let sequences: Vec<Value> = sequences
+                .iter()
+                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                .cloned()
+                .collect();
+            if !sequences.is_empty() {
+                out.insert(
+                    "stop".to_owned(),
+                    if sequences.len() == 1 {
+                        sequences[0].clone()
+                    } else {
+                        Value::Array(sequences)
+                    },
+                );
+            }
+        }
     }
 
     fn apply_context(
@@ -1808,57 +1884,6 @@ fn server_tool_function_shape(tool: &IrTool) -> (String, String, Value) {
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
         ),
-    }
-}
-
-fn normalize_responses_parameters(out: &mut Map<String, Value>, caps: &ModelCapabilities) {
-    if let Some(value) = out.get_mut("max_output_tokens") {
-        if let Some(cap) = caps.max_tokens_cap {
-            if let Some(number) = value.as_u64() {
-                *value = Value::Number(number.min(cap).into());
-            }
-        }
-    }
-    if let Some(value) = out.remove("reasoning_effort") {
-        out.insert("reasoning".to_owned(), serde_json::json!({"effort": value}));
-    }
-    if let Some(value) = out.remove("output_config") {
-        if let Some(effort) = value.get("effort") {
-            out.insert(
-                "reasoning".to_owned(),
-                serde_json::json!({"effort": effort}),
-            );
-        }
-        if let Some(format) = value.get("format") {
-            // Messages structured-output request maps to Responses text.format.
-            let text = out
-                .entry("text".to_owned())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if let Some(text) = text.as_object_mut() {
-                text.insert("format".to_owned(), format.clone());
-            }
-        }
-    }
-    // Messages stop_sequences -> Responses `stop`.
-    if let Some(sequences) = out
-        .remove("stop_sequences")
-        .and_then(|value| value.as_array().cloned())
-    {
-        let sequences: Vec<Value> = sequences
-            .iter()
-            .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
-            .cloned()
-            .collect();
-        if !sequences.is_empty() {
-            out.insert(
-                "stop".to_owned(),
-                if sequences.len() == 1 {
-                    sequences[0].clone()
-                } else {
-                    Value::Array(sequences)
-                },
-            );
-        }
     }
 }
 
@@ -2974,6 +2999,66 @@ mod tests {
         assert_eq!(rendered["text"]["verbosity"], "low");
         assert_eq!(rendered["parallel_tool_calls"], true);
         assert_eq!(rendered["provider_budget"]["tokens"], 123);
+    }
+
+    #[test]
+    fn generation_controls_render_only_target_protocol_fields() {
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort":"high"},
+            "text": {"format":{"type":"json_object"}},
+            "stop": "END",
+            "parallel_tool_calls": true
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+
+        let chat = ir
+            .render(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap();
+        assert!(chat.get("reasoning").is_none());
+        assert!(chat.get("text").is_none());
+        assert!(chat.get("stop_sequences").is_none());
+        assert!(chat.get("parallel_tool_use").is_none());
+        assert_eq!(chat["stop"], "END");
+        assert_eq!(chat["parallel_tool_calls"], true);
+
+        let messages = ir
+            .render(Protocol::AnthropicMessages, &ModelCapabilities::default())
+            .unwrap();
+        assert!(messages.get("reasoning").is_none());
+        assert!(messages.get("text").is_none());
+        assert!(messages.get("parallel_tool_calls").is_none());
+        assert_eq!(messages["stop_sequences"][0], "END");
+        assert_eq!(messages["parallel_tool_use"], true);
+        assert_eq!(messages["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn messages_generation_controls_do_not_leak_into_responses() {
+        let request = json!({
+            "model": "m",
+            "messages": [{"role":"user", "content":"hi"}],
+            "output_config": {"effort":"high", "format":{"type":"json_object"}},
+            "thinking": {"type":"adaptive", "budget_tokens":1024},
+            "stop_sequences": ["END"],
+            "parallel_tool_use": false
+        });
+        let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
+        let responses = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+
+        assert!(responses.get("output_config").is_none());
+        assert!(responses.get("stop_sequences").is_none());
+        assert!(responses.get("parallel_tool_use").is_none());
+        assert_eq!(responses["reasoning"]["effort"], "high");
+        assert_eq!(responses["text"]["format"]["type"], "json_object");
+        assert_eq!(responses["stop"], "END");
+        assert_eq!(responses["parallel_tool_calls"], false);
     }
 
     #[test]
