@@ -552,11 +552,9 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::streams::ParserRendererStream::with_recorder(
+                ) => Box::pin(crate::streams::RecordingPassthroughStream::new(
                     resp_stream,
                     codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
-                    codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(
-                    ),
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
                 (
@@ -4941,19 +4939,25 @@ mod tests {
 
     #[tokio::test]
     async fn responses_upstream_streams_to_responses_downstream() {
-        // Upstream serves Responses SSE; downstream Responses (Codex) receives
-        // normalized official Responses SSE.
+        // Same-protocol Responses streams remain byte-for-byte transparent while
+        // the neutral recorder observes known and extension output items.
         let (url, _bodies, _headers, response, shutdown_tx) =
             spawn_scripted_server("/v1/responses").await;
+        let upstream_body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"},\"sequence_number\":0}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":6,\"output_tokens\":9}}}\n\n",
+        );
         *response.lock().unwrap() = Some(
             axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from(
-                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"},\"sequence_number\":0}\n\n\
-                     event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n\
-                     event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":6,\"output_tokens\":9}}}\n\n",
-                ))
+                .body(Body::from(upstream_body))
                 .unwrap(),
         );
         let mut providers = HashMap::new();
@@ -4961,6 +4965,7 @@ mod tests {
         let mut cfg = test_config("provider_a", providers);
         cfg.listen_base_path = "/v1".to_string();
         let state = test_proxy_state(cfg);
+        let response_states = state.runtime.response_states();
 
         let req = responses_request(json!({"model": "m", "input": "hi", "stream": true}));
         let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
@@ -4968,11 +4973,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("event: response.created"));
-        assert!(text.contains("\"type\":\"response.output_text.delta\""));
-        assert!(text.contains("\"delta\":\"Hi\""));
-        assert!(text.contains("event: response.completed"));
+        assert_eq!(body.as_ref(), upstream_body.as_bytes());
+        let recorded = response_states.get("resp_1").unwrap();
+        let rendered = recorded
+            .request_ir
+            .render_with_report(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
+            )
+            .unwrap()
+            .0;
+        assert!(rendered["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "web_search_call" && item["id"] == "ws_1"));
         let _ = shutdown_tx.send(());
     }
 

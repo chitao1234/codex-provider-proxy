@@ -217,3 +217,104 @@ where
         }
     }
 }
+
+pin_project! {
+    /// Pass through an SSE stream byte-for-byte while parsing a copy solely for
+    /// protocol-neutral continuation recording. Parse failures never affect the
+    /// downstream stream; they only disable recording for that response.
+    pub struct RecordingPassthroughStream<S, P> {
+        #[pin]
+        inner: S,
+        parser: P,
+        recorder: Option<ResponseRecorder>,
+        response: StreamingResponseIr,
+        pending: BytesMut,
+        recording: bool,
+        finished: bool,
+    }
+}
+
+impl<S, P> RecordingPassthroughStream<S, P> {
+    pub fn new(inner: S, parser: P, recorder: Option<ResponseRecorder>) -> Self {
+        Self {
+            inner,
+            parser,
+            recorder,
+            response: StreamingResponseIr::default(),
+            pending: BytesMut::new(),
+            recording: true,
+            finished: false,
+        }
+    }
+}
+
+impl<S, P> Stream for RecordingPassthroughStream<S, P>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+    P: Parser,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if *this.recording {
+                    this.pending.extend_from_slice(&chunk);
+                    let mut events = Vec::new();
+                    while let Some(boundary_end) =
+                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
+                    {
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        let event_type = sse::first_event_type(&event_bytes).unwrap_or("");
+                        let Some(payload) = sse::first_data_payload(&event_bytes) else {
+                            continue;
+                        };
+                        let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                            *this.recording = false;
+                            this.pending.clear();
+                            break;
+                        };
+                        if this
+                            .parser
+                            .on_event(event_type, &parsed, &mut events)
+                            .is_err()
+                        {
+                            *this.recording = false;
+                            this.pending.clear();
+                            break;
+                        }
+                    }
+                    for event in &events {
+                        this.response.on_event(event);
+                    }
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                *this.finished = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                *this.finished = true;
+                if *this.recording {
+                    let mut events = Vec::new();
+                    this.parser.finish(&mut events);
+                    for event in &events {
+                        this.response.on_event(event);
+                    }
+                    if let (Some(recorder), Some(response_id)) =
+                        (this.recorder.as_ref(), this.response.openai_response_id())
+                    {
+                        recorder.record_stream(&response_id, this.response);
+                    }
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
