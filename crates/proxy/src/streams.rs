@@ -199,6 +199,15 @@ where
                     while let Some(boundary_end) =
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
+                        if boundary_end > sse::MAX_EVENT_BYTES {
+                            *this.finished = true;
+                            let error = oversized_sse_event_error();
+                            if rendered.is_empty() {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                            *this.pending_error = Some(error);
+                            break;
+                        }
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         let parsed = match decode_json_event(&event_bytes) {
                             Ok(parsed) => parsed,
@@ -227,6 +236,14 @@ where
                                 this.renderer.on_event(&event, &mut rendered);
                             }
                         }
+                    }
+                    if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
+                        *this.finished = true;
+                        let error = oversized_sse_event_error();
+                        if rendered.is_empty() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        *this.pending_error = Some(error);
                     }
                     if !rendered.is_empty() {
                         this.out_events.extend(std::mem::take(&mut rendered));
@@ -341,6 +358,11 @@ where
                     while let Some(boundary_end) =
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
+                        if boundary_end > sse::MAX_EVENT_BYTES {
+                            *this.recording = false;
+                            this.pending.clear();
+                            break;
+                        }
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         let Ok(parsed) = decode_json_event(&event_bytes) else {
                             *this.recording = false;
@@ -359,6 +381,10 @@ where
                             this.pending.clear();
                             break;
                         }
+                    }
+                    if *this.recording && this.pending.len() > sse::MAX_EVENT_BYTES {
+                        *this.recording = false;
+                        this.pending.clear();
                     }
                     for event in &events {
                         this.response.on_event(event);
@@ -392,6 +418,16 @@ where
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn oversized_sse_event_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "upstream SSE event exceeds the {}-byte conversion limit",
+            sse::MAX_EVENT_BYTES
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -525,6 +561,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parser_renderer_rejects_oversized_unterminated_event() {
+        let body = Bytes::from(vec![b'x'; sse::MAX_EVENT_BYTES + 1]);
+        let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
+        let mut converted = ParserRendererStream::new(
+            inner,
+            ProbeParser {
+                values: Rc::new(RefCell::new(Vec::new())),
+            },
+            NullRenderer,
+        );
+
+        let error = converted.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("conversion limit"));
+    }
+
+    #[tokio::test]
     async fn recording_passthrough_keeps_malformed_sse_and_skips_recording() {
         let store = crate::response_state::ResponseStateStore::new(4);
         let request_ir = RequestIr::parse(
@@ -589,6 +642,28 @@ mod tests {
         }
 
         assert_eq!(received, body);
+        assert!(store.get("resp_1").is_none());
+    }
+
+    #[tokio::test]
+    async fn recording_passthrough_disables_parsing_for_oversized_event() {
+        let store = crate::response_state::ResponseStateStore::new(4);
+        let request_ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &serde_json::json!({"model":"model", "input":"hi"}),
+        )
+        .unwrap();
+        let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
+        let body = Bytes::from(vec![b'x'; sse::MAX_EVENT_BYTES + 1]);
+        let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
+        let mut passthrough = RecordingPassthroughStream::new(
+            inner,
+            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            Some(recorder),
+        );
+
+        assert_eq!(passthrough.next().await.unwrap().unwrap(), body);
+        assert!(passthrough.next().await.is_none());
         assert!(store.get("resp_1").is_none());
     }
 }

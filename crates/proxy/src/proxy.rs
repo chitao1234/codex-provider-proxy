@@ -2184,6 +2184,7 @@ pin_project! {
         provider_name: String,
         pending: BytesMut,
         pending_error: Option<std::io::Error>,
+        filtering: bool,
         finished: bool,
     }
 }
@@ -2197,6 +2198,7 @@ impl<S> ResponsesSlowDownDropStream<S> {
             provider_name,
             pending: BytesMut::new(),
             pending_error: None,
+            filtering: true,
             finished: false,
         }
     }
@@ -2225,6 +2227,9 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    if !*this.filtering {
+                        return std::task::Poll::Ready(Some(Ok(chunk)));
+                    }
                     this.pending.extend_from_slice(&chunk);
                     let mut passthrough = BytesMut::new();
 
@@ -2247,6 +2252,14 @@ where
                             return std::task::Poll::Ready(Some(Err(err)));
                         }
                         passthrough.extend_from_slice(&event_bytes);
+                    }
+
+                    if this.pending.len()
+                        > codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES
+                    {
+                        *this.filtering = false;
+                        passthrough.extend_from_slice(this.pending.as_ref());
+                        this.pending.clear();
                     }
 
                     if !passthrough.is_empty() {
@@ -4626,6 +4639,34 @@ mod tests {
         assert_eq!(delivered, payload_1);
         assert!(!delivered.contains("response.failed"));
         assert!(!delivered.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_event_disables_slow_down_filter_without_dropping_bytes() {
+        let oversized = Bytes::from(vec![
+            b'x';
+            codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES
+                + 1
+        ]);
+        let slow_down = Bytes::from_static(concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
+        ).as_bytes());
+        let inner = stream::iter([
+            Ok::<_, std::io::Error>(oversized.clone()),
+            Ok(slow_down.clone()),
+        ]);
+        let mut filtered =
+            super::ResponsesSlowDownDropStream::new(inner, 1, None, "provider".to_owned());
+        let mut delivered = BytesMut::new();
+        while let Some(chunk) = filtered.next().await {
+            delivered.extend_from_slice(&chunk.unwrap());
+        }
+
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(&oversized);
+        expected.extend_from_slice(&slow_down);
+        assert_eq!(delivered, expected);
     }
 
     #[tokio::test]

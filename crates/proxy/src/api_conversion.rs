@@ -706,6 +706,21 @@ where
                     while let Some(boundary_end) =
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
+                        if boundary_end > sse::MAX_EVENT_BYTES {
+                            *this.finished = true;
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "upstream SSE event exceeds the {}-byte conversion limit",
+                                    sse::MAX_EVENT_BYTES
+                                ),
+                            );
+                            if rendered.is_empty() {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                            *this.pending_error = Some(error);
+                            break;
+                        }
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         let event = match sse::decode_event(&event_bytes) {
                             Ok(event) => event,
@@ -738,6 +753,20 @@ where
                                 this.target.on_event(&event, &mut rendered);
                             }
                         }
+                    }
+                    if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
+                        *this.finished = true;
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "upstream SSE event exceeds the {}-byte conversion limit",
+                                sse::MAX_EVENT_BYTES
+                            ),
+                        );
+                        if rendered.is_empty() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        *this.pending_error = Some(error);
                     }
                     if !rendered.is_empty() {
                         this.out_events.extend(rendered);
@@ -1460,5 +1489,21 @@ accept_downstream_apis = ["openai_responses"]
         assert!(output_count > 0);
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(converted.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_oversized_unterminated_event() {
+        let body = Bytes::from(vec![
+            b'x';
+            codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES
+                + 1
+        ]);
+        let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
+        let mut converted =
+            ChatConversionStream::<_, ResponsesStreamTarget>::with_recorder(inner, None);
+
+        let error = converted.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("conversion limit"));
     }
 }

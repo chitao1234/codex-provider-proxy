@@ -4,6 +4,9 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 
+/// Maximum buffered size of one not-yet-delimited SSE event.
+pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// The fields used by the conversion layer from one decoded SSE event.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DecodedEvent<'a> {
