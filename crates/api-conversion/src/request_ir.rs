@@ -5,7 +5,7 @@
 //! unknown provider/client parameters therefore survive a conversion instead of being silently
 //! discarded.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde_json::{Map, Value};
 
@@ -28,7 +28,7 @@ pub struct RequestIr {
     /// `max_tokens`/`max_completion_tokens`, Responses `max_output_tokens`.
     /// Optional in Chat/Responses; required by the Messages API.
     max_output_tokens: Option<Value>,
-    transcript: Vec<IrConversationItem>,
+    transcript: IrTranscript,
     instructions: Vec<Value>,
     tools: Vec<IrTool>,
     tool_choice: Option<Value>,
@@ -44,6 +44,44 @@ pub(crate) enum IrConversationItem {
     Message(IrMessage),
     Reasoning(Value),
     Extension { namespace: String, value: Value },
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct IrTranscript {
+    previous: Option<Arc<IrTranscript>>,
+    items: Vec<IrConversationItem>,
+}
+
+impl IrTranscript {
+    fn push(&mut self, item: IrConversationItem) {
+        self.items.push(item);
+    }
+
+    fn extend(&mut self, other: Self) {
+        debug_assert!(other.previous.is_none());
+        self.items.extend(other.items);
+    }
+
+    fn prepend(&mut self, previous: &Self) {
+        self.previous = Some(Arc::new(previous.clone()));
+    }
+
+    fn retain_current(&mut self, keep: impl FnMut(&IrConversationItem) -> bool) {
+        self.items.retain(keep);
+    }
+
+    fn iter(&self) -> std::vec::IntoIter<&IrConversationItem> {
+        let mut items = Vec::new();
+        self.collect_items(&mut items);
+        items.into_iter()
+    }
+
+    fn collect_items<'a>(&'a self, items: &mut Vec<&'a IrConversationItem>) {
+        if let Some(previous) = &self.previous {
+            previous.collect_items(items);
+        }
+        items.extend(&self.items);
+    }
 }
 
 /// Stateful request context shared by protocols and provider dialects.
@@ -257,7 +295,7 @@ impl RequestIr {
             model,
             stream,
             max_output_tokens,
-            transcript: Vec::new(),
+            transcript: IrTranscript::default(),
             instructions: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
@@ -286,7 +324,7 @@ impl RequestIr {
         if protocol == Protocol::OpenAiResponses {
             let mut current_transcript = std::mem::take(&mut ir.transcript);
             if let Some(previous_request) = previous_request {
-                ir.transcript = previous_request.transcript.clone();
+                ir.transcript.prepend(&previous_request.transcript);
                 ir.inherit_context(&previous_request.context);
             }
             if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
@@ -294,7 +332,7 @@ impl RequestIr {
                     .iter()
                     .any(|item| matches!(item, IrConversationItem::Reasoning(value) if reasoning_text(value).is_some()));
                 if !current_has_reasoning {
-                    current_transcript.retain(|item| {
+                    current_transcript.retain_current(|item| {
                         !matches!(item, IrConversationItem::Reasoning(value) if reasoning_text(value).is_none())
                     });
                     ir.transcript
@@ -756,7 +794,7 @@ impl RequestIr {
         }
         let mut pending_reasoning = None;
         let mut saw_non_system = false;
-        for item in &self.transcript {
+        for item in self.transcript.iter() {
             match item {
                 IrConversationItem::Reasoning(reasoning) => {
                     if let Some(text) = reasoning_text(reasoning) {
@@ -1206,7 +1244,7 @@ impl RequestIr {
         // fold into the top-level system (collected across the transcript).
         let mut system_extra: Vec<String> = Vec::new();
         let mut messages = Vec::new();
-        for item in &self.transcript {
+        for item in self.transcript.iter() {
             match item {
                 IrConversationItem::Reasoning(reasoning) => {
                     let blocks = reasoning_to_messages_blocks(reasoning);
@@ -1363,7 +1401,7 @@ impl RequestIr {
             );
         }
         let mut input = Vec::new();
-        for item in &self.transcript {
+        for item in self.transcript.iter() {
             match item {
                 IrConversationItem::Reasoning(reasoning) => input.push(reasoning.clone()),
                 IrConversationItem::Message(message) => {
@@ -2901,7 +2939,7 @@ mod tests {
         });
         let ir = RequestIr::parse(Protocol::AnthropicMessages, &request).unwrap();
         // Parse keeps the block cache_control in the IR.
-        let IrConversationItem::Message(message) = &ir.transcript[0] else {
+        let IrConversationItem::Message(message) = ir.transcript.iter().next().unwrap() else {
             panic!("expected message");
         };
         let IrContent::Text { extensions, .. } = &message.content[0] else {
@@ -3163,6 +3201,36 @@ mod tests {
         assert_eq!(responses["metadata"]["trace"], "root");
         assert_eq!(responses["conversation"]["id"], "conv-1");
         assert_eq!(responses["safety_identifier"], "safe-1");
+    }
+
+    #[test]
+    fn continuation_transcript_shares_ancestor_segments() {
+        let first = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({"model":"m", "input":"first"}),
+        )
+        .unwrap();
+        let second = RequestIr::parse_with_context(
+            Protocol::OpenAiResponses,
+            &json!({"model":"m", "input":"second"}),
+            Some(&first),
+            None,
+        )
+        .unwrap();
+        let third = RequestIr::parse_with_context(
+            Protocol::OpenAiResponses,
+            &json!({"model":"m", "input":"third"}),
+            Some(&second),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(third.transcript.iter().count(), 3);
+        assert_eq!(third.transcript.items.len(), 1);
+        let second_ancestor = second.transcript.previous.as_ref().unwrap();
+        let third_parent = third.transcript.previous.as_ref().unwrap();
+        let third_ancestor = third_parent.previous.as_ref().unwrap();
+        assert!(Arc::ptr_eq(second_ancestor, third_ancestor));
     }
 
     #[test]
