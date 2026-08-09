@@ -462,7 +462,9 @@ async fn handle_proxy_inner(
             downstream_status,
             resp,
             &resp_headers,
-            forwarded_path,
+            conversion_plan
+                .expect("conversion applies only when a plan exists")
+                .response,
         )
         .await;
     }
@@ -660,15 +662,15 @@ fn text_response(status: StatusCode, body: Body) -> Response<Body> {
     response
 }
 
-/// Convert a non-2xx upstream response of a converted request into the Anthropic error
-/// envelope when the body is JSON; otherwise pass the body through with filtered headers.
+/// Convert a non-2xx upstream response of a converted request into the downstream
+/// protocol's error envelope when the body is JSON.
 async fn convert_upstream_error_response(
     cfg: &Config,
     upstream_status: StatusCode,
     downstream_status: StatusCode,
     resp: reqwest::Response,
     upstream_headers: &HeaderMap,
-    forwarded_path: &str,
+    response_pipeline: crate::api_conversion::ResponsePipeline,
 ) -> Result<Response<Body>> {
     let body = buffer_response_body_for_conversion(resp, cfg.request_body_buffer_max_bytes).await?;
     let Ok(json) = serde_json::from_slice::<Value>(&body) else {
@@ -679,7 +681,7 @@ async fn convert_upstream_error_response(
         return Ok(response);
     };
     let converted =
-        crate::api_conversion::convert_error_body(upstream_status, &json, forwarded_path);
+        crate::api_conversion::convert_error_body(upstream_status, &json, response_pipeline);
     let mut response = Response::builder()
         .status(downstream_status)
         .body(Body::from(converted.to_string()))?;
@@ -3838,7 +3840,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(b"attempt-0"));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -3873,7 +3875,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(b"attempt-0"));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -5382,6 +5384,51 @@ mod tests {
         assert_eq!(out["type"], "error");
         assert_eq!(out["error"]["type"], "invalid_request_error");
         assert_eq!(out["error"]["message"], "unknown tool type");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn converts_upstream_error_to_openai_error_envelope() {
+        let (url, _bodies, _headers, response, shutdown_tx) =
+            spawn_scripted_server("/v1/messages").await;
+        *response.lock().unwrap() = Some(
+            axum::http::Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "type": "error",
+                        "request_id": "req_1",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "slow down",
+                            "retry_after": 2
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("provider_a".to_string(), messages_upstream_provider(url));
+        let mut cfg = test_config("provider_a", providers);
+        cfg.listen_base_path = "/v1".to_string();
+        let state = test_proxy_state(cfg);
+
+        let req = responses_request(json!({"model": "m", "input": "hi"}));
+        let resp = handle_proxy_inner(state, "127.0.0.1:50021".parse().unwrap(), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(out.get("type").is_none());
+        assert_eq!(out["request_id"], "req_1");
+        assert_eq!(out["error"]["type"], "rate_limit_error");
+        assert_eq!(out["error"]["message"], "slow down");
+        assert_eq!(out["error"]["retry_after"], 2);
+        assert!(out["error"]["code"].is_null());
+        assert!(out["error"]["param"].is_null());
         let _ = shutdown_tx.send(());
     }
 

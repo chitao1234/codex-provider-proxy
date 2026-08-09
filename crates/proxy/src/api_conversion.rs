@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
-use codex_provider_proxy_api_conversion::error::convert_chat_error_body;
+use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
@@ -477,11 +477,13 @@ impl ResponseRecorder {
 }
 
 /// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
-pub fn convert_error_body(status: StatusCode, body: &Value, path: &str) -> Value {
-    match downstream_api_for_path(path) {
-        Some(DownstreamApi::AnthropicMessages) => convert_chat_error_body(status, body),
-        Some(DownstreamApi::OpenAiResponses) => body.clone(),
-        None => body.clone(),
+pub fn convert_error_body(status: StatusCode, body: &Value, pipeline: ResponsePipeline) -> Value {
+    if pipeline.source == pipeline.target_protocol() {
+        return body.clone();
+    }
+    match pipeline.target {
+        DownstreamApi::AnthropicMessages => convert_chat_error_body(status, body),
+        DownstreamApi::OpenAiResponses => ApiErrorIr::parse(status, body).render_openai(),
     }
 }
 
