@@ -63,6 +63,31 @@ enum ResponseContent {
     Opaque(Value),
 }
 
+#[derive(Default)]
+struct AssistantOutputAccumulator {
+    content: Vec<IrContent>,
+    item_id: Option<String>,
+    status: Option<String>,
+    message_extensions: Map<String, Value>,
+    tool_calls: Vec<IrToolCall>,
+    phase: u8,
+    has_message: bool,
+}
+
+impl AssistantOutputAccumulator {
+    fn flush(&mut self, request: &mut RequestIr) {
+        request.append_assistant_output(
+            std::mem::take(&mut self.content),
+            self.item_id.take(),
+            self.status.take(),
+            std::mem::take(&mut self.tool_calls),
+            std::mem::take(&mut self.message_extensions),
+        );
+        self.phase = 0;
+        self.has_message = false;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ResponseTermination {
     reason: StopReason,
@@ -122,11 +147,7 @@ impl ResponseIr {
     }
 
     pub fn append_to_request(&self, request: &mut RequestIr) {
-        let mut content = Vec::new();
-        let mut item_id = None;
-        let mut message_status = None;
-        let mut message_extensions = Map::new();
-        let mut tool_calls = Vec::new();
+        let mut output = AssistantOutputAccumulator::default();
         for item in &self.items {
             match item {
                 ResponseItem::Reasoning {
@@ -136,7 +157,10 @@ impl ResponseIr {
                     signature,
                     opaque_extensions,
                 } => {
-                    content.push(IrContent::Thinking {
+                    if output.phase > 0 {
+                        output.flush(request);
+                    }
+                    output.content.push(IrContent::Thinking {
                         id: id.clone(),
                         status: status.clone(),
                         text: text.clone(),
@@ -153,14 +177,15 @@ impl ResponseIr {
                     content: parts,
                     opaque_extensions,
                 } => {
-                    if item_id.is_none() {
-                        item_id.clone_from(id);
+                    if output.has_message || output.phase > 1 {
+                        output.flush(request);
                     }
-                    if message_status.is_none() {
-                        message_status.clone_from(status);
-                    }
-                    message_extensions.extend(opaque_extensions.clone());
-                    content.extend(parts.iter().map(|part| match part {
+                    output.phase = 1;
+                    output.has_message = true;
+                    output.item_id.clone_from(id);
+                    output.status.clone_from(status);
+                    output.message_extensions.extend(opaque_extensions.clone());
+                    output.content.extend(parts.iter().map(|part| match part {
                         ResponseContent::Text(part) => {
                             let mut opaque = part.opaque_extensions.clone();
                             if !part.annotations.is_empty() {
@@ -187,24 +212,24 @@ impl ResponseIr {
                     arguments,
                     status,
                     opaque_extensions,
-                } => tool_calls.push(IrToolCall {
-                    id: id.clone(),
-                    call_id: Some(call_id.clone()),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                    status: status.clone(),
-                    opaque_extensions: opaque_extensions.clone(),
-                }),
-                ResponseItem::Opaque(_) => {}
+                } => {
+                    output.phase = 2;
+                    output.tool_calls.push(IrToolCall {
+                        id: id.clone(),
+                        call_id: Some(call_id.clone()),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        status: status.clone(),
+                        opaque_extensions: opaque_extensions.clone(),
+                    });
+                }
+                ResponseItem::Opaque(value) => {
+                    output.flush(request);
+                    request.append_extension_item("openai.responses".to_owned(), value.clone());
+                }
             }
         }
-        request.append_assistant_output(
-            content,
-            item_id,
-            message_status,
-            tool_calls,
-            message_extensions,
-        );
+        output.flush(request);
     }
 
     fn parse_chat(body: &Value) -> Result<Self, ConversionError> {
@@ -1303,6 +1328,7 @@ mod tests {
                 "output": [
                     {"id":"rs_1", "type":"reasoning", "status":"completed", "summary":[{"type":"summary_text", "text":"thought"}]},
                     {"id":"msg_1", "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text", "text":"answer", "annotations":[]}]},
+                    {"id":"search_1", "type":"web_search_call", "status":"completed", "vendor_trace":"kept"},
                     {"id":"fc_1", "type":"function_call", "status":"completed", "call_id":"call_1", "name":"lookup", "arguments":"{\"q\":1}", "x_provider":"kept"}
                 ]
             }),
@@ -1321,8 +1347,10 @@ mod tests {
         assert_eq!(input[2]["id"], "msg_1");
         assert_eq!(input[2]["status"], "completed");
         assert_eq!(input[2]["content"][0]["text"], "answer");
-        assert_eq!(input[3]["id"], "fc_1");
-        assert_eq!(input[3]["status"], "completed");
-        assert_eq!(input[3]["x_provider"], "kept");
+        assert_eq!(input[3]["type"], "web_search_call");
+        assert_eq!(input[3]["vendor_trace"], "kept");
+        assert_eq!(input[4]["id"], "fc_1");
+        assert_eq!(input[4]["status"], "completed");
+        assert_eq!(input[4]["x_provider"], "kept");
     }
 }
