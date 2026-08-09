@@ -636,9 +636,6 @@ pin_project! {
     }
 }
 
-pub type ChatToMessagesStream<S> = ChatConversionStream<S, MessagesStreamTarget>;
-pub type ChatToResponsesStream<S> = ChatConversionStream<S, ResponsesStreamTarget>;
-
 impl<S> ChatConversionStream<S, MessagesStreamTarget> {
     pub fn new(inner: S) -> Self {
         Self::from_target(inner, MessagesStreamTarget(MessagesRenderer::new()), None)
@@ -1280,7 +1277,8 @@ accept_downstream_apis = ["openai_responses"]
             "data: [DONE]\n\n",
         );
         let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body.as_bytes()))]);
-        let mut converted = ChatToResponsesStream::with_recorder(inner, Some(recorder));
+        let mut converted =
+            ChatConversionStream::<_, ResponsesStreamTarget>::with_recorder(inner, Some(recorder));
         while let Some(chunk) = converted.next().await {
             chunk.unwrap();
         }

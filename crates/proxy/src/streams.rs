@@ -236,13 +236,14 @@ pin_project! {
 
 impl<S, P> RecordingPassthroughStream<S, P> {
     pub fn new(inner: S, parser: P, recorder: Option<ResponseRecorder>) -> Self {
+        let recording = recorder.is_some();
         Self {
             inner,
             parser,
             recorder,
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
-            recording: true,
+            recording,
             finished: false,
         }
     }
