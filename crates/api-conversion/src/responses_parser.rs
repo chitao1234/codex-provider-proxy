@@ -45,8 +45,12 @@ pub struct ResponsesParser {
     next_tool_index: usize,
     /// Whether the reasoning item is open (for reasoning_summary_text delta handling).
     reasoning_open: bool,
+    reasoning: String,
+    reasoning_emitted_len: usize,
     /// Whether the message item is open.
     message_open: bool,
+    text: String,
+    text_emitted_len: usize,
     refusal: String,
     refusal_emitted_len: usize,
     usage: ChatUsage,
@@ -82,7 +86,11 @@ impl ResponsesParser {
             tool_ids: HashMap::new(),
             next_tool_index: 0,
             reasoning_open: false,
+            reasoning: String::new(),
+            reasoning_emitted_len: 0,
             message_open: false,
+            text: String::new(),
+            text_emitted_len: 0,
             refusal: String::new(),
             refusal_emitted_len: 0,
             usage: ChatUsage::default(),
@@ -191,18 +199,27 @@ impl ResponsesParser {
                 // reasoning_summary_text.delta carry the thinking increment.
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                     self.reasoning_open = true;
-                    out.push(StreamEvent::ReasoningDelta {
-                        text: delta.to_string(),
-                        signature: None,
-                    });
+                    self.reasoning.push_str(delta);
+                    self.emit_reasoning_increment(out);
                 }
             }
             "response.output_text.delta" => {
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                     self.message_open = true;
-                    out.push(StreamEvent::TextDelta {
-                        text: delta.to_string(),
-                    });
+                    self.text.push_str(delta);
+                    self.emit_text_increment(out);
+                }
+            }
+            "response.output_text.done" => {
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    reconcile_final_text(&mut self.text, text);
+                    self.emit_text_increment(out);
+                }
+            }
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    reconcile_final_text(&mut self.reasoning, text);
+                    self.emit_reasoning_increment(out);
                 }
             }
             "response.refusal.delta" => {
@@ -340,7 +357,24 @@ impl ResponsesParser {
                     }
                 }
             }
-            "response.content_part.done" | "response.reasoning_text.done" => {
+            "response.content_part.done" => {
+                if let Some(part) = data.get("part").and_then(Value::as_object) {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("output_text") => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                reconcile_final_text(&mut self.text, text);
+                                self.emit_text_increment(out);
+                            }
+                        }
+                        Some("refusal") => {
+                            if let Some(refusal) = part.get("refusal").and_then(Value::as_str) {
+                                reconcile_final_text(&mut self.refusal, refusal);
+                                self.emit_refusal_increment(out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some((_, kind)) = self.open_item.take() {
                     match kind {
                         ItemKind::Reasoning => self.reasoning_open = false,
@@ -443,6 +477,32 @@ impl ResponsesParser {
             self.refusal_emitted_len = self.refusal.len();
             out.push(StreamEvent::RefusalDelta { refusal });
         }
+    }
+
+    fn emit_reasoning_increment(&mut self, out: &mut Vec<StreamEvent>) {
+        if self.reasoning_emitted_len < self.reasoning.len() {
+            let text = self.reasoning[self.reasoning_emitted_len..].to_owned();
+            self.reasoning_emitted_len = self.reasoning.len();
+            out.push(StreamEvent::ReasoningDelta {
+                text,
+                signature: None,
+            });
+        }
+    }
+
+    fn emit_text_increment(&mut self, out: &mut Vec<StreamEvent>) {
+        if self.text_emitted_len < self.text.len() {
+            let text = self.text[self.text_emitted_len..].to_owned();
+            self.text_emitted_len = self.text.len();
+            out.push(StreamEvent::TextDelta { text });
+        }
+    }
+}
+
+fn reconcile_final_text(accumulated: &mut String, final_text: &str) {
+    if final_text.len() >= accumulated.len() && final_text.starts_with(accumulated.as_str()) {
+        accumulated.clear();
+        accumulated.push_str(final_text);
     }
 }
 
@@ -763,6 +823,39 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(refusal, "not allowed");
+    }
+
+    #[test]
+    fn reconciles_text_and_reasoning_done_events() {
+        let mut parser = ResponsesParser::new();
+        let mut out = Vec::new();
+        for (event_type, data) in [
+            ("response.output_text.delta", json!({"delta":"Hel"})),
+            ("response.output_text.done", json!({"text":"Hello"})),
+            (
+                "response.reasoning_summary_text.done",
+                json!({"text":"thought"}),
+            ),
+        ] {
+            parser.on_event(event_type, &data, &mut out).unwrap();
+        }
+
+        let text = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let reasoning = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Hello");
+        assert_eq!(reasoning, "thought");
     }
 
     #[test]
