@@ -168,6 +168,7 @@ impl MessagesRenderer {
                     }),
                 ));
             }
+            StreamEvent::Extension { .. } => {}
         }
     }
 

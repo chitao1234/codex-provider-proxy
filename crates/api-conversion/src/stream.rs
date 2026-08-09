@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Map;
+use serde_json::Value;
 
 use crate::chat::ChatUsage;
 use crate::request_ir::{ContentExtensions, IrContent, IrToolCall, RequestIr};
@@ -61,6 +62,14 @@ pub enum StreamEvent {
         message: String,
         code: Option<String>,
     },
+    /// Protocol-specific information not yet modeled by the semantic IR.
+    /// Extensions remain explicitly namespaced instead of being coerced into text,
+    /// reasoning, or function-call fields.
+    Extension {
+        namespace: String,
+        kind: String,
+        payload: Value,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +81,7 @@ pub struct StreamingResponseIr {
     tools: BTreeMap<usize, StreamingToolCall>,
     stop_reason: Option<StopReason>,
     failed: bool,
+    extensions: Vec<(String, Value)>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +119,17 @@ impl StreamingResponseIr {
             }
             StreamEvent::End { stop_reason, .. } => self.stop_reason = Some(*stop_reason),
             StreamEvent::Error { .. } => self.failed = true,
+            StreamEvent::Extension {
+                namespace,
+                kind,
+                payload,
+            } => {
+                if namespace == "openai.responses" && kind == "response.output_item.done" {
+                    if let Some(item) = payload.get("item") {
+                        self.extensions.push((namespace.clone(), item.clone()));
+                    }
+                }
+            }
         }
     }
 
@@ -170,6 +191,9 @@ impl StreamingResponseIr {
             tool_calls,
             Map::new(),
         );
+        for (namespace, value) in &self.extensions {
+            request.append_extension_item(namespace.clone(), value.clone());
+        }
     }
 }
 

@@ -43,6 +43,7 @@ pub struct RequestIr {
 pub(crate) enum IrConversationItem {
     Message(IrMessage),
     Reasoning(Value),
+    Extension { namespace: String, value: Value },
 }
 
 /// Stateful request context shared by protocols and provider dialects.
@@ -433,6 +434,11 @@ impl RequestIr {
         }));
     }
 
+    pub(crate) fn append_extension_item(&mut self, namespace: String, value: Value) {
+        self.transcript
+            .push(IrConversationItem::Extension { namespace, value });
+    }
+
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
@@ -549,11 +555,10 @@ impl RequestIr {
                             ),
                         }))
                     }
-                    _ => self
-                        .transcript
-                        .push(IrConversationItem::Message(IrMessage::custom(
-                            value.clone(),
-                        ))),
+                    _ => self.transcript.push(IrConversationItem::Extension {
+                        namespace: "openai.responses".to_owned(),
+                        value: value.clone(),
+                    }),
                 }
             }
         }
@@ -826,6 +831,7 @@ impl RequestIr {
                     }
                     messages.extend(rendered);
                 }
+                IrConversationItem::Extension { .. } => {}
             }
         }
         if let Some(reasoning) = pending_reasoning {
@@ -1096,7 +1102,7 @@ impl RequestIr {
             .iter()
             .filter_map(|item| match item {
                 IrConversationItem::Message(message) => Some(message),
-                IrConversationItem::Reasoning(_) => None,
+                IrConversationItem::Reasoning(_) | IrConversationItem::Extension { .. } => None,
             })
             .flat_map(|message| message.content.iter())
             .any(|content| matches!(content, IrContent::Image(_)))
@@ -1221,6 +1227,7 @@ impl RequestIr {
                     }
                     messages.extend(message.to_messages_values(caps.cache.block_cache_control));
                 }
+                IrConversationItem::Extension { .. } => {}
             }
         }
         let mut system_text = instructions_text(&self.instructions);
@@ -1383,6 +1390,12 @@ impl RequestIr {
                     }
                     input.extend(message.to_responses_values(false));
                 }
+                IrConversationItem::Extension { namespace, value }
+                    if namespace == "openai.responses" =>
+                {
+                    input.push(value.clone());
+                }
+                IrConversationItem::Extension { .. } => {}
             }
         }
         out.insert("input".to_owned(), Value::Array(input));

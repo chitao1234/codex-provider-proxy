@@ -25,8 +25,6 @@ struct FunctionCallAccumulator {
     arguments: String,
     /// Arguments already emitted as deltas (increments only).
     emitted_len: usize,
-    /// Whether the item has been announced via ToolCallStart.
-    announced: bool,
 }
 
 /// Parse upstream Responses SSE events into `StreamEvent`s.
@@ -40,6 +38,10 @@ pub struct ResponsesParser {
     open_item: Option<(usize, ItemKind)>,
     /// Tool index -> accumulated function_call state.
     function_calls: HashMap<usize, FunctionCallAccumulator>,
+    /// Responses output_index -> protocol-neutral tool index.
+    tool_items: HashMap<usize, usize>,
+    /// Responses item/call id -> protocol-neutral tool index.
+    tool_ids: HashMap<String, usize>,
     next_tool_index: usize,
     /// Whether the reasoning item is open (for reasoning_summary_text delta handling).
     reasoning_open: bool,
@@ -74,6 +76,8 @@ impl ResponsesParser {
             model: String::new(),
             open_item: None,
             function_calls: HashMap::new(),
+            tool_items: HashMap::new(),
+            tool_ids: HashMap::new(),
             next_tool_index: 0,
             reasoning_open: false,
             message_open: false,
@@ -133,6 +137,10 @@ impl ResponsesParser {
                         self.open_item = Some((output_index, ItemKind::Message));
                     }
                     "function_call" => {
+                        let item_id = item
+                            .and_then(|i| i.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         let id = item
                             .and_then(|i| i.get("call_id"))
                             .and_then(Value::as_str)
@@ -147,6 +155,13 @@ impl ResponsesParser {
                         self.next_tool_index += 1;
                         self.function_calls
                             .insert(tool_index, FunctionCallAccumulator::default());
+                        self.tool_items.insert(output_index, tool_index);
+                        if !item_id.is_empty() {
+                            self.tool_ids.insert(item_id.to_owned(), tool_index);
+                        }
+                        if !id.is_empty() {
+                            self.tool_ids.insert(id.clone(), tool_index);
+                        }
                         self.open_item = Some((output_index, ItemKind::FunctionCall));
                         out.push(StreamEvent::ToolCallStart {
                             index: tool_index,
@@ -179,16 +194,9 @@ impl ResponsesParser {
             }
             "response.function_call_arguments.delta" => {
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    // The open function_call item gets the increment.
-                    let index = self
-                        .function_calls
-                        .iter()
-                        .find(|(_, acc)| !acc.announced)
-                        .map(|(i, _)| *i)
-                        .or_else(|| self.function_calls.keys().next().copied());
+                    let index = self.resolve_tool_index(data);
                     if let Some(index) = index {
                         let acc = self.function_calls.get_mut(&index).expect("exists");
-                        acc.announced = true;
                         acc.arguments.push_str(delta);
                         if acc.emitted_len < acc.arguments.len() {
                             let increment = acc.arguments[acc.emitted_len..].to_string();
@@ -207,15 +215,11 @@ impl ResponsesParser {
                 // Arguments complete; the accumulated value is final. Emit any
                 // remaining increment.
                 if let Some(delta) = data.get("arguments").and_then(Value::as_str) {
-                    let index = self
-                        .function_calls
-                        .iter()
-                        .find(|(_, acc)| acc.emitted_len < acc.arguments.len())
-                        .map(|(i, _)| *i)
-                        .or_else(|| self.function_calls.keys().next().copied());
+                    let index = self.resolve_tool_index(data);
                     if let Some(index) = index {
                         let acc = self.function_calls.get_mut(&index).expect("exists");
-                        if !delta.is_empty() && !acc.arguments.contains(delta) {
+                        if delta.len() >= acc.arguments.len() && delta.starts_with(&acc.arguments) {
+                            acc.arguments.clear();
                             acc.arguments.push_str(delta);
                         }
                         if acc.emitted_len < acc.arguments.len() {
@@ -231,10 +235,52 @@ impl ResponsesParser {
                     }
                 }
             }
-            "response.output_item.done"
-            | "response.content_part.done"
-            | "response.reasoning_text.done" => {
+            "response.output_item.done" => {
+                let item = data.get("item");
+                let item_type = item
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if item_type == "function_call" {
+                    if let Some(arguments) = item
+                        .and_then(|item| item.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        if let Some(index) = self.resolve_tool_index(data) {
+                            let acc = self.function_calls.get_mut(&index).expect("exists");
+                            if arguments.len() >= acc.arguments.len()
+                                && arguments.starts_with(&acc.arguments)
+                            {
+                                acc.arguments.clear();
+                                acc.arguments.push_str(arguments);
+                            }
+                            if acc.emitted_len < acc.arguments.len() {
+                                let increment = acc.arguments[acc.emitted_len..].to_owned();
+                                acc.emitted_len = acc.arguments.len();
+                                out.push(StreamEvent::ToolCallArgsDelta {
+                                    index,
+                                    args: increment,
+                                });
+                            }
+                        }
+                    }
+                } else if !matches!(item_type, "reasoning" | "message") {
+                    out.push(StreamEvent::Extension {
+                        namespace: "openai.responses".to_owned(),
+                        kind: event_type.to_owned(),
+                        payload: data.clone(),
+                    });
+                }
                 // Close the open item.
+                if let Some((_, kind)) = self.open_item.take() {
+                    match kind {
+                        ItemKind::Reasoning => self.reasoning_open = false,
+                        ItemKind::Message => self.message_open = false,
+                        ItemKind::FunctionCall => {}
+                    }
+                }
+            }
+            "response.content_part.done" | "response.reasoning_text.done" => {
                 if let Some((_, kind)) = self.open_item.take() {
                     match kind {
                         ItemKind::Reasoning => self.reasoning_open = false,
@@ -285,7 +331,11 @@ impl ResponsesParser {
                 out.push(StreamEvent::Error { message, code });
             }
             _ => {
-                // Unknown events (ping, web_search_call lifecycle) ignored.
+                out.push(StreamEvent::Extension {
+                    namespace: "openai.responses".to_owned(),
+                    kind: event_type.to_owned(),
+                    payload: data.clone(),
+                });
             }
         }
         Ok(())
@@ -307,6 +357,30 @@ impl ResponsesParser {
                 usage: self.usage,
             });
         }
+    }
+
+    fn resolve_tool_index(&self, data: &Value) -> Option<usize> {
+        data.get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| self.tool_items.get(&(index as usize)).copied())
+            .or_else(|| {
+                ["item_id", "call_id"]
+                    .into_iter()
+                    .filter_map(|field| data.get(field).and_then(Value::as_str))
+                    .find_map(|id| self.tool_ids.get(id).copied())
+            })
+            .or_else(|| {
+                self.open_item.and_then(|(output_index, kind)| {
+                    (kind == ItemKind::FunctionCall)
+                        .then(|| self.tool_items.get(&output_index).copied())
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                (self.function_calls.len() == 1)
+                    .then(|| self.function_calls.keys().next().copied())
+                    .flatten()
+            })
     }
 }
 
@@ -481,6 +555,85 @@ mod tests {
         assert!(
             matches!(&out[3], StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "ris\"}")
         );
+    }
+
+    #[test]
+    fn routes_interleaved_function_calls_by_output_index() {
+        let mut parser = ResponsesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event(
+                "response.created",
+                &json!({"response": {"id": "resp_1", "model": "m"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.output_item.added",
+                &json!({"output_index": 1, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "first"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.output_item.added",
+                &json!({"output_index": 4, "item": {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "second"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.function_call_arguments.delta",
+                &json!({"output_index": 4, "item_id": "fc_2", "delta": "{\"b\":"}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.function_call_arguments.delta",
+                &json!({"output_index": 1, "item_id": "fc_1", "delta": "{\"a\":1}"}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.function_call_arguments.delta",
+                &json!({"output_index": 4, "item_id": "fc_2", "delta": "2}"}),
+                &mut out,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &out[3],
+            StreamEvent::ToolCallArgsDelta { index: 1, args } if args == "{\"b\":"
+        ));
+        assert!(matches!(
+            &out[4],
+            StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "{\"a\":1}"
+        ));
+        assert!(matches!(
+            &out[5],
+            StreamEvent::ToolCallArgsDelta { index: 1, args } if args == "2}"
+        ));
+    }
+
+    #[test]
+    fn preserves_unknown_events_as_namespaced_extensions() {
+        let mut parser = ResponsesParser::new();
+        let mut out = Vec::new();
+        let event = json!({"output_index": 2, "delta": {"query": "rust"}});
+        parser
+            .on_event("response.web_search_call.searching", &event, &mut out)
+            .unwrap();
+
+        assert!(matches!(
+            &out[0],
+            StreamEvent::Extension { namespace, kind, payload }
+                if namespace == "openai.responses"
+                    && kind == "response.web_search_call.searching"
+                    && payload == &event
+        ));
     }
 
     #[test]

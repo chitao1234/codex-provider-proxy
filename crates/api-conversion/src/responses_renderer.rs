@@ -202,6 +202,7 @@ impl ResponsesRenderer {
                     out,
                 );
             }
+            StreamEvent::Extension { .. } => {}
         }
     }
 
