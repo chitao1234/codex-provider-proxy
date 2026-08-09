@@ -637,6 +637,7 @@ pin_project! {
         response: StreamingResponseIr,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
+        pending_error: Option<std::io::Error>,
         finished: bool,
     }
 }
@@ -671,6 +672,7 @@ impl<S, T> ChatConversionStream<S, T> {
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
+            pending_error: None,
             finished: false,
         }
     }
@@ -688,6 +690,9 @@ where
         if let Some(event) = this.out_events.pop_front() {
             return Poll::Ready(Some(Ok(event)));
         }
+        if let Some(error) = this.pending_error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
         if *this.finished {
             return Poll::Ready(None);
         }
@@ -697,6 +702,7 @@ where
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.pending.extend_from_slice(&chunk);
                     let mut events = Vec::new();
+                    let mut rendered = Vec::new();
                     while let Some(boundary_end) =
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
@@ -705,23 +711,33 @@ where
                             Ok(event) => event,
                             Err(err) => {
                                 *this.finished = true;
-                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                let error = std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!("upstream SSE event is not valid UTF-8: {err}"),
-                                ))));
+                                );
+                                if rendered.is_empty() {
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                                *this.pending_error = Some(error);
+                                break;
                             }
                         };
                         if let Some(payload) = event.data {
                             if let Err(err) = this.parser.on_chunk(&payload, &mut events) {
                                 *this.finished = true;
-                                return Poll::Ready(Some(Err(std::io::Error::other(err))));
+                                let error =
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, err);
+                                if rendered.is_empty() {
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                                *this.pending_error = Some(error);
+                                break;
+                            }
+                            for event in events.drain(..) {
+                                this.response.on_event(&event);
+                                this.target.on_event(&event, &mut rendered);
                             }
                         }
-                    }
-                    let mut rendered = Vec::new();
-                    for event in &events {
-                        this.response.on_event(event);
-                        this.target.on_event(event, &mut rendered);
                     }
                     if !rendered.is_empty() {
                         this.out_events.extend(rendered);
@@ -762,10 +778,21 @@ where
                         this.target.on_event(event, &mut rendered);
                     }
                     this.target.finish(&mut rendered);
+                    let incomplete = this.response.has_started() && !this.response.is_terminal();
                     if let (Some(recorder), Some(response_id)) =
                         (this.recorder.as_ref(), this.response.openai_response_id())
                     {
                         recorder.record_stream(&response_id, this.response);
+                    }
+                    if incomplete {
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "upstream SSE ended without a terminal protocol event",
+                        );
+                        if rendered.is_empty() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        *this.pending_error = Some(error);
                     }
                     if rendered.is_empty() {
                         return Poll::Ready(None);
@@ -1410,5 +1437,28 @@ accept_downstream_apis = ["openai_responses"]
             .0;
         assert_eq!(rendered["messages"][1]["reasoning_content"], "thought");
         assert_eq!(rendered["messages"][1]["content"][0]["text"], "answer");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_delivers_valid_events_before_later_error() {
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            "data: not-json\n\n",
+        );
+        let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body.as_bytes()))]);
+        let mut converted =
+            ChatConversionStream::<_, ResponsesStreamTarget>::with_recorder(inner, None);
+        let mut output_count = 0;
+        let error = loop {
+            match converted.next().await {
+                Some(Ok(_)) => output_count += 1,
+                Some(Err(error)) => break error,
+                None => panic!("expected malformed event error"),
+            }
+        };
+
+        assert!(output_count > 0);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(converted.next().await.is_none());
     }
 }

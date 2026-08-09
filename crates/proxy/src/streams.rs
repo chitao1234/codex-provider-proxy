@@ -131,6 +131,7 @@ pin_project! {
         response: StreamingResponseIr,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
+        pending_error: Option<std::io::Error>,
         finished: bool,
     }
 }
@@ -145,6 +146,7 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
+            pending_error: None,
             finished: false,
         }
     }
@@ -163,6 +165,7 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
+            pending_error: None,
             finished: false,
         }
     }
@@ -181,6 +184,9 @@ where
         if let Some(event) = this.out_events.pop_front() {
             return Poll::Ready(Some(Ok(event)));
         }
+        if let Some(error) = this.pending_error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
         if *this.finished {
             return Poll::Ready(None);
         }
@@ -198,22 +204,30 @@ where
                             Ok(parsed) => parsed,
                             Err(err) => {
                                 *this.finished = true;
-                                return Poll::Ready(Some(Err(err)));
+                                if rendered.is_empty() {
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                                *this.pending_error = Some(err);
+                                break;
                             }
                         };
                         if let Some((event_type, parsed)) = parsed {
                             if let Err(err) = this.parser.on_event(event_type, &parsed, &mut events)
                             {
                                 *this.finished = true;
-                                return Poll::Ready(Some(Err(std::io::Error::other(err))));
+                                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, err);
+                                if rendered.is_empty() {
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                                *this.pending_error = Some(err);
+                                break;
+                            }
+                            for event in events.drain(..) {
+                                this.response.on_event(&event);
+                                this.renderer.on_event(&event, &mut rendered);
                             }
                         }
                     }
-                    for event in &events {
-                        this.response.on_event(event);
-                        this.renderer.on_event(event, &mut rendered);
-                    }
-                    events.clear();
                     if !rendered.is_empty() {
                         this.out_events.extend(std::mem::take(&mut rendered));
                         return Poll::Ready(Some(Ok(this
@@ -245,10 +259,21 @@ where
                         this.renderer.on_event(event, &mut rendered);
                     }
                     this.renderer.finish(&mut rendered);
+                    let incomplete = this.response.has_started() && !this.response.is_terminal();
                     if let (Some(recorder), Some(response_id)) =
                         (this.recorder.as_ref(), this.response.openai_response_id())
                     {
                         recorder.record_stream(&response_id, this.response);
+                    }
+                    if incomplete {
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "upstream SSE ended without a terminal protocol event",
+                        );
+                        if rendered.is_empty() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        *this.pending_error = Some(error);
                     }
                     if rendered.is_empty() {
                         return Poll::Ready(None);
@@ -404,6 +429,35 @@ mod tests {
         fn finish(&mut self, _out: &mut Vec<Bytes>) {}
     }
 
+    struct StartParser;
+
+    impl Parser for StartParser {
+        fn on_event(
+            &mut self,
+            _event_type: &str,
+            _data: &Value,
+            out: &mut Vec<StreamEvent>,
+        ) -> Result<(), ConversionError> {
+            out.push(StreamEvent::Start {
+                id: "response_1".to_owned(),
+                model: "model".to_owned(),
+            });
+            Ok(())
+        }
+
+        fn finish(&mut self, _out: &mut Vec<StreamEvent>) {}
+    }
+
+    struct ByteRenderer;
+
+    impl Renderer for ByteRenderer {
+        fn on_event(&mut self, _event: &StreamEvent, out: &mut Vec<Bytes>) {
+            out.push(Bytes::from_static(b"converted"));
+        }
+
+        fn finish(&mut self, _out: &mut Vec<Bytes>) {}
+    }
+
     #[tokio::test]
     async fn parser_renderer_joins_multiline_sse_data() {
         let values = Rc::new(RefCell::new(Vec::new()));
@@ -442,6 +496,28 @@ mod tests {
                 NullRenderer,
             );
 
+            let error = converted.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(converted.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn parser_renderer_delivers_valid_events_before_later_error() {
+        for (body, expected_kind) in [
+            (
+                Bytes::from_static(b"data: {\"valid\":true}\n\ndata: not-json\n\n"),
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                Bytes::from_static(b"data: {\"valid\":true}\n\n"),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+        ] {
+            let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
+            let mut converted = ParserRendererStream::new(inner, StartParser, ByteRenderer);
+
+            assert_eq!(converted.next().await.unwrap().unwrap(), "converted");
             let error = converted.next().await.unwrap().unwrap_err();
             assert_eq!(error.kind(), expected_kind);
             assert!(converted.next().await.is_none());

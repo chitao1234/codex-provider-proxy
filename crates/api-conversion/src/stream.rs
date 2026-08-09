@@ -154,6 +154,14 @@ impl StreamingResponseIr {
         })
     }
 
+    pub fn has_started(&self) -> bool {
+        !self.upstream_id.is_empty()
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.failed || self.stop_reason.is_some()
+    }
+
     pub fn stop_reason(&self) -> Option<StopReason> {
         self.stop_reason
     }
