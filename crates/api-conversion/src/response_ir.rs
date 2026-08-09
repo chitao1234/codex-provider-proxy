@@ -36,7 +36,7 @@ enum ResponseItem {
     Message {
         id: Option<String>,
         status: Option<String>,
-        content: Vec<ResponseText>,
+        content: Vec<ResponseContent>,
         opaque_extensions: Map<String, Value>,
     },
     ToolCall {
@@ -55,6 +55,12 @@ struct ResponseText {
     text: String,
     annotations: Vec<Value>,
     opaque_extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+enum ResponseContent {
+    Text(ResponseText),
+    Opaque(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -154,21 +160,24 @@ impl ResponseIr {
                         message_status.clone_from(status);
                     }
                     message_extensions.extend(opaque_extensions.clone());
-                    content.extend(parts.iter().map(|part| {
-                        let mut opaque = part.opaque_extensions.clone();
-                        if !part.annotations.is_empty() {
-                            opaque.insert(
-                                "annotations".to_owned(),
-                                Value::Array(part.annotations.clone()),
-                            );
+                    content.extend(parts.iter().map(|part| match part {
+                        ResponseContent::Text(part) => {
+                            let mut opaque = part.opaque_extensions.clone();
+                            if !part.annotations.is_empty() {
+                                opaque.insert(
+                                    "annotations".to_owned(),
+                                    Value::Array(part.annotations.clone()),
+                                );
+                            }
+                            IrContent::Text {
+                                text: part.text.clone(),
+                                extensions: ContentExtensions {
+                                    cache_control: None,
+                                    opaque,
+                                },
+                            }
                         }
-                        IrContent::Text {
-                            text: part.text.clone(),
-                            extensions: ContentExtensions {
-                                cache_control: None,
-                                opaque,
-                            },
-                        }
+                        ResponseContent::Opaque(value) => IrContent::Raw(value.clone()),
                     }));
                 }
                 ResponseItem::ToolCall {
@@ -228,7 +237,7 @@ impl ResponseIr {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            content.push(ResponseText {
+            content.push(ResponseContent::Text(ResponseText {
                 text: text.to_owned(),
                 annotations: message
                     .get("annotations")
@@ -236,7 +245,7 @@ impl ResponseIr {
                     .cloned()
                     .unwrap_or_default(),
                 opaque_extensions: Map::new(),
-            });
+            }));
         }
         if !content.is_empty() {
             items.push(ResponseItem::Message {
@@ -380,7 +389,7 @@ impl ResponseIr {
                             ),
                         });
                     }
-                    Some("text") => message_content.push(ResponseText {
+                    Some("text") => message_content.push(ResponseContent::Text(ResponseText {
                         text: object
                             .get("text")
                             .and_then(Value::as_str)
@@ -388,7 +397,7 @@ impl ResponseIr {
                             .to_owned(),
                         annotations: Vec::new(),
                         opaque_extensions: opaque_fields(object, &["type", "text"]),
-                    }),
+                    })),
                     Some("tool_use") => {
                         flush_message_content(&mut items, &mut message_content);
                         items.push(ResponseItem::ToolCall {
@@ -496,21 +505,28 @@ impl ResponseIr {
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|part| {
-                                let part = part.as_object()?;
-                                Some(ResponseText {
-                                    text: part
+                            .map(|part| {
+                                let Some(part_object) = part.as_object() else {
+                                    return ResponseContent::Opaque(part.clone());
+                                };
+                                if part_object.get("type").and_then(Value::as_str)
+                                    != Some("output_text")
+                                {
+                                    return ResponseContent::Opaque(part.clone());
+                                }
+                                ResponseContent::Text(ResponseText {
+                                    text: part_object
                                         .get("text")
                                         .and_then(Value::as_str)
                                         .unwrap_or_default()
                                         .to_owned(),
-                                    annotations: part
+                                    annotations: part_object
                                         .get("annotations")
                                         .and_then(Value::as_array)
                                         .cloned()
                                         .unwrap_or_default(),
                                     opaque_extensions: opaque_fields(
-                                        part,
+                                        part_object,
                                         &["type", "text", "annotations"],
                                     ),
                                 })
@@ -614,15 +630,17 @@ impl ResponseIr {
                 }
                 ResponseItem::Message { content: parts, .. } => {
                     for part in parts {
-                        let mut block = part.opaque_extensions.clone();
-                        block.insert("type".to_owned(), json!("text"));
-                        block.insert("text".to_owned(), json!(part.text));
-                        content.push(Value::Object(block));
-                        if !part.annotations.is_empty() {
-                            if let Some(sources) =
-                                format_url_citations(Some(&Value::Array(part.annotations.clone())))
-                            {
-                                content.push(json!({"type":"text", "text":sources}));
+                        if let ResponseContent::Text(part) = part {
+                            let mut block = part.opaque_extensions.clone();
+                            block.insert("type".to_owned(), json!("text"));
+                            block.insert("text".to_owned(), json!(part.text));
+                            content.push(Value::Object(block));
+                            if !part.annotations.is_empty() {
+                                if let Some(sources) = format_url_citations(Some(&Value::Array(
+                                    part.annotations.clone(),
+                                ))) {
+                                    content.push(json!({"type":"text", "text":sources}));
+                                }
                             }
                         }
                     }
@@ -707,14 +725,21 @@ impl ResponseIr {
                 } => {
                     let mut rendered_content = Vec::new();
                     for part in content {
-                        let mut rendered = part.opaque_extensions.clone();
-                        rendered.insert("type".to_owned(), json!("output_text"));
-                        rendered.insert("text".to_owned(), json!(part.text));
-                        rendered.insert(
-                            "annotations".to_owned(),
-                            Value::Array(part.annotations.clone()),
-                        );
-                        rendered_content.push(Value::Object(rendered));
+                        match part {
+                            ResponseContent::Text(part) => {
+                                let mut rendered = part.opaque_extensions.clone();
+                                rendered.insert("type".to_owned(), json!("output_text"));
+                                rendered.insert("text".to_owned(), json!(part.text));
+                                rendered.insert(
+                                    "annotations".to_owned(),
+                                    Value::Array(part.annotations.clone()),
+                                );
+                                rendered_content.push(Value::Object(rendered));
+                            }
+                            ResponseContent::Opaque(value) => {
+                                rendered_content.push(value.clone());
+                            }
+                        }
                     }
                     let mut rendered = opaque_extensions.clone();
                     rendered.insert(
@@ -782,7 +807,7 @@ impl ResponseIr {
     }
 }
 
-fn flush_message_content(items: &mut Vec<ResponseItem>, content: &mut Vec<ResponseText>) {
+fn flush_message_content(items: &mut Vec<ResponseItem>, content: &mut Vec<ResponseContent>) {
     if content.is_empty() {
         return;
     }
@@ -1209,6 +1234,40 @@ mod tests {
         assert_eq!(output["usage"]["x_details"]["cached"], true);
         assert_eq!(output["conversation"], "conv-1");
         assert_eq!(output["x_provider"]["trace"], "t");
+    }
+
+    #[test]
+    fn responses_message_preserves_unknown_content_parts() {
+        let body = json!({
+            "id": "resp-1",
+            "model": "m",
+            "status": "completed",
+            "output": [{
+                "id": "msg-1",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {"type":"output_text", "text":"before", "annotations":[]},
+                    {"type":"refusal", "refusal":"not allowed", "vendor_code":7},
+                    {"type":"output_text", "text":"after", "annotations":[]}
+                ]
+            }],
+            "usage": {"input_tokens":1, "output_tokens":2}
+        });
+        let response = ResponseIr::parse(Protocol::OpenAiResponses, &body).unwrap();
+
+        let responses = response.render(Protocol::OpenAiResponses).unwrap();
+        assert_eq!(responses["output"][0]["content"][0]["text"], "before");
+        assert_eq!(responses["output"][0]["content"][1]["type"], "refusal");
+        assert_eq!(responses["output"][0]["content"][1]["vendor_code"], 7);
+        assert_eq!(responses["output"][0]["content"][2]["text"], "after");
+
+        let messages = response.render(Protocol::AnthropicMessages).unwrap();
+        let content = messages["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["text"], "after");
     }
 
     #[test]
