@@ -2234,6 +2234,13 @@ where
                     let mut passthrough = BytesMut::new();
 
                     while let Some(boundary_end) = find_sse_event_boundary(this.pending.as_ref()) {
+                        if boundary_end > codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES
+                        {
+                            *this.filtering = false;
+                            passthrough.extend_from_slice(this.pending.as_ref());
+                            this.pending.clear();
+                            break;
+                        }
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
                         if let Some(code) = responses_slow_down_error_code(&event_bytes) {
                             warn_slow_down_drop(
