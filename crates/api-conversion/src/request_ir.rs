@@ -2745,6 +2745,12 @@ impl IrToolCall {
             value => value.clone(),
         };
         let mut block = self.opaque_extensions.clone();
+        if !self.function_extensions.is_empty() {
+            block.insert(
+                "function".to_owned(),
+                Value::Object(self.function_extensions.clone()),
+            );
+        }
         block.insert("type".to_owned(), Value::String("tool_use".to_owned()));
         block.insert(
             "id".to_owned(),
@@ -2768,6 +2774,12 @@ impl IrToolCall {
             value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
         };
         let mut call = self.opaque_extensions.clone();
+        if !self.function_extensions.is_empty() {
+            call.insert(
+                "function".to_owned(),
+                Value::Object(self.function_extensions.clone()),
+            );
+        }
         call.insert("type".to_owned(), Value::String("function_call".to_owned()));
         call.insert(
             "id".to_owned(),

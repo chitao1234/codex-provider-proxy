@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use crate::chat::ChatUsage;
 use crate::sse::encode_sse_event;
@@ -105,7 +105,13 @@ impl MessagesRenderer {
                 self.open_text(out);
                 self.text_delta(text, out);
             }
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                opaque_extensions,
+                function_extensions,
+            } => {
                 self.close_text(out);
                 self.close_thinking(out);
                 let block_index = self.allocate_block_index();
@@ -117,12 +123,23 @@ impl MessagesRenderer {
                         emitted_len: 0,
                     },
                 );
+                let mut content_block = opaque_extensions.clone();
+                if !function_extensions.is_empty() {
+                    content_block.insert(
+                        "function".to_owned(),
+                        Value::Object(function_extensions.clone()),
+                    );
+                }
+                content_block.insert("type".to_owned(), json!("tool_use"));
+                content_block.insert("id".to_owned(), json!(id));
+                content_block.insert("name".to_owned(), json!(name));
+                content_block.insert("input".to_owned(), json!({}));
                 out.push(encode_sse_event(
                     "content_block_start",
                     &json!({
                         "type": "content_block_start",
                         "index": block_index,
-                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                        "content_block": content_block,
                     }),
                 ));
             }
@@ -476,6 +493,8 @@ mod tests {
                 index: 0,
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
+                opaque_extensions: Map::new(),
+                function_extensions: Map::new(),
             },
             StreamEvent::ToolCallArgsDelta {
                 index: 0,
@@ -498,6 +517,25 @@ mod tests {
         assert!(text.contains("\"partial_json\":\"ris\\\"}\""));
         assert!(!text.contains("\"partial_json\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
         assert!(text.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[test]
+    fn renders_tool_call_extensions() {
+        let text = render(vec![
+            StreamEvent::Start {
+                id: "x".to_owned(),
+                model: "m".to_owned(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                opaque_extensions: Map::from_iter([("x_call".to_owned(), json!(1))]),
+                function_extensions: Map::from_iter([("x_function".to_owned(), json!(2))]),
+            },
+        ]);
+        assert!(text.contains("\"x_call\":1"));
+        assert!(text.contains("\"function\":{\"x_function\":2}"));
     }
 
     #[test]

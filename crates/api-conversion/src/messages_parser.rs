@@ -6,7 +6,7 @@
 //! stop, message_delta, message_stop) into protocol-independent events, preserving
 //! thinking signatures and tool-call increments.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::chat::ChatUsage;
 use crate::error::ConversionError;
@@ -130,6 +130,10 @@ impl MessagesParser {
                             index: tool_index,
                             id,
                             name,
+                            opaque_extensions: block
+                                .map(|block| opaque_fields(block, &["type", "id", "name", "input"]))
+                                .unwrap_or_default(),
+                            function_extensions: Map::new(),
                         });
                     }
                     "text" | "thinking" => {}
@@ -282,6 +286,14 @@ fn messages_extension(kind: &str, payload: &Value) -> StreamEvent {
     }
 }
 
+fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn extract_anthropic_usage(usage: &Value) -> ChatUsage {
     let usage = usage.as_object();
     let u64_field = |field: &str| usage.and_then(|u| u.get(field)).and_then(Value::as_u64);
@@ -432,7 +444,7 @@ mod tests {
         parser
             .on_event(
                 "content_block_start",
-                &json!({"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}}),
+                &json!({"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}, "x_tool": 1}}),
                 &mut out,
             )
             .unwrap();
@@ -462,8 +474,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(&out[1], StreamEvent::ToolCallStart { index: 0, id, name } if id == "toolu_1" && name == "get_weather")
+            matches!(&out[1], StreamEvent::ToolCallStart { index: 0, id, name, .. } if id == "toolu_1" && name == "get_weather")
         );
+        assert!(matches!(
+            &out[1],
+            StreamEvent::ToolCallStart { opaque_extensions, .. }
+                if opaque_extensions["x_tool"] == 1
+        ));
         assert!(
             matches!(&out[2], StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "{\"city\": \"Pa")
         );

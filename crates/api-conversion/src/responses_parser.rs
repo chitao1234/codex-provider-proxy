@@ -13,7 +13,7 @@
 //! - DeepSeek/MiniMax ids have no `resp_`/`msg_`/`rs_` prefixes (kept as-is; the
 //!   renderer synthesizes prefixes downstream).
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::chat::ChatUsage;
 use crate::error::ConversionError;
@@ -167,6 +167,15 @@ impl ResponsesParser {
                             index: tool_index,
                             id,
                             name,
+                            opaque_extensions: item
+                                .map(|item| {
+                                    opaque_fields(
+                                        item,
+                                        &["id", "type", "status", "call_id", "name", "arguments"],
+                                    )
+                                })
+                                .unwrap_or_default(),
+                            function_extensions: Map::new(),
                         });
                     }
                     _ => {}
@@ -399,6 +408,14 @@ fn extract_responses_usage(usage: &Value) -> ChatUsage {
     }
 }
 
+fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,7 +531,7 @@ mod tests {
         parser
             .on_event(
                 "response.output_item.added",
-                &json!({"output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": ""}}),
+                &json!({"output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather", "arguments": "", "x_tool": 1}}),
                 &mut out,
             )
             .unwrap();
@@ -541,8 +558,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(&out[1], StreamEvent::ToolCallStart { index: 0, id, name } if id == "call_1" && name == "get_weather")
+            matches!(&out[1], StreamEvent::ToolCallStart { index: 0, id, name, .. } if id == "call_1" && name == "get_weather")
         );
+        assert!(matches!(
+            &out[1],
+            StreamEvent::ToolCallStart { opaque_extensions, .. }
+                if opaque_extensions["x_tool"] == 1
+        ));
         assert!(
             matches!(&out[2], StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "{\"city\": \"Pa")
         );

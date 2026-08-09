@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::chat::ChatUsage;
 use crate::sse::encode_sse_event;
@@ -21,6 +21,8 @@ struct FunctionCallState {
     name: String,
     arguments: String,
     output_index: usize,
+    opaque_extensions: Map<String, Value>,
+    function_extensions: Map<String, Value>,
 }
 
 /// Render semantic events into official OpenAI Responses SSE bytes.
@@ -130,7 +132,13 @@ impl ResponsesRenderer {
                     out,
                 );
             }
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                opaque_extensions,
+                function_extensions,
+            } => {
                 let item_id = format!("fc_{}_{}", self.response_id_suffix(), index);
                 let output_index = self.output_index;
                 self.output_index += 1;
@@ -142,21 +150,29 @@ impl ResponsesRenderer {
                         name: name.clone(),
                         arguments: String::new(),
                         output_index,
+                        opaque_extensions: opaque_extensions.clone(),
+                        function_extensions: function_extensions.clone(),
                     },
                 );
+                let mut item = opaque_extensions.clone();
+                if !function_extensions.is_empty() {
+                    item.insert(
+                        "function".to_owned(),
+                        Value::Object(function_extensions.clone()),
+                    );
+                }
+                item.insert("id".to_owned(), json!(item_id));
+                item.insert("type".to_owned(), json!("function_call"));
+                item.insert("status".to_owned(), json!("in_progress"));
+                item.insert("call_id".to_owned(), json!(id));
+                item.insert("name".to_owned(), json!(name));
+                item.insert("arguments".to_owned(), json!(""));
                 self.emit(
                     "response.output_item.added",
                     &json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": "",
-                        },
+                        "item": item,
                     }),
                     out,
                 );
@@ -306,17 +322,23 @@ impl ResponsesRenderer {
                 "output_index": state.output_index,
                 "arguments": state.arguments,
             }));
+            let mut item = state.opaque_extensions;
+            if !state.function_extensions.is_empty() {
+                item.insert(
+                    "function".to_owned(),
+                    Value::Object(state.function_extensions),
+                );
+            }
+            item.insert("id".to_owned(), json!(state.item_id));
+            item.insert("type".to_owned(), json!("function_call"));
+            item.insert("status".to_owned(), json!("completed"));
+            item.insert("call_id".to_owned(), json!(state.call_id));
+            item.insert("name".to_owned(), json!(state.name));
+            item.insert("arguments".to_owned(), json!(state.arguments));
             items_done.push(json!({
                 "type": "response.output_item.done",
                 "output_index": state.output_index,
-                "item": {
-                    "id": state.item_id,
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": state.call_id,
-                    "name": state.name,
-                    "arguments": state.arguments,
-                },
+                "item": item,
             }));
         }
         for event in args_done {
@@ -508,6 +530,8 @@ mod tests {
                 index: 0,
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
+                opaque_extensions: Map::new(),
+                function_extensions: Map::new(),
             },
             StreamEvent::ToolCallArgsDelta {
                 index: 0,
@@ -669,6 +693,21 @@ mod tests {
         assert!(text.contains("\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\""));
         assert!(text.contains("\"name\":\"get_weather\""));
         assert!(text.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn pipeline_preserves_chat_tool_call_extensions() {
+        let text = pipeline(
+            &[
+                r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","x_call":1,"function":{"name":"lookup","arguments":"{}","x_function":2}}]},"finish_reason":null}]}"#,
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ],
+            true,
+        );
+        assert!(text.contains("\"x_call\":1"));
+        assert!(text.contains("\"function\":{\"x_function\":2}"));
+        assert_eq!(text.matches("\"x_call\":1").count(), 2);
     }
 
     #[test]

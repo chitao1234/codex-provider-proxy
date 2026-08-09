@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::chat::{
     delta_string, extract_usage, first_choice_delta, first_choice_finish_reason,
@@ -24,6 +24,8 @@ struct ToolAccumulator {
     name: Option<String>,
     announced: bool,
     arguments: String,
+    opaque_extensions: Map<String, Value>,
+    function_extensions: Map<String, Value>,
     /// Bytes of `arguments` already emitted as deltas (for increment-only output).
     emitted_len: usize,
 }
@@ -98,6 +100,9 @@ impl ChatParser {
         let usage = extract_usage(&chunk);
         if !usage.is_empty() {
             self.usage = usage;
+        }
+        if let Some(extension) = chat_chunk_extension(&chunk) {
+            out.push(extension);
         }
         if let Some(finish_reason) = first_choice_finish_reason(&chunk) {
             let saw_tool_call = self.tools.values().any(|tool| tool.name.is_some());
@@ -199,6 +204,10 @@ impl ChatParser {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let call_extensions = opaque_fields(call, &["index", "id", "type", "function"]);
+        let function_extensions = function
+            .map(|function| opaque_fields(function, &["name", "arguments"]))
+            .unwrap_or_default();
 
         // Announce the tool call once id + name are both known.
         let announce = {
@@ -212,17 +221,27 @@ impl ChatParser {
             if let Some(arguments) = new_args {
                 accumulator.arguments.push_str(&arguments);
             }
+            accumulator.opaque_extensions.extend(call_extensions);
+            accumulator.function_extensions.extend(function_extensions);
             !accumulator.announced && accumulator.id.is_some() && accumulator.name.is_some()
         };
         if announce {
-            let (id, name) = {
+            let (id, name, opaque_extensions, function_extensions) = {
                 let acc = &self.tools[&index];
                 (
                     acc.id.clone().expect("checked"),
                     acc.name.clone().expect("checked"),
+                    acc.opaque_extensions.clone(),
+                    acc.function_extensions.clone(),
                 )
             };
-            out.push(StreamEvent::ToolCallStart { index, id, name });
+            out.push(StreamEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                opaque_extensions,
+                function_extensions,
+            });
             let acc = self.tools.get_mut(&index).expect("inserted above");
             acc.announced = true;
         }
@@ -237,6 +256,71 @@ impl ChatParser {
             }
         }
     }
+}
+
+fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn chat_chunk_extension(chunk: &Value) -> Option<StreamEvent> {
+    let chunk = chunk.as_object()?;
+    let mut payload = Map::new();
+    let root = opaque_fields(
+        chunk,
+        &[
+            "id", "object", "created", "model", "choices", "usage", "error",
+        ],
+    );
+    if !root.is_empty() {
+        payload.insert("root".to_owned(), Value::Object(root));
+    }
+    if let Some(choice) = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+    {
+        let choice_extensions = opaque_fields(choice, &["index", "delta", "finish_reason"]);
+        if !choice_extensions.is_empty() {
+            payload.insert("choice".to_owned(), Value::Object(choice_extensions));
+        }
+        if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
+            let delta_extensions = opaque_fields(
+                delta,
+                &["role", "reasoning_content", "content", "tool_calls"],
+            );
+            if !delta_extensions.is_empty() {
+                payload.insert("delta".to_owned(), Value::Object(delta_extensions));
+            }
+        }
+    }
+    if let Some(usage) = chunk.get("usage").and_then(Value::as_object) {
+        let usage_extensions = opaque_fields(
+            usage,
+            &[
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "cached_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+            ],
+        );
+        if !usage_extensions.is_empty() {
+            payload.insert("usage".to_owned(), Value::Object(usage_extensions));
+        }
+    }
+    (!payload.is_empty()).then(|| StreamEvent::Extension {
+        namespace: "openai.chat_completions".to_owned(),
+        kind: "chat.completion.chunk".to_owned(),
+        payload: Value::Object(payload),
+    })
 }
 
 /// MiMo url_citation annotations -> a "Sources:" text block (Anthropic has no
@@ -393,7 +477,7 @@ mod tests {
         parser.on_chunk("[DONE]", &mut events).unwrap();
 
         assert!(
-            matches!(&events[1], StreamEvent::ToolCallStart { index: 0, id, name } if id == "call_1" && name == "get_weather")
+            matches!(&events[1], StreamEvent::ToolCallStart { index: 0, id, name, .. } if id == "call_1" && name == "get_weather")
         );
         // Increments only, never cumulative.
         assert!(
@@ -433,6 +517,45 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(arguments, "{\"a\":1}");
+    }
+
+    #[test]
+    fn preserves_chunk_and_tool_call_extensions() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        parser
+            .on_chunk(
+                r#"{"id":"x","model":"m","service_tier":"priority","choices":[{"index":0,"logprobs":{"vendor":true},"x_choice":1,"delta":{"x_delta":2,"tool_calls":[{"index":0,"id":"call_1","type":"function","x_call":3,"function":{"name":"lookup","arguments":"{}","x_function":4}}]},"finish_reason":null}]}"#,
+                &mut events,
+            )
+            .unwrap();
+
+        let tool = events
+            .iter()
+            .find(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+            .unwrap();
+        assert!(matches!(
+            tool,
+            StreamEvent::ToolCallStart {
+                opaque_extensions,
+                function_extensions,
+                ..
+            } if opaque_extensions["x_call"] == 3 && function_extensions["x_function"] == 4
+        ));
+        let extension = events
+            .iter()
+            .find(|event| matches!(event, StreamEvent::Extension { .. }))
+            .unwrap();
+        assert!(matches!(
+            extension,
+            StreamEvent::Extension { namespace, kind, payload }
+                if namespace == "openai.chat_completions"
+                    && kind == "chat.completion.chunk"
+                    && payload["root"]["service_tier"] == "priority"
+                    && payload["choice"]["logprobs"]["vendor"] == true
+                    && payload["choice"]["x_choice"] == 1
+                    && payload["delta"]["x_delta"] == 2
+        ));
     }
 
     #[test]

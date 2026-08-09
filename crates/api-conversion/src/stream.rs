@@ -49,6 +49,8 @@ pub enum StreamEvent {
         index: usize,
         id: String,
         name: String,
+        opaque_extensions: Map<String, Value>,
+        function_extensions: Map<String, Value>,
     },
     /// Increment of a tool call's arguments (never cumulative).
     ToolCallArgsDelta { index: usize, args: String },
@@ -92,6 +94,8 @@ struct StreamingToolCall {
     id: String,
     name: String,
     arguments: String,
+    opaque_extensions: Map<String, Value>,
+    function_extensions: Map<String, Value>,
 }
 
 impl StreamingResponseIr {
@@ -105,13 +109,21 @@ impl StreamingResponseIr {
                 }
             }
             StreamEvent::TextDelta { text } => self.text.push_str(text),
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                opaque_extensions,
+                function_extensions,
+            } => {
                 self.tools.insert(
                     *index,
                     StreamingToolCall {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: String::new(),
+                        opaque_extensions: opaque_extensions.clone(),
+                        function_extensions: function_extensions.clone(),
                     },
                 );
             }
@@ -138,6 +150,11 @@ impl StreamingResponseIr {
                     if let Some(item) = payload.get("item") {
                         self.extensions.push((namespace.clone(), item.clone()));
                     }
+                } else {
+                    self.extensions.push((
+                        namespace.clone(),
+                        serde_json::json!({"kind": kind, "payload": payload}),
+                    ));
                 }
             }
         }
@@ -168,6 +185,12 @@ impl StreamingResponseIr {
 
     pub fn protocol_stop_reason(&self) -> Option<&str> {
         self.protocol_stop_reason.as_deref()
+    }
+
+    pub fn protocol_extensions(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.extensions
+            .iter()
+            .map(|(namespace, value)| (namespace.as_str(), value))
     }
 
     pub fn last_reasoning(&self) -> Option<&str> {
@@ -203,8 +226,8 @@ impl StreamingResponseIr {
                 name: tool.name.clone(),
                 arguments: serde_json::Value::String(tool.arguments.clone()),
                 status: Some("completed".to_owned()),
-                opaque_extensions: Map::new(),
-                function_extensions: Map::new(),
+                opaque_extensions: tool.opaque_extensions.clone(),
+                function_extensions: tool.function_extensions.clone(),
             })
             .collect();
         request.append_assistant_output(
@@ -273,6 +296,8 @@ mod tests {
                 index: 0,
                 id: "call_1".to_owned(),
                 name: "lookup".to_owned(),
+                opaque_extensions: Map::from_iter([("x_call".to_owned(), json!(1))]),
+                function_extensions: Map::from_iter([("x_function".to_owned(), json!(2))]),
             },
             StreamEvent::ToolCallArgsDelta {
                 index: 0,
@@ -282,6 +307,11 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
                 protocol_reason: Some("tool_calls".to_owned()),
                 usage: ChatUsage::default(),
+            },
+            StreamEvent::Extension {
+                namespace: "openai.chat_completions".to_owned(),
+                kind: "chat.completion.chunk".to_owned(),
+                payload: json!({"root":{"service_tier":"priority"}}),
             },
         ] {
             response.on_event(&event);
@@ -293,6 +323,16 @@ mod tests {
         );
         assert_eq!(response.stop_reason(), Some(StopReason::ToolUse));
         assert_eq!(response.protocol_stop_reason(), Some("tool_calls"));
+        assert_eq!(
+            response.protocol_extensions().next(),
+            Some((
+                "openai.chat_completions",
+                &json!({
+                    "kind":"chat.completion.chunk",
+                    "payload":{"root":{"service_tier":"priority"}}
+                })
+            ))
+        );
         let mut request = RequestIr::parse(
             Protocol::AnthropicMessages,
             &json!({"model":"m", "max_tokens":16, "messages":[{"role":"user", "content":"hi"}]}),
@@ -308,6 +348,8 @@ mod tests {
         assert_eq!(assistant["content"][0]["signature"], "sig");
         assert_eq!(assistant["content"][1]["text"], "answer");
         assert_eq!(assistant["content"][2]["id"], "call_1");
+        assert_eq!(assistant["content"][2]["x_call"], 1);
+        assert_eq!(assistant["content"][2]["function"]["x_function"], 2);
     }
 
     #[test]
