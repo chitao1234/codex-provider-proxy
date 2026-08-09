@@ -93,6 +93,7 @@ pub struct StreamingResponseIr {
     protocol_stop_reason: Option<String>,
     failed: bool,
     extensions: Vec<(String, Value)>,
+    continuation_extensions: Vec<(String, Value)>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +165,9 @@ impl StreamingResponseIr {
             } => {
                 if namespace == "openai.responses" && kind == "response.output_item.done" {
                     if let Some(item) = payload.get("item") {
+                        let item = item.clone();
                         self.extensions.push((namespace.clone(), item.clone()));
+                        self.continuation_extensions.push((namespace.clone(), item));
                     }
                 } else {
                     self.extensions.push((
@@ -253,7 +256,7 @@ impl StreamingResponseIr {
             tool_calls,
             Map::new(),
         );
-        for (namespace, value) in &self.extensions {
+        for (namespace, value) in &self.continuation_extensions {
             request.append_extension_item(namespace.clone(), value.clone());
         }
     }
@@ -394,5 +397,54 @@ mod tests {
             code: None,
         });
         assert_eq!(response.openai_response_id(), None);
+    }
+
+    #[test]
+    fn keeps_stream_extensions_out_of_responses_continuation_input() {
+        let mut response = StreamingResponseIr::default();
+        for event in [
+            StreamEvent::Start {
+                id: "resp_1".to_owned(),
+                model: "m".to_owned(),
+            },
+            StreamEvent::Extension {
+                namespace: "openai.responses".to_owned(),
+                kind: "response.web_search_call.searching".to_owned(),
+                payload: json!({"type":"response.web_search_call.searching","output_index":0}),
+            },
+            StreamEvent::Extension {
+                namespace: "openai.responses".to_owned(),
+                kind: "response.output_item.done".to_owned(),
+                payload: json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1","status":"completed"}
+                }),
+            },
+            StreamEvent::End {
+                stop_reason: StopReason::Stop,
+                protocol_reason: Some("completed".to_owned()),
+                usage: ChatUsage::default(),
+            },
+        ] {
+            response.on_event(&event);
+        }
+
+        let mut request = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({"model":"m","input":"next"}),
+        )
+        .unwrap();
+        response.append_to_request(&mut request);
+        let rendered = request
+            .render_with_report(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap()
+            .0;
+        let input = rendered["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["id"] == "ws_1"));
+        assert!(!input.iter().any(|item| {
+            item["kind"] == "response.web_search_call.searching"
+                || item["type"] == "response.web_search_call.searching"
+        }));
     }
 }
