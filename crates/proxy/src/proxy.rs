@@ -524,11 +524,7 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::streams::ParserRendererStream::new(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
-                    codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
-                )) as BoxRespStream,
+                ) => resp_stream,
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
@@ -4997,22 +4993,22 @@ mod tests {
 
     #[tokio::test]
     async fn messages_upstream_streams_to_messages_downstream() {
-        // Upstream serves Messages SSE; downstream Messages client receives it converted
-        // through the semantic IR (near-passthrough).
+        // Same-protocol streams remain byte-for-byte transparent, including events
+        // unknown to the semantic IR.
+        let sse_body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+                        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                        event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n\
+                        event: provider.extension\ndata: {\"type\":\"provider.extension\",\"opaque\":true}\n\n\
+                        event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                        event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n\
+                        event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let (url, _bodies, _headers, response, shutdown_tx) =
             spawn_scripted_server("/v1/messages").await;
         *response.lock().unwrap() = Some(
             axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from(
-                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
-                     event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
-                     event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello!\"}}\n\n\
-                     event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-                     event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n\
-                     event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                ))
+                .body(Body::from(sse_body))
                 .unwrap(),
         );
         let mut providers = HashMap::new();
@@ -5029,11 +5025,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("event: message_start"));
-        assert!(text.contains("\"text\":\"Hello!\""));
-        assert!(text.contains("\"stop_reason\":\"end_turn\""));
-        assert!(text.contains("event: message_stop"));
+        assert_eq!(body, sse_body);
         let _ = shutdown_tx.send(());
     }
 
