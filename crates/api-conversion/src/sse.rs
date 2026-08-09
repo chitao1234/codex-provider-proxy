@@ -1,6 +1,15 @@
 //! Server-Sent Events helpers: encoding downstream events and decoding upstream data lines.
 
+use std::borrow::Cow;
+
 use bytes::Bytes;
+
+/// The fields used by the conversion layer from one decoded SSE event.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DecodedEvent<'a> {
+    pub event_type: Option<&'a str>,
+    pub data: Option<Cow<'a, str>>,
+}
 
 /// Encode one SSE event: `event: <type>\ndata: <json>\n\n`.
 pub fn encode_sse_event(event_type: &str, data: &serde_json::Value) -> Bytes {
@@ -13,33 +22,32 @@ pub fn encode_sse_event(event_type: &str, data: &serde_json::Value) -> Bytes {
     Bytes::from(out)
 }
 
-/// The `data:` payload of a complete SSE event line (the part after `data: `, trimmed).
+/// Decode the event type and complete data payload from one SSE event.
 ///
-/// Returns `None` for non-data lines (`event:`, `:`, `id:`, `retry:`) and for empty data.
-pub fn data_payload(line: &str) -> Option<&str> {
-    let line = line.strip_prefix("data:")?;
-    let payload = line.strip_prefix(' ').unwrap_or(line);
-    if payload.is_empty() {
-        None
-    } else {
-        Some(payload)
+/// Multiple `data:` fields are joined with newlines as required by SSE. A single
+/// data field remains borrowed, keeping the common path allocation-free.
+pub fn decode_event(event: &[u8]) -> Result<DecodedEvent<'_>, std::str::Utf8Error> {
+    let event = std::str::from_utf8(event)?;
+    let mut event_type = None;
+    let mut data_lines = Vec::new();
+    for line in event.lines() {
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event_type = Some(value),
+            "data" => data_lines.push(value),
+            _ => {}
+        }
     }
-}
-
-/// Extract the first `data:` payload from a complete SSE event that may span multiple lines
-/// (`event: X\ndata: {...}\n\n`). OpenAI-compatible upstreams emit a single data line per event.
-pub fn first_data_payload(event: &[u8]) -> Option<&str> {
-    let event = std::str::from_utf8(event).ok()?;
-    event.lines().find_map(data_payload)
-}
-
-/// Extract the `event:` type from a complete SSE event, if present.
-pub fn first_event_type(event: &[u8]) -> Option<&str> {
-    let event = std::str::from_utf8(event).ok()?;
-    event
-        .lines()
-        .find_map(|line| line.strip_prefix("event:"))
-        .map(str::trim)
+    let data = match data_lines.as_slice() {
+        [] => None,
+        [data] => Some(Cow::Borrowed(*data)),
+        _ => Some(Cow::Owned(data_lines.join("\n"))),
+    };
+    Ok(DecodedEvent { event_type, data })
 }
 
 #[cfg(test)]
@@ -59,21 +67,26 @@ mod tests {
     }
 
     #[test]
-    fn extracts_data_payload() {
-        assert_eq!(data_payload("data: {\"a\":1}"), Some("{\"a\":1}"));
-        assert_eq!(data_payload("data:{\"a\":1}"), Some("{\"a\":1}"));
-        assert_eq!(data_payload("data: [DONE]"), Some("[DONE]"));
-        assert_eq!(data_payload("event: message_start"), None);
-        assert_eq!(data_payload(": keep-alive"), None);
-        assert_eq!(data_payload("data:"), None);
-    }
-
-    #[test]
-    fn extracts_first_data_payload_from_multiline_event() {
-        let event = b"event: message_start\ndata: {\"a\":1}\n\n";
-        assert_eq!(first_data_payload(event), Some("{\"a\":1}"));
-        let event = b": keep-alive\n\n";
-        assert_eq!(first_data_payload(event), None);
-        assert_eq!(first_data_payload(b"\xff\xfe garbage"), None);
+    fn decodes_complete_event_data() {
+        assert_eq!(
+            decode_event(b"event: message_start\ndata: {\"a\":1}\n\n").unwrap(),
+            DecodedEvent {
+                event_type: Some("message_start"),
+                data: Some(Cow::Borrowed("{\"a\":1}")),
+            }
+        );
+        assert_eq!(
+            decode_event(b"data: {\ndata:   \"a\": 1\ndata: }\n\n").unwrap(),
+            DecodedEvent {
+                event_type: None,
+                data: Some(Cow::Owned("{\n  \"a\": 1\n}".to_owned())),
+            }
+        );
+        assert_eq!(
+            decode_event(b"data:\ndata:\n\n").unwrap().data,
+            Some(Cow::Owned("\n".to_owned()))
+        );
+        assert_eq!(decode_event(b": keep-alive\n\n").unwrap().data, None);
+        assert!(decode_event(b"\xff\xfe garbage").is_err());
     }
 }

@@ -21,6 +21,39 @@ use serde_json::Value;
 
 use crate::api_conversion::ResponseRecorder;
 
+fn decode_json_event(event_bytes: &[u8]) -> std::io::Result<Option<(&str, Value)>> {
+    let event = sse::decode_event(event_bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("upstream SSE event is not valid UTF-8: {err}"),
+        )
+    })?;
+    let Some(payload) = event.data else {
+        return Ok(None);
+    };
+    let data = serde_json::from_str(&payload).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("upstream SSE data is not valid JSON: {err}"),
+        )
+    })?;
+    Ok(Some((event.event_type.unwrap_or(""), data)))
+}
+
+fn pending_has_data(pending: &[u8]) -> std::io::Result<bool> {
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    sse::decode_event(pending)
+        .map(|event| event.data.is_some())
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("upstream SSE ended with invalid UTF-8: {err}"),
+            )
+        })
+}
+
 /// An upstream SSE parser producing semantic events.
 pub trait Parser {
     fn on_event(
@@ -161,14 +194,18 @@ where
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        let event_type = sse::first_event_type(&event_bytes).unwrap_or("");
-                        if let Some(payload) = sse::first_data_payload(&event_bytes) {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
-                                if let Err(err) =
-                                    this.parser.on_event(event_type, &parsed, &mut events)
-                                {
-                                    return Poll::Ready(Some(Err(std::io::Error::other(err))));
-                                }
+                        let parsed = match decode_json_event(&event_bytes) {
+                            Ok(parsed) => parsed,
+                            Err(err) => {
+                                *this.finished = true;
+                                return Poll::Ready(Some(Err(err)));
+                            }
+                        };
+                        if let Some((event_type, parsed)) = parsed {
+                            if let Err(err) = this.parser.on_event(event_type, &parsed, &mut events)
+                            {
+                                *this.finished = true;
+                                return Poll::Ready(Some(Err(std::io::Error::other(err))));
                             }
                         }
                     }
@@ -191,6 +228,16 @@ where
                 }
                 Poll::Ready(None) => {
                     *this.finished = true;
+                    match pending_has_data(this.pending.as_ref()) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "upstream SSE ended during a data event",
+                            ))));
+                        }
+                        Err(err) => return Poll::Ready(Some(Err(err))),
+                    }
                     let mut final_events = Vec::new();
                     this.parser.finish(&mut final_events);
                     for event in &final_events {
@@ -270,14 +317,13 @@ where
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        let event_type = sse::first_event_type(&event_bytes).unwrap_or("");
-                        let Some(payload) = sse::first_data_payload(&event_bytes) else {
-                            continue;
-                        };
-                        let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                        let Ok(parsed) = decode_json_event(&event_bytes) else {
                             *this.recording = false;
                             this.pending.clear();
                             break;
+                        };
+                        let Some((event_type, parsed)) = parsed else {
+                            continue;
                         };
                         if this
                             .parser
@@ -301,6 +347,9 @@ where
             }
             Poll::Ready(None) => {
                 *this.finished = true;
+                if *this.recording && pending_has_data(this.pending.as_ref()).unwrap_or(true) {
+                    *this.recording = false;
+                }
                 if *this.recording {
                     let mut events = Vec::new();
                     this.parser.finish(&mut events);
@@ -317,5 +366,120 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
+    use futures_util::{stream, StreamExt};
+
+    use super::*;
+
+    struct ProbeParser {
+        values: Rc<RefCell<Vec<Value>>>,
+    }
+
+    impl Parser for ProbeParser {
+        fn on_event(
+            &mut self,
+            _event_type: &str,
+            data: &Value,
+            _out: &mut Vec<StreamEvent>,
+        ) -> Result<(), ConversionError> {
+            self.values.borrow_mut().push(data.clone());
+            Ok(())
+        }
+
+        fn finish(&mut self, _out: &mut Vec<StreamEvent>) {}
+    }
+
+    struct NullRenderer;
+
+    impl Renderer for NullRenderer {
+        fn on_event(&mut self, _event: &StreamEvent, _out: &mut Vec<Bytes>) {}
+
+        fn finish(&mut self, _out: &mut Vec<Bytes>) {}
+    }
+
+    #[tokio::test]
+    async fn parser_renderer_joins_multiline_sse_data() {
+        let values = Rc::new(RefCell::new(Vec::new()));
+        let body = Bytes::from_static(b"event: test\ndata: {\ndata: \"answer\": 42\ndata: }\n\n");
+        let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
+        let mut converted = ParserRendererStream::new(
+            inner,
+            ProbeParser {
+                values: values.clone(),
+            },
+            NullRenderer,
+        );
+
+        assert!(converted.next().await.is_none());
+        assert_eq!(*values.borrow(), vec![serde_json::json!({"answer": 42})]);
+    }
+
+    #[tokio::test]
+    async fn parser_renderer_rejects_malformed_and_truncated_data_events() {
+        for (body, expected_kind) in [
+            (
+                Bytes::from_static(b"data: not-json\n\n"),
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                Bytes::from_static(b"data: {\"answer\":42}"),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+        ] {
+            let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
+            let mut converted = ParserRendererStream::new(
+                inner,
+                ProbeParser {
+                    values: Rc::new(RefCell::new(Vec::new())),
+                },
+                NullRenderer,
+            );
+
+            let error = converted.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(converted.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_passthrough_keeps_malformed_sse_and_skips_recording() {
+        let store = crate::response_state::ResponseStateStore::new(4);
+        let request_ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &serde_json::json!({"model":"model", "input":"hi"}),
+        )
+        .unwrap();
+        let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
+        let body = Bytes::from_static(
+            concat!(
+                "event: response.created\n",
+                "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"model\"}}\n\n",
+                "event: response.completed\n",
+                "data: {\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n",
+                "data: not-json\n\n",
+                "data: {\"truncated\":true}",
+            )
+            .as_bytes(),
+        );
+        let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
+        let mut passthrough = RecordingPassthroughStream::new(
+            inner,
+            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            Some(recorder),
+        );
+        let mut received = Vec::new();
+        while let Some(chunk) = passthrough.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(received, body);
+        assert!(store.get("resp_1").is_none());
     }
 }

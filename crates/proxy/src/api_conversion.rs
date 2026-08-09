@@ -701,8 +701,19 @@ where
                         crate::proxy::find_sse_event_boundary(this.pending.as_ref())
                     {
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        if let Some(payload) = sse::first_data_payload(&event_bytes) {
-                            if let Err(err) = this.parser.on_chunk(payload, &mut events) {
+                        let event = match sse::decode_event(&event_bytes) {
+                            Ok(event) => event,
+                            Err(err) => {
+                                *this.finished = true;
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("upstream SSE event is not valid UTF-8: {err}"),
+                                ))));
+                            }
+                        };
+                        if let Some(payload) = event.data {
+                            if let Err(err) = this.parser.on_chunk(&payload, &mut events) {
+                                *this.finished = true;
                                 return Poll::Ready(Some(Err(std::io::Error::other(err))));
                             }
                         }
@@ -726,6 +737,23 @@ where
                 }
                 Poll::Ready(None) => {
                     *this.finished = true;
+                    if !this.pending.is_empty() {
+                        match sse::decode_event(this.pending.as_ref()) {
+                            Ok(event) if event.data.is_none() => {}
+                            Ok(_) => {
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "upstream SSE ended during a data event",
+                                ))));
+                            }
+                            Err(err) => {
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("upstream SSE ended with invalid UTF-8: {err}"),
+                                ))));
+                            }
+                        }
+                    }
                     let mut events = Vec::new();
                     this.parser.finish(&mut events);
                     let mut rendered = Vec::new();
