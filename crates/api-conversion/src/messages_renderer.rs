@@ -90,10 +90,15 @@ impl MessagesRenderer {
                     }),
                 ));
             }
-            StreamEvent::ReasoningDelta { text, .. } => {
+            StreamEvent::ReasoningDelta { text, signature } => {
                 self.close_text(out);
                 self.open_thinking(out);
-                self.thinking_delta(text, out);
+                if !text.is_empty() {
+                    self.thinking_delta(text, out);
+                }
+                if let Some(signature) = signature {
+                    self.thinking_signature_delta(signature, out);
+                }
             }
             StreamEvent::TextDelta { text } => {
                 self.close_thinking(out);
@@ -231,6 +236,17 @@ impl MessagesRenderer {
                 "type": "content_block_delta",
                 "index": self.thinking_index,
                 "delta": {"type": "thinking_delta", "thinking": thinking}
+            }),
+        ));
+    }
+
+    fn thinking_signature_delta(&mut self, signature: &str, out: &mut Vec<bytes::Bytes>) {
+        out.push(encode_sse_event(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": self.thinking_index,
+                "delta": {"type": "signature_delta", "signature": signature}
             }),
         ));
     }
@@ -426,6 +442,32 @@ mod tests {
         assert!(text.contains("\"text\":\"Hi\""));
         assert!(text.contains("\"stop_reason\":\"end_turn\""));
         assert!(text.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn renders_thinking_signature_delta() {
+        let text = render(vec![
+            StreamEvent::Start {
+                id: "x".to_string(),
+                model: "m".to_string(),
+            },
+            StreamEvent::ReasoningDelta {
+                text: "We".to_string(),
+                signature: None,
+            },
+            StreamEvent::ReasoningDelta {
+                text: String::new(),
+                signature: Some("sig".to_string()),
+            },
+            StreamEvent::End {
+                stop_reason: StopReason::Stop,
+                usage: ChatUsage::default(),
+            },
+        ]);
+
+        assert!(text.contains("\"type\":\"thinking_delta\""));
+        assert!(text.contains("\"type\":\"signature_delta\""));
+        assert!(text.contains("\"signature\":\"sig\""));
     }
 
     #[test]

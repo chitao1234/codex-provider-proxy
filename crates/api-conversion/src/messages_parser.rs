@@ -15,8 +15,6 @@ use crate::stream::{StopReason, StreamEvent};
 /// Accumulated tool-call state across upstream content blocks.
 #[derive(Default)]
 struct ToolAccumulator {
-    id: Option<String>,
-    name: Option<String>,
     arguments: String,
     /// Arguments already emitted as deltas (increments only).
     emitted_len: usize,
@@ -29,12 +27,10 @@ pub struct MessagesParser {
     /// Upstream id/model captured from message_start.
     message_id: String,
     model: String,
-    /// Index of the content block currently being deltad (if any).
-    active_block: Option<usize>,
-    /// Type of the active block: "text" | "thinking" | "tool_use".
-    active_type: Option<&'static str>,
     /// Tool call index -> accumulated state.
     tools: HashMap<usize, ToolAccumulator>,
+    /// Anthropic content block index -> protocol-neutral tool call index.
+    tool_blocks: HashMap<usize, usize>,
     /// Next tool index to assign (Anthropic blocks have no index, use sequence).
     next_tool_index: usize,
     usage: ChatUsage,
@@ -57,9 +53,8 @@ impl MessagesParser {
             finished: false,
             message_id: String::new(),
             model: String::new(),
-            active_block: None,
-            active_type: None,
             tools: HashMap::new(),
+            tool_blocks: HashMap::new(),
             next_tool_index: 0,
             usage: ChatUsage::default(),
             end_emitted: false,
@@ -112,12 +107,6 @@ impl MessagesParser {
                     .and_then(Value::as_u64)
                     .map(|i| i as usize)
                     .unwrap_or_default();
-                self.active_block = Some(index);
-                self.active_type = Some(match block_type {
-                    "thinking" => "thinking",
-                    "tool_use" => "tool_use",
-                    _ => "text",
-                });
                 if block_type == "tool_use" {
                     let id = block
                         .and_then(|b| b.get("id"))
@@ -131,14 +120,8 @@ impl MessagesParser {
                         .to_string();
                     let tool_index = self.next_tool_index;
                     self.next_tool_index += 1;
-                    self.tools.insert(
-                        tool_index,
-                        ToolAccumulator {
-                            id: Some(id.clone()),
-                            name: Some(name.clone()),
-                            ..Default::default()
-                        },
-                    );
+                    self.tool_blocks.insert(index, tool_index);
+                    self.tools.insert(tool_index, ToolAccumulator::default());
                     out.push(StreamEvent::ToolCallStart {
                         index: tool_index,
                         id,
@@ -148,59 +131,77 @@ impl MessagesParser {
             }
             "content_block_delta" => {
                 let delta = data.get("delta").and_then(Value::as_object);
-                match self.active_type {
-                    Some("thinking") => {
-                        if let Some(text) = delta.and_then(|d| d.get("thinking")) {
-                            if let Some(text) = text.as_str() {
-                                // thinking_delta carries the increment.
-                                out.push(StreamEvent::ReasoningDelta {
-                                    text: text.to_string(),
-                                    signature: None,
-                                });
-                            }
+                match delta
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta
+                            .and_then(|delta| delta.get("thinking"))
+                            .and_then(Value::as_str)
+                        {
+                            out.push(StreamEvent::ReasoningDelta {
+                                text: text.to_owned(),
+                                signature: None,
+                            });
                         }
                     }
-                    Some("tool_use") => {
-                        if let Some(partial) = delta.and_then(|d| d.get("partial_json")) {
-                            if let Some(partial) = partial.as_str() {
-                                let tool_index = self
-                                    .tools
-                                    .iter()
-                                    .find(|(_, t)| t.name.is_some() && t.id.is_some())
-                                    .map(|(i, _)| *i);
-                                if let Some(tool_index) = tool_index {
-                                    let acc = self.tools.get_mut(&tool_index).expect("tool exists");
-                                    acc.arguments.push_str(partial);
-                                    if acc.emitted_len < acc.arguments.len() {
-                                        let increment =
-                                            acc.arguments[acc.emitted_len..].to_string();
-                                        acc.emitted_len = acc.arguments.len();
-                                        if !increment.is_empty() {
-                                            out.push(StreamEvent::ToolCallArgsDelta {
-                                                index: tool_index,
-                                                args: increment,
-                                            });
-                                        }
-                                    }
+                    Some("signature_delta") => {
+                        if let Some(signature) = delta
+                            .and_then(|delta| delta.get("signature"))
+                            .and_then(Value::as_str)
+                        {
+                            out.push(StreamEvent::ReasoningDelta {
+                                text: String::new(),
+                                signature: Some(signature.to_owned()),
+                            });
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let partial = delta
+                            .and_then(|delta| delta.get("partial_json"))
+                            .and_then(Value::as_str);
+                        let tool_index = data
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .and_then(|index| self.tool_blocks.get(&(index as usize)))
+                            .copied();
+                        if let (Some(partial), Some(tool_index)) = (partial, tool_index) {
+                            let acc = self.tools.get_mut(&tool_index).expect("tool exists");
+                            acc.arguments.push_str(partial);
+                            if acc.emitted_len < acc.arguments.len() {
+                                let increment = acc.arguments[acc.emitted_len..].to_string();
+                                acc.emitted_len = acc.arguments.len();
+                                if !increment.is_empty() {
+                                    out.push(StreamEvent::ToolCallArgsDelta {
+                                        index: tool_index,
+                                        args: increment,
+                                    });
                                 }
                             }
                         }
                     }
-                    _ => {
-                        // text_delta
-                        if let Some(text) = delta.and_then(|d| d.get("text")) {
-                            if let Some(text) = text.as_str() {
-                                out.push(StreamEvent::TextDelta {
-                                    text: text.to_string(),
-                                });
-                            }
+                    Some("text_delta") | None => {
+                        if let Some(text) = delta
+                            .and_then(|delta| delta.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            out.push(StreamEvent::TextDelta {
+                                text: text.to_owned(),
+                            });
                         }
                     }
+                    Some(_) => {}
                 }
             }
             "content_block_stop" => {
-                self.active_block = None;
-                self.active_type = None;
+                if let Some(index) = data
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|index| index as usize)
+                {
+                    self.tool_blocks.remove(&index);
+                }
             }
             "message_delta" => {
                 // stop_reason + usage.
@@ -369,6 +370,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_thinking_signature_delta() {
+        let mut parser = MessagesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event(
+                "content_block_start",
+                &json!({"index": 2, "content_block": {"type": "thinking", "thinking": ""}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_delta",
+                &json!({"index": 2, "delta": {"type": "thinking_delta", "thinking": "We"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_delta",
+                &json!({"index": 2, "delta": {"type": "signature_delta", "signature": "sig"}}),
+                &mut out,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ReasoningDelta { text, signature }
+                if text == "We" && signature.is_none()
+        ));
+        assert!(matches!(
+            &out[1],
+            StreamEvent::ReasoningDelta { text, signature }
+                if text.is_empty() && signature.as_deref() == Some("sig")
+        ));
+    }
+
+    #[test]
     fn parses_tool_use_with_increments() {
         let mut parser = MessagesParser::new();
         let mut out = Vec::new();
@@ -423,6 +462,52 @@ mod tests {
         assert!(
             matches!(out.last().unwrap(), StreamEvent::End { stop_reason, .. } if *stop_reason == StopReason::ToolUse)
         );
+    }
+
+    #[test]
+    fn routes_tool_deltas_by_content_block_index() {
+        let mut parser = MessagesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event(
+                "content_block_start",
+                &json!({"index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "first", "input": {}}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_start",
+                &json!({"index": 3, "content_block": {"type": "tool_use", "id": "toolu_2", "name": "second", "input": {}}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_delta",
+                &json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event("content_block_stop", &json!({"index": 1}), &mut out)
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_delta",
+                &json!({"index": 3, "delta": {"type": "input_json_delta", "partial_json": "{\"b\":"}}),
+                &mut out,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &out[2],
+            StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "{\"a\":"
+        ));
+        assert!(matches!(
+            &out[3],
+            StreamEvent::ToolCallArgsDelta { index: 1, args } if args == "{\"b\":"
+        ));
     }
 
     #[test]

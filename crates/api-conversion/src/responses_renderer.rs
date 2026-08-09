@@ -104,6 +104,9 @@ impl ResponsesRenderer {
                 );
             }
             StreamEvent::ReasoningDelta { text, .. } => {
+                if text.is_empty() {
+                    return;
+                }
                 self.ensure_reasoning_item(out);
                 self.reasoning_text.push_str(text);
                 let index = self.reasoning_item.unwrap_or(0);
