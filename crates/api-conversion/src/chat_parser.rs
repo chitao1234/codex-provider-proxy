@@ -15,13 +15,14 @@ use crate::chat::{
     is_usage_only_chunk, upstream_id, upstream_model, ChatUsage,
 };
 use crate::error::ConversionError;
-use crate::stream::{map_chat_finish_reason, StreamEvent};
+use crate::stream::{map_chat_finish_reason, StopReason, StreamEvent};
 
 /// Accumulated state of one upstream tool call across chunks.
 #[derive(Default)]
 struct ToolAccumulator {
     id: Option<String>,
     name: Option<String>,
+    announced: bool,
     arguments: String,
     /// Bytes of `arguments` already emitted as deltas (for increment-only output).
     emitted_len: usize,
@@ -33,6 +34,7 @@ pub struct ChatParser {
     finished: bool,
     tools: HashMap<usize, ToolAccumulator>,
     usage: ChatUsage,
+    pending_stop: Option<(StopReason, String)>,
 }
 
 impl Default for ChatParser {
@@ -48,6 +50,7 @@ impl ChatParser {
             finished: false,
             tools: HashMap::new(),
             usage: ChatUsage::default(),
+            pending_stop: None,
         }
     }
 
@@ -98,14 +101,13 @@ impl ChatParser {
         }
         if let Some(finish_reason) = first_choice_finish_reason(&chunk) {
             let saw_tool_call = self.tools.values().any(|tool| tool.name.is_some());
-            out.push(StreamEvent::End {
-                stop_reason: map_chat_finish_reason(Some(finish_reason), saw_tool_call),
-                protocol_reason: Some(finish_reason.to_owned()),
-                usage: self.usage,
-            });
-            // The response is complete once a finish_reason arrives; subsequent
-            // usage-only chunks are absorbed by finish().
-            self.finish(out);
+            self.pending_stop = Some((
+                map_chat_finish_reason(Some(finish_reason), saw_tool_call),
+                finish_reason.to_owned(),
+            ));
+            if !self.usage.is_empty() {
+                self.finish(out);
+            }
             return Ok(());
         }
         if is_usage_only_chunk(&chunk) {
@@ -128,7 +130,7 @@ impl ChatParser {
             let Some(tool) = self.tools.get_mut(&index) else {
                 continue;
             };
-            if tool.name.is_none() {
+            if !tool.announced {
                 continue;
             }
             if tool.emitted_len < tool.arguments.len() {
@@ -136,6 +138,13 @@ impl ChatParser {
                 tool.emitted_len = tool.arguments.len();
                 out.push(StreamEvent::ToolCallArgsDelta { index, args });
             }
+        }
+        if let Some((stop_reason, protocol_reason)) = self.pending_stop.take() {
+            out.push(StreamEvent::End {
+                stop_reason,
+                protocol_reason: Some(protocol_reason),
+                usage: self.usage,
+            });
         }
     }
 
@@ -203,7 +212,7 @@ impl ChatParser {
             if let Some(arguments) = new_args {
                 accumulator.arguments.push_str(&arguments);
             }
-            accumulator.id.is_some() && accumulator.name.is_some()
+            !accumulator.announced && accumulator.id.is_some() && accumulator.name.is_some()
         };
         if announce {
             let (id, name) = {
@@ -214,10 +223,8 @@ impl ChatParser {
                 )
             };
             out.push(StreamEvent::ToolCallStart { index, id, name });
-            // Clear id/name so the announce fires only once; arguments keep accumulating.
             let acc = self.tools.get_mut(&index).expect("inserted above");
-            acc.id = None;
-            acc.name = None;
+            acc.announced = true;
         }
 
         // Emit only the arguments increment since the last emission.
@@ -327,6 +334,41 @@ mod tests {
     }
 
     #[test]
+    fn captures_usage_from_trailing_usage_only_chunk() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        parser
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+                &mut events,
+            )
+            .unwrap();
+        parser
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#,
+                &mut events,
+            )
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::End { .. })));
+        parser
+            .on_chunk(
+                r#"{"id":"x","choices":[],"usage":{"prompt_tokens":6,"completion_tokens":9}}"#,
+                &mut events,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::End { usage, protocol_reason, .. })
+                if usage.prompt_tokens == Some(6)
+                    && usage.completion_tokens == Some(9)
+                    && protocol_reason.as_deref() == Some("stop")
+        ));
+    }
+
+    #[test]
     fn parses_tool_calls_with_incremental_arguments() {
         let mut parser = ChatParser::new();
         let mut events = Vec::new();
@@ -361,6 +403,36 @@ mod tests {
             matches!(&events[3], StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "ris\"}")
         );
         assert!(!events.iter().any(|e| matches!(e, StreamEvent::ToolCallArgsDelta { args, .. } if args == "{\"city\": \"Paris\"}")));
+    }
+
+    #[test]
+    fn repeated_tool_metadata_does_not_restart_tool_call() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"a\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"1}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ] {
+            parser.on_chunk(payload, &mut events).unwrap();
+        }
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+        let arguments = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallArgsDelta { args, .. } => Some(args.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(arguments, "{\"a\":1}");
     }
 
     #[test]
