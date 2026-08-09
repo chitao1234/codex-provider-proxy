@@ -40,7 +40,7 @@ pub struct RequestIr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum IrConversationItem {
+pub(crate) enum IrConversationItem {
     Message(IrMessage),
     Reasoning(Value),
 }
@@ -170,19 +170,20 @@ impl GenerationControls {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct IrMessage {
-    role: String,
-    content: Vec<IrContent>,
-    item_id: Option<String>,
-    tool_call_id: Option<String>,
-    tool_calls: Vec<IrToolCall>,
-    opaque_extensions: Map<String, Value>,
+pub(crate) struct IrMessage {
+    pub(crate) role: String,
+    pub(crate) content: Vec<IrContent>,
+    pub(crate) item_id: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) tool_calls: Vec<IrToolCall>,
+    pub(crate) opaque_extensions: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-struct ContentExtensions {
-    cache_control: Option<Value>,
-    opaque: Map<String, Value>,
+pub(crate) struct ContentExtensions {
+    pub(crate) cache_control: Option<Value>,
+    pub(crate) opaque: Map<String, Value>,
 }
 
 impl ContentExtensions {
@@ -205,12 +206,14 @@ impl ContentExtensions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum IrContent {
+pub(crate) enum IrContent {
     Text {
         text: String,
         extensions: ContentExtensions,
     },
     Thinking {
+        id: Option<String>,
+        status: Option<String>,
         text: String,
         signature: Option<String>,
         extensions: ContentExtensions,
@@ -227,11 +230,13 @@ enum IrContent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct IrToolCall {
-    id: Option<String>,
-    call_id: Option<String>,
-    name: String,
-    arguments: Value,
+pub(crate) struct IrToolCall {
+    pub(crate) id: Option<String>,
+    pub(crate) call_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) arguments: Value,
+    pub(crate) status: Option<String>,
+    pub(crate) opaque_extensions: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,6 +439,28 @@ impl RequestIr {
         self.transcript.extend(parsed.transcript);
     }
 
+    pub(crate) fn append_assistant_output(
+        &mut self,
+        content: Vec<IrContent>,
+        item_id: Option<String>,
+        status: Option<String>,
+        tool_calls: Vec<IrToolCall>,
+        opaque_extensions: Map<String, Value>,
+    ) {
+        if content.is_empty() && tool_calls.is_empty() && opaque_extensions.is_empty() {
+            return;
+        }
+        self.transcript.push(IrConversationItem::Message(IrMessage {
+            role: "assistant".to_owned(),
+            content,
+            item_id,
+            status,
+            tool_call_id: None,
+            tool_calls,
+            opaque_extensions,
+        }));
+    }
+
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
@@ -500,6 +527,7 @@ impl RequestIr {
                         extensions: ContentExtensions::default(),
                     }],
                     item_id: None,
+                    status: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
                     opaque_extensions: Map::new(),
@@ -534,6 +562,10 @@ impl RequestIr {
                             role: "tool".to_owned(),
                             content,
                             item_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+                            status: value
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             tool_call_id: value
                                 .get("call_id")
                                 .and_then(Value::as_str)
@@ -578,6 +610,10 @@ impl RequestIr {
             role: role.clone(),
             content: normalize_content(object.get("content")),
             item_id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+            status: object
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             tool_call_id: object
                 .get("tool_call_id")
                 .or_else(|| object.get("call_id"))
@@ -594,6 +630,7 @@ impl RequestIr {
                     "tool_calls",
                     "tool_call_id",
                     "call_id",
+                    "status",
                 ],
             ),
         };
@@ -1918,6 +1955,11 @@ impl IrContent {
                 extensions: ContentExtensions::parse(object, &["type", "text", "cache_control"]),
             },
             Some("thinking" | "reasoning_text") => Self::Thinking {
+                id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                status: object
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 text: object
                     .get("thinking")
                     .or_else(|| object.get("text"))
@@ -1930,7 +1972,15 @@ impl IrContent {
                     .map(str::to_owned),
                 extensions: ContentExtensions::parse(
                     object,
-                    &["type", "thinking", "text", "signature", "cache_control"],
+                    &[
+                        "id",
+                        "type",
+                        "status",
+                        "thinking",
+                        "text",
+                        "signature",
+                        "cache_control",
+                    ],
                 ),
             },
             Some("image" | "input_image" | "image_url") => Self::Image(value.clone()),
@@ -1970,6 +2020,8 @@ impl IrContent {
                 Value::Object(object)
             }
             Self::Thinking {
+                id: _,
+                status: _,
                 text,
                 signature,
                 extensions,
@@ -2065,6 +2117,8 @@ fn prepared_content(content: &[IrContent], keep_cache_control: bool) -> Vec<IrCo
                 }
             }
             IrContent::Thinking {
+                id,
+                status,
                 text,
                 signature,
                 extensions,
@@ -2072,6 +2126,8 @@ fn prepared_content(content: &[IrContent], keep_cache_control: bool) -> Vec<IrCo
                 let mut extensions = extensions.clone();
                 extensions.cache_control = None;
                 IrContent::Thinking {
+                    id: id.clone(),
+                    status: status.clone(),
                     text: text.clone(),
                     signature: signature.clone(),
                     extensions,
@@ -2093,6 +2149,7 @@ impl IrMessage {
             role: "custom".to_owned(),
             content: vec![IrContent::Raw(value)],
             item_id: None,
+            status: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
             opaque_extensions: Map::new(),
@@ -2104,6 +2161,7 @@ impl IrMessage {
             role: "assistant".to_owned(),
             content: Vec::new(),
             item_id: None,
+            status: None,
             tool_call_id: None,
             tool_calls: vec![call],
             opaque_extensions: Map::new(),
@@ -2236,17 +2294,42 @@ impl IrMessage {
                 IrContent::ToolUse(call) => values.push(call.to_responses()),
                 // Anthropic thinking blocks have no Responses content type; they become
                 // standalone reasoning items preceding the assistant message.
-                IrContent::Thinking { text, .. } if !text.trim().is_empty() => {
-                    values.push(serde_json::json!({
-                        "type":"reasoning",
-                        "summary":[{"type":"summary_text","text":text}]
-                    }));
+                IrContent::Thinking {
+                    id,
+                    status,
+                    text,
+                    extensions,
+                    ..
+                } if !text.trim().is_empty() => {
+                    let mut reasoning = extensions.opaque.clone();
+                    reasoning.insert("type".to_owned(), Value::String("reasoning".to_owned()));
+                    if let Some(id) = id {
+                        reasoning.insert("id".to_owned(), Value::String(id.clone()));
+                    }
+                    if let Some(status) = status {
+                        reasoning.insert("status".to_owned(), Value::String(status.clone()));
+                    }
+                    reasoning.insert(
+                        "summary".to_owned(),
+                        serde_json::json!([{"type":"summary_text","text":text}]),
+                    );
+                    values.push(Value::Object(reasoning));
                 }
                 _ => content.push(part.to_responses(&self.role)),
             }
         }
         if !content.is_empty() {
-            values.push(serde_json::json!({"type":"message", "role":self.role, "content":content}));
+            let mut message = self.opaque_extensions.clone();
+            message.insert("type".to_owned(), Value::String("message".to_owned()));
+            message.insert("role".to_owned(), Value::String(self.role.clone()));
+            message.insert("content".to_owned(), Value::Array(content));
+            if let Some(id) = &self.item_id {
+                message.insert("id".to_owned(), Value::String(id.clone()));
+            }
+            if let Some(status) = &self.status {
+                message.insert("status".to_owned(), Value::String(status.clone()));
+            }
+            values.push(Value::Object(message));
         }
         values.extend(self.tool_calls.iter().map(IrToolCall::to_responses));
         values
@@ -2382,6 +2465,14 @@ impl IrToolCall {
                 .and_then(|f| f.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| Value::String("{}".to_owned())),
+            status: value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            opaque_extensions: value
+                .as_object()
+                .map(|object| opaque_fields(object, &["id", "type", "function", "status"]))
+                .unwrap_or_default(),
         }
     }
 
@@ -2398,6 +2489,14 @@ impl IrToolCall {
                 .get("input")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
+            status: value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            opaque_extensions: value
+                .as_object()
+                .map(|object| opaque_fields(object, &["id", "type", "name", "input", "status"]))
+                .unwrap_or_default(),
         }
     }
 
@@ -2417,6 +2516,19 @@ impl IrToolCall {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| Value::String("{}".to_owned())),
+            status: value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            opaque_extensions: value
+                .as_object()
+                .map(|object| {
+                    opaque_fields(
+                        object,
+                        &["id", "type", "call_id", "name", "arguments", "status"],
+                    )
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -2425,7 +2537,22 @@ impl IrToolCall {
             Value::String(value) => value.clone(),
             value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
         };
-        serde_json::json!({"id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "type":"function", "function":{"name":self.name, "arguments":arguments}})
+        let mut call = self.opaque_extensions.clone();
+        call.insert(
+            "id".to_owned(),
+            Value::String(
+                self.call_id
+                    .clone()
+                    .or_else(|| self.id.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+        call.insert("type".to_owned(), Value::String("function".to_owned()));
+        call.insert(
+            "function".to_owned(),
+            serde_json::json!({"name":self.name, "arguments":arguments}),
+        );
+        Value::Object(call)
     }
 
     fn to_messages_block(&self) -> Value {
@@ -2437,7 +2564,20 @@ impl IrToolCall {
             }
             value => value.clone(),
         };
-        serde_json::json!({"type":"tool_use", "id":self.id.clone().or_else(|| self.call_id.clone()).unwrap_or_default(), "name":self.name, "input":input})
+        let mut block = self.opaque_extensions.clone();
+        block.insert("type".to_owned(), Value::String("tool_use".to_owned()));
+        block.insert(
+            "id".to_owned(),
+            Value::String(
+                self.call_id
+                    .clone()
+                    .or_else(|| self.id.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+        block.insert("name".to_owned(), Value::String(self.name.clone()));
+        block.insert("input".to_owned(), input);
+        Value::Object(block)
     }
 
     fn to_responses(&self) -> Value {
@@ -2447,7 +2587,25 @@ impl IrToolCall {
             Value::String(value) => value.clone(),
             value => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()),
         };
-        serde_json::json!({"type":"function_call", "id":self.id, "call_id":self.call_id.clone().or(self.id.clone()), "name":self.name, "arguments":arguments})
+        let mut call = self.opaque_extensions.clone();
+        call.insert("type".to_owned(), Value::String("function_call".to_owned()));
+        call.insert(
+            "id".to_owned(),
+            self.id.clone().map_or(Value::Null, Value::String),
+        );
+        call.insert(
+            "call_id".to_owned(),
+            self.call_id
+                .clone()
+                .or_else(|| self.id.clone())
+                .map_or(Value::Null, Value::String),
+        );
+        call.insert("name".to_owned(), Value::String(self.name.clone()));
+        call.insert("arguments".to_owned(), Value::String(arguments));
+        if let Some(status) = &self.status {
+            call.insert("status".to_owned(), Value::String(status.clone()));
+        }
+        Value::Object(call)
     }
 }
 

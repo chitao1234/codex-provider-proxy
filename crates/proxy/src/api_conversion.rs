@@ -468,6 +468,21 @@ impl ResponseRecorder {
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
         ));
     }
+
+    pub fn record_ir(&self, response_id: &str, response: &ResponseIr) {
+        let mut request_ir = self.request_ir.clone();
+        response.append_to_request(&mut request_ir);
+        let now = crate::response_state::now_unix();
+        self.store.put(crate::response_state::ResponseState::new(
+            response_id.to_string(),
+            self.provider_name.clone(),
+            self.model.clone(),
+            request_ir,
+            response.last_reasoning().map(str::to_owned),
+            now,
+            crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
+        ));
+    }
 }
 
 /// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
@@ -493,10 +508,24 @@ pub fn convert_non_streaming_body(
     convert_non_streaming_body_with_pipeline(body, response_pipeline(upstream_api, downstream))
 }
 
-pub fn convert_non_streaming_body_with_pipeline(
+#[cfg(test)]
+fn convert_non_streaming_body_with_pipeline(
     body: Bytes,
     pipeline: ResponsePipeline,
 ) -> Result<Bytes, std::io::Error> {
+    convert_non_streaming_response(body, pipeline).map(|converted| converted.body)
+}
+
+struct ConvertedNonStreamingResponse {
+    body: Bytes,
+    response_id: Option<String>,
+    response: Option<ResponseIr>,
+}
+
+fn convert_non_streaming_response(
+    body: Bytes,
+    pipeline: ResponsePipeline,
+) -> Result<ConvertedNonStreamingResponse, std::io::Error> {
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -506,19 +535,39 @@ pub fn convert_non_streaming_body_with_pipeline(
     if pipeline.source == Protocol::AnthropicMessages
         && pipeline.target == DownstreamApi::AnthropicMessages
     {
-        return Ok(body);
+        return Ok(ConvertedNonStreamingResponse {
+            response_id: json
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+            response: None,
+            body,
+        });
     }
-    let converted = ResponseIr::parse(pipeline.source, &json)
-        .and_then(|response| response.render(pipeline.target_protocol()))
+    let response = ResponseIr::parse(pipeline.source, &json)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    serde_json::to_vec(&converted)
+    let converted = response
+        .render(pipeline.target_protocol())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let response_id = converted
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let body = serde_json::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "failed to serialize converted response",
             )
-        })
+        })?;
+    Ok(ConvertedNonStreamingResponse {
+        body,
+        response_id,
+        response: Some(response),
+    })
 }
 
 pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> ResponsePipeline {
@@ -774,28 +823,18 @@ where
                 Poll::Ready(None) => {
                     *this.finished = true;
                     let buffered = std::mem::take(this.buffered).freeze();
-                    if let Some(recorder) = &this.recorder {
-                        if let Ok(json) = serde_json::from_slice::<Value>(&buffered) {
-                            let turn = ResponseIr::chat_assistant_turn(&json);
-                            let converted = convert_non_streaming_body_with_pipeline(
-                                buffered.clone(),
-                                *this.pipeline,
-                            );
-                            if let Ok(converted) = converted {
-                                if let Ok(body) = serde_json::from_slice::<Value>(&converted) {
-                                    if let Some(response_id) =
-                                        body.get("id").and_then(Value::as_str)
-                                    {
-                                        recorder.record(response_id, turn);
-                                    }
-                                }
+                    *this.result = Some(
+                        convert_non_streaming_response(buffered, *this.pipeline).map(|converted| {
+                            if let (Some(recorder), Some(response_id), Some(response)) = (
+                                this.recorder.as_ref(),
+                                converted.response_id.as_deref(),
+                                converted.response.as_ref(),
+                            ) {
+                                recorder.record_ir(response_id, response);
                             }
-                        }
-                    }
-                    *this.result = Some(convert_non_streaming_body_with_pipeline(
-                        buffered,
-                        *this.pipeline,
-                    ));
+                            converted.body
+                        }),
+                    );
                     return Poll::Ready(this.result.take());
                 }
                 Poll::Pending => return Poll::Pending,
@@ -813,6 +852,8 @@ pub fn strip_converted_response_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{stream, StreamExt};
+
     use super::*;
 
     fn provider(upstream: UpstreamApi, downstream: DownstreamApi) -> Provider {
@@ -1145,5 +1186,81 @@ accept_downstream_apis = ["openai_responses"]
             resolve_conversion_plan(&provider, &Method::POST, "/v1/messages").unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_recorder_consumes_neutral_response_ir() {
+        let cases = [
+            (
+                Protocol::AnthropicMessages,
+                serde_json::json!({
+                    "id": "msg_1",
+                    "model": "m",
+                    "content": [
+                        {"type":"thinking", "thinking":"thought", "signature":"sig"},
+                        {"type":"text", "text":"answer"},
+                        {"type":"tool_use", "id":"call_1", "name":"lookup", "input":{"q":1}}
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1, "output_tokens": 2}
+                }),
+                "resp_msg_1",
+            ),
+            (
+                Protocol::OpenAiResponses,
+                serde_json::json!({
+                    "id": "resp_1",
+                    "model": "m",
+                    "status": "completed",
+                    "output": [
+                        {"id":"rs_1", "type":"reasoning", "status":"completed", "summary":[{"type":"summary_text", "text":"thought"}]},
+                        {"id":"msg_1", "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]},
+                        {"id":"fc_1", "type":"function_call", "status":"completed", "call_id":"call_1", "name":"lookup", "arguments":"{\"q\":1}"}
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 2}
+                }),
+                "resp_1",
+            ),
+        ];
+
+        for (source, body, expected_id) in cases {
+            let store = crate::response_state::ResponseStateStore::new(4);
+            let request_ir = RequestIr::parse(
+                Protocol::OpenAiResponses,
+                &serde_json::json!({"model":"m", "input":"hi"}),
+            )
+            .unwrap();
+            let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
+            let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from(
+                serde_json::to_vec(&body).unwrap(),
+            ))]);
+            let mut converted = NonStreamingConversionStream::with_recorder(
+                inner,
+                1024 * 1024,
+                ResponsePipeline {
+                    source,
+                    target: DownstreamApi::OpenAiResponses,
+                },
+                Some(recorder),
+            );
+            while let Some(chunk) = converted.next().await {
+                chunk.unwrap();
+            }
+
+            let state = store.get(expected_id).expect("response state recorded");
+            assert_eq!(state.last_reasoning.as_deref(), Some("thought"));
+            let rendered = state
+                .request_ir
+                .render_with_report(
+                    Protocol::OpenAiChatCompletions,
+                    &ModelCapabilities::default(),
+                )
+                .unwrap()
+                .0;
+            let messages = rendered["messages"].as_array().unwrap();
+            assert_eq!(messages[1]["reasoning_content"], "thought");
+            assert_eq!(messages[1]["content"][0]["text"], "answer");
+            assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        }
     }
 }

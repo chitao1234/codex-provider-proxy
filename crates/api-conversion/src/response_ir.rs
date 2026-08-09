@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use crate::chat::{extract_usage, first_choice, first_choice_message, upstream_id, upstream_model};
 use crate::conversion_utils::format_url_citations;
 use crate::error::ConversionError;
-use crate::request_ir::Protocol;
+use crate::request_ir::{ContentExtensions, IrContent, IrToolCall, Protocol, RequestIr};
 use crate::stream::{map_chat_finish_reason, StopReason};
 
 #[derive(Debug, Clone)]
@@ -18,6 +18,7 @@ pub struct ResponseIr {
     status: String,
     incomplete_details: Option<Value>,
     error: Option<Value>,
+    termination: ResponseTermination,
     items: Vec<ResponseItem>,
     usage: ResponseUsage,
     opaque_extensions: Map<String, Value>,
@@ -56,6 +57,13 @@ struct ResponseText {
     opaque_extensions: Map<String, Value>,
 }
 
+#[derive(Debug, Clone)]
+struct ResponseTermination {
+    reason: StopReason,
+    protocol_reason: Option<String>,
+    stop_sequence: Option<Value>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ResponseUsage {
     input_tokens: Option<u64>,
@@ -88,17 +96,106 @@ impl ResponseIr {
         }
     }
 
-    pub fn chat_assistant_turn(body: &Value) -> Option<Value> {
-        let message = first_choice_message(body)?;
-        let has_text = message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty());
-        let has_calls = message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some_and(|calls| !calls.is_empty());
-        (has_text || has_calls).then(|| message.clone())
+    pub fn id(&self) -> Option<&str> {
+        (!self.id.is_empty()).then_some(self.id.as_str())
+    }
+
+    pub fn stop_reason(&self) -> StopReason {
+        self.termination.reason
+    }
+
+    pub fn protocol_stop_reason(&self) -> Option<&str> {
+        self.termination.protocol_reason.as_deref()
+    }
+
+    pub fn last_reasoning(&self) -> Option<&str> {
+        self.items.iter().rev().find_map(|item| match item {
+            ResponseItem::Reasoning { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn append_to_request(&self, request: &mut RequestIr) {
+        let mut content = Vec::new();
+        let mut item_id = None;
+        let mut message_status = None;
+        let mut message_extensions = Map::new();
+        let mut tool_calls = Vec::new();
+        for item in &self.items {
+            match item {
+                ResponseItem::Reasoning {
+                    id,
+                    status,
+                    text,
+                    signature,
+                    opaque_extensions,
+                } => {
+                    content.push(IrContent::Thinking {
+                        id: id.clone(),
+                        status: status.clone(),
+                        text: text.clone(),
+                        signature: signature.clone(),
+                        extensions: ContentExtensions {
+                            cache_control: None,
+                            opaque: opaque_extensions.clone(),
+                        },
+                    });
+                }
+                ResponseItem::Message {
+                    id,
+                    status,
+                    content: parts,
+                    opaque_extensions,
+                } => {
+                    if item_id.is_none() {
+                        item_id.clone_from(id);
+                    }
+                    if message_status.is_none() {
+                        message_status.clone_from(status);
+                    }
+                    message_extensions.extend(opaque_extensions.clone());
+                    content.extend(parts.iter().map(|part| {
+                        let mut opaque = part.opaque_extensions.clone();
+                        if !part.annotations.is_empty() {
+                            opaque.insert(
+                                "annotations".to_owned(),
+                                Value::Array(part.annotations.clone()),
+                            );
+                        }
+                        IrContent::Text {
+                            text: part.text.clone(),
+                            extensions: ContentExtensions {
+                                cache_control: None,
+                                opaque,
+                            },
+                        }
+                    }));
+                }
+                ResponseItem::ToolCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                    status,
+                    opaque_extensions,
+                } => tool_calls.push(IrToolCall {
+                    id: id.clone(),
+                    call_id: Some(call_id.clone()),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    status: status.clone(),
+                    opaque_extensions: opaque_extensions.clone(),
+                }),
+                ResponseItem::Opaque(_) => {}
+            }
+        }
+        request.append_assistant_output(
+            content,
+            item_id,
+            message_status,
+            tool_calls,
+            message_extensions,
+        );
     }
 
     fn parse_chat(body: &Value) -> Result<Self, ConversionError> {
@@ -203,6 +300,17 @@ impl ResponseIr {
             status: status_for_stop(stop_reason).to_owned(),
             incomplete_details: incomplete_details_for_stop(stop_reason),
             error: None,
+            termination: ResponseTermination {
+                reason: stop_reason,
+                protocol_reason: body
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                stop_sequence: None,
+            },
             items,
             usage: ResponseUsage {
                 input_tokens: usage.prompt_tokens,
@@ -323,6 +431,14 @@ impl ResponseIr {
             status: status_for_stop(stop_reason).to_owned(),
             incomplete_details: incomplete_details_for_stop(stop_reason),
             error: None,
+            termination: ResponseTermination {
+                reason: stop_reason,
+                protocol_reason: message
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                stop_sequence: message.get("stop_sequence").cloned(),
+            },
             items,
             usage: parse_messages_usage(message.get("usage")),
             opaque_extensions: opaque_fields(
@@ -441,17 +557,21 @@ impl ResponseIr {
                 }
             }
         }
+        let status = response
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_owned();
+        let incomplete_details = response.get("incomplete_details").cloned();
+        let termination = responses_termination(&status, incomplete_details.as_ref(), &items);
         Ok(Self {
             id: string_field(response, "id"),
             model: string_field(response, "model"),
             created_at: response.get("created_at").cloned(),
-            status: response
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("completed")
-                .to_owned(),
-            incomplete_details: response.get("incomplete_details").cloned(),
+            status,
+            incomplete_details,
             error: response.get("error").cloned(),
+            termination,
             items,
             usage: parse_responses_usage(response.get("usage")),
             opaque_extensions: opaque_fields(
@@ -524,12 +644,12 @@ impl ResponseIr {
                 ResponseItem::Opaque(_) | ResponseItem::Reasoning { .. } => {}
             }
         }
-        let stop_reason = if self.status == "incomplete" {
-            "max_tokens"
-        } else if saw_tool_call {
-            "tool_use"
-        } else {
-            "end_turn"
+        let stop_reason = match self.termination.reason {
+            StopReason::ToolUse => "tool_use",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::ContentFilter => "refusal",
+            StopReason::Stop | StopReason::Other if saw_tool_call => "tool_use",
+            StopReason::Stop | StopReason::Other => "end_turn",
         };
         let mut out = Map::new();
         out.insert("id".to_owned(), json!(synth_message_id(&self.id)));
@@ -538,7 +658,13 @@ impl ResponseIr {
         out.insert("model".to_owned(), json!(self.model));
         out.insert("content".to_owned(), Value::Array(content));
         out.insert("stop_reason".to_owned(), json!(stop_reason));
-        out.insert("stop_sequence".to_owned(), Value::Null);
+        out.insert(
+            "stop_sequence".to_owned(),
+            self.termination
+                .stop_sequence
+                .clone()
+                .unwrap_or(Value::Null),
+        );
         out.insert("usage".to_owned(), self.usage.render_messages());
         Value::Object(out)
     }
@@ -856,6 +982,36 @@ fn incomplete_details_for_stop(reason: StopReason) -> Option<Value> {
     }
 }
 
+fn responses_termination(
+    status: &str,
+    incomplete_details: Option<&Value>,
+    items: &[ResponseItem],
+) -> ResponseTermination {
+    let protocol_reason = incomplete_details
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| (status != "completed").then(|| status.to_owned()));
+    let reason = match protocol_reason.as_deref() {
+        Some("max_output_tokens" | "max_tokens") => StopReason::MaxTokens,
+        Some("content_filter" | "refusal") => StopReason::ContentFilter,
+        Some("incomplete") => StopReason::MaxTokens,
+        Some(_) => StopReason::Other,
+        None if items
+            .iter()
+            .any(|item| matches!(item, ResponseItem::ToolCall { .. })) =>
+        {
+            StopReason::ToolUse
+        }
+        None => StopReason::Stop,
+    };
+    ResponseTermination {
+        reason,
+        protocol_reason,
+        stop_sequence: None,
+    }
+}
+
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -867,6 +1023,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::dialect::ModelCapabilities;
 
     fn convert(source: Protocol, target: Protocol, body: Value) -> Value {
         ResponseIr::parse(source, &body)
@@ -1012,5 +1169,61 @@ mod tests {
         assert_eq!(output["usage"]["x_details"]["cached"], true);
         assert_eq!(output["conversation"], "conv-1");
         assert_eq!(output["x_provider"]["trace"], "t");
+    }
+
+    #[test]
+    fn response_ir_exposes_normalized_and_protocol_stop_reasons() {
+        let response = ResponseIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "id": "resp-1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": []
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response.stop_reason(), StopReason::MaxTokens);
+        assert_eq!(response.protocol_stop_reason(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn response_ir_appends_protocol_neutral_continuation_items() {
+        let mut request = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({"model": "m", "input": "hi"}),
+        )
+        .unwrap();
+        let response = ResponseIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "id": "resp-1",
+                "model": "m",
+                "status": "completed",
+                "output": [
+                    {"id":"rs_1", "type":"reasoning", "status":"completed", "summary":[{"type":"summary_text", "text":"thought"}]},
+                    {"id":"msg_1", "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text", "text":"answer", "annotations":[]}]},
+                    {"id":"fc_1", "type":"function_call", "status":"completed", "call_id":"call_1", "name":"lookup", "arguments":"{\"q\":1}", "x_provider":"kept"}
+                ]
+            }),
+        )
+        .unwrap();
+
+        response.append_to_request(&mut request);
+        let rendered = request
+            .render_with_report(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap()
+            .0;
+        let input = rendered["input"].as_array().unwrap();
+        assert_eq!(input[1]["id"], "rs_1");
+        assert_eq!(input[1]["status"], "completed");
+        assert_eq!(input[1]["summary"][0]["text"], "thought");
+        assert_eq!(input[2]["id"], "msg_1");
+        assert_eq!(input[2]["status"], "completed");
+        assert_eq!(input[2]["content"][0]["text"], "answer");
+        assert_eq!(input[3]["id"], "fc_1");
+        assert_eq!(input[3]["status"], "completed");
+        assert_eq!(input[3]["x_provider"], "kept");
     }
 }
