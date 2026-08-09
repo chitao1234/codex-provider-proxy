@@ -30,17 +30,25 @@ pub fn decode_event(event: &[u8]) -> Result<DecodedEvent<'_>, std::str::Utf8Erro
     let event = std::str::from_utf8(event)?;
     let mut event_type = None;
     let mut data_lines = Vec::new();
-    for line in event.lines() {
-        if line.starts_with(':') {
-            continue;
+    let bytes = event.as_bytes();
+    let mut line_start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' | b'\n' => {
+                decode_line(&event[line_start..index], &mut event_type, &mut data_lines);
+                if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                line_start = index;
+            }
+            _ => index += 1,
         }
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "event" => event_type = Some(value),
-            "data" => data_lines.push(value),
-            _ => {}
-        }
+    }
+    if line_start < event.len() {
+        decode_line(&event[line_start..], &mut event_type, &mut data_lines);
     }
     let data = match data_lines.as_slice() {
         [] => None,
@@ -48,6 +56,19 @@ pub fn decode_event(event: &[u8]) -> Result<DecodedEvent<'_>, std::str::Utf8Erro
         _ => Some(Cow::Owned(data_lines.join("\n"))),
     };
     Ok(DecodedEvent { event_type, data })
+}
+
+fn decode_line<'a>(line: &'a str, event_type: &mut Option<&'a str>, data_lines: &mut Vec<&'a str>) {
+    if line.starts_with(':') {
+        return;
+    }
+    let (field, value) = line.split_once(':').unwrap_or((line, ""));
+    let value = value.strip_prefix(' ').unwrap_or(value);
+    match field {
+        "event" => *event_type = Some(value),
+        "data" => data_lines.push(value),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +108,13 @@ mod tests {
             Some(Cow::Owned("\n".to_owned()))
         );
         assert_eq!(decode_event(b": keep-alive\n\n").unwrap().data, None);
+        assert_eq!(
+            decode_event(b"event: test\rdata: first\rdata: second\r\r").unwrap(),
+            DecodedEvent {
+                event_type: Some("test"),
+                data: Some(Cow::Owned("first\nsecond".to_owned())),
+            }
+        );
         assert!(decode_event(b"\xff\xfe garbage").is_err());
     }
 }

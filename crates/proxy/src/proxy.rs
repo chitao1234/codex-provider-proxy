@@ -2147,20 +2147,25 @@ fn responses_slow_down_error_code(event_bytes: &[u8]) -> Option<&'static str> {
 pub(crate) fn find_sse_event_boundary(buf: &[u8]) -> Option<usize> {
     let mut idx = 0usize;
     while idx < buf.len() {
-        match buf[idx] {
-            b'\n' if buf.get(idx + 1) == Some(&b'\n') => return Some(idx + 2),
-            b'\r'
-                if buf.get(idx + 1) == Some(&b'\n')
-                    && buf.get(idx + 2) == Some(&b'\r')
-                    && buf.get(idx + 3) == Some(&b'\n') =>
-            {
-                return Some(idx + 4);
-            }
-            _ => {}
+        let Some(first_end) = sse_line_ending_end(buf, idx) else {
+            idx += 1;
+            continue;
+        };
+        if let Some(second_end) = sse_line_ending_end(buf, first_end) {
+            return Some(second_end);
         }
-        idx += 1;
+        idx = first_end;
     }
     None
+}
+
+fn sse_line_ending_end(buf: &[u8], start: usize) -> Option<usize> {
+    match buf.get(start)? {
+        b'\n' => Some(start + 1),
+        b'\r' if buf.get(start + 1) == Some(&b'\n') => Some(start + 2),
+        b'\r' => Some(start + 1),
+        _ => None,
+    }
 }
 
 fn slow_down_disconnect_error(code: &str) -> std::io::Error {
@@ -2948,14 +2953,28 @@ mod tests {
     use super::{
         apply_anthropic_beta_updates, buffer_request_body, downstream_response_status,
         error_log_details, filtered_incoming_headers, filtered_response_headers,
-        format_error_chain, handle_proxy_inner, is_text_event_stream, join_paths,
-        linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
+        find_sse_event_boundary, format_error_chain, handle_proxy_inner, is_text_event_stream,
+        join_paths, linear_retry_backoff_delay, maybe_filter_responses_slow_down_stream,
         path_is_messages_count_tokens, proxy_error_response, resolve_upstream_attempt,
         responses_slow_down_error_code, send_with_non_2xx_retries,
         send_with_non_2xx_retries_with_sleep, should_drop_responses_slow_down_errors,
         strip_listen_base_path, ProxyState, RequestBodyTooLarge, ResolveUpstreamAttemptArgs,
         RetryRequestTemplate, RetrySendArgs, ANTHROPIC_BETA_HEADER, KEEP_ALIVE_HEADER,
     };
+
+    #[test]
+    fn finds_all_valid_sse_blank_line_encodings() {
+        for delimiter in ["\n\n", "\r\n\r\n", "\r\r", "\r\n\n", "\n\r\n"] {
+            let event = format!("data: {{}}{delimiter}next");
+            assert_eq!(
+                find_sse_event_boundary(event.as_bytes()),
+                Some("data: {}".len() + delimiter.len()),
+                "delimiter={delimiter:?}",
+            );
+        }
+        assert_eq!(find_sse_event_boundary(b"data: {}\r\n"), None);
+        assert_eq!(find_sse_event_boundary(b"data: {}\r"), None);
+    }
 
     #[tokio::test]
     async fn request_body_buffer_accepts_exact_limit_and_rejects_over_limit() {
