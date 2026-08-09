@@ -33,7 +33,7 @@ pub enum DownstreamApi {
     /// Anthropic Messages API (`POST /v1/messages`), e.g. Claude Code.
     AnthropicMessages,
     /// OpenAI Responses API (`POST /v1/responses`), e.g. Codex CLI.
-    #[serde(rename = "openai_responses", alias = "openai_responses")]
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
 }
 

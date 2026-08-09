@@ -2,6 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use codex_provider_proxy_api_conversion::dialect::{DownstreamApi, ModelCapabilities, UpstreamApi};
+use http::header::HeaderName;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -445,6 +446,27 @@ fn optional_non_empty_strings(
     })
 }
 
+fn validate_model_capabilities(
+    provider_name: &str,
+    scope: &str,
+    capabilities: &ModelCapabilities,
+) -> Result<()> {
+    let Some(header_name) = capabilities.cache.prompt_cache_key_header.as_deref() else {
+        return Ok(());
+    };
+    if header_name.trim() != header_name || header_name.is_empty() {
+        return Err(anyhow!(
+            "provider {provider_name} {scope} cache.prompt_cache_key_header must be a non-empty HTTP header name without surrounding whitespace"
+        ));
+    }
+    HeaderName::from_bytes(header_name.as_bytes()).map_err(|_| {
+        anyhow!(
+            "provider {provider_name} {scope} cache.prompt_cache_key_header is not a valid HTTP header name: {header_name:?}"
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ProviderFile {
     base_url: Url,
@@ -476,6 +498,12 @@ impl Config {
         for (name, provider) in file.providers {
             if provider.base_url.cannot_be_a_base() {
                 return Err(anyhow!("provider {name} base_url cannot be a base url"));
+            }
+            if let Some(capabilities) = &provider.capabilities {
+                validate_model_capabilities(&name, "capabilities", capabilities)?;
+            }
+            for (model, capabilities) in &provider.models {
+                validate_model_capabilities(&name, &format!("models.{model:?}"), capabilities)?;
             }
             providers.insert(
                 name,
@@ -696,6 +724,84 @@ mod tests {
             config.providers["provider_a"].accept_downstream_apis,
             vec![DownstreamApi::AnthropicMessages]
         );
+    }
+
+    #[test]
+    fn accepts_valid_prompt_cache_key_headers() {
+        let config = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+
+                [providers.provider_a.capabilities.cache]
+                prompt_cache_key = true
+                prompt_cache_key_header = "x-conversation-id"
+
+                [providers.provider_a.models."model-a".cache]
+                prompt_cache_key = true
+                prompt_cache_key_header = "x-model-conversation-id"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.providers["provider_a"]
+                .default_capabilities
+                .as_ref()
+                .unwrap()
+                .cache
+                .prompt_cache_key_header
+                .as_deref(),
+            Some("x-conversation-id")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_prompt_cache_key_header_in_provider_capabilities() {
+        let error = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+
+                [providers.provider_a.capabilities.cache]
+                prompt_cache_key_header = "invalid header"
+            "#,
+        )
+        .expect_err("invalid header name should fail during config loading");
+
+        assert!(error
+            .to_string()
+            .contains("capabilities cache.prompt_cache_key_header is not a valid HTTP header"));
+    }
+
+    #[test]
+    fn rejects_invalid_prompt_cache_key_header_in_model_capabilities() {
+        let error = Config::from_toml_str(
+            r#"
+                listen_addr = "127.0.0.1:8080"
+                default_provider = "provider_a"
+
+                [providers.provider_a]
+                base_url = "https://api.example.com/"
+                api_key = "replace-me"
+
+                [providers.provider_a.models."model-a".cache]
+                prompt_cache_key_header = " x-conversation-id"
+            "#,
+        )
+        .expect_err("surrounding whitespace should fail during config loading");
+
+        assert!(error.to_string().contains(
+            "models.\"model-a\" cache.prompt_cache_key_header must be a non-empty HTTP header"
+        ));
     }
 
     #[test]
