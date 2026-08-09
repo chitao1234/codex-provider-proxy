@@ -139,6 +139,13 @@ impl ResponseIr {
         self.termination.protocol_reason.as_deref()
     }
 
+    /// Whether this response contains terminal assistant output suitable for a
+    /// later continuation transcript.
+    pub fn is_continuable(&self) -> bool {
+        self.error.as_ref().is_none_or(Value::is_null)
+            && matches!(self.status.as_str(), "completed" | "incomplete")
+    }
+
     pub fn last_reasoning(&self) -> Option<&str> {
         self.items.iter().rev().find_map(|item| match item {
             ResponseItem::Reasoning { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
@@ -1310,6 +1317,30 @@ mod tests {
 
         assert_eq!(response.stop_reason(), StopReason::MaxTokens);
         assert_eq!(response.protocol_stop_reason(), Some("max_output_tokens"));
+    }
+
+    #[test]
+    fn only_terminal_non_error_responses_are_continuable() {
+        for (status, error, expected) in [
+            ("completed", Value::Null, true),
+            ("incomplete", Value::Null, true),
+            ("in_progress", Value::Null, false),
+            ("failed", json!({"message":"boom"}), false),
+            ("completed", json!({"message":"boom"}), false),
+        ] {
+            let response = ResponseIr::parse(
+                Protocol::OpenAiResponses,
+                &json!({
+                    "id": "resp_1",
+                    "model": "m",
+                    "status": status,
+                    "error": error,
+                    "output": []
+                }),
+            )
+            .unwrap();
+            assert_eq!(response.is_continuable(), expected, "status={status}");
+        }
     }
 
     #[test]

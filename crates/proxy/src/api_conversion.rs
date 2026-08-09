@@ -858,7 +858,10 @@ where
                             if let (Some(recorder), Some(response_id), Some(response)) = (
                                 this.recorder.as_ref(),
                                 converted.response_id.as_deref(),
-                                converted.response.as_ref(),
+                                converted
+                                    .response
+                                    .as_ref()
+                                    .filter(|response| response.is_continuable()),
                             ) {
                                 recorder.record_ir(response_id, response);
                             }
@@ -1328,6 +1331,46 @@ accept_downstream_apis = ["openai_responses"]
             assert_eq!(messages[1]["reasoning_content"], "thought");
             assert_eq!(messages[1]["content"][0]["text"], "answer");
             assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_recorder_skips_non_continuable_responses() {
+        for (status, error) in [
+            ("in_progress", Value::Null),
+            ("failed", serde_json::json!({"message":"boom"})),
+        ] {
+            let store = crate::response_state::ResponseStateStore::new(4);
+            let request_ir = RequestIr::parse(
+                Protocol::OpenAiResponses,
+                &serde_json::json!({"model":"m", "input":"hi"}),
+            )
+            .unwrap();
+            let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
+            let body = serde_json::json!({
+                "id": "resp_1",
+                "model": "m",
+                "status": status,
+                "error": error,
+                "output": []
+            });
+            let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from(
+                serde_json::to_vec(&body).unwrap(),
+            ))]);
+            let mut converted = NonStreamingConversionStream::with_recorder(
+                inner,
+                1024 * 1024,
+                ResponsePipeline {
+                    source: Protocol::OpenAiResponses,
+                    target: DownstreamApi::OpenAiResponses,
+                },
+                Some(recorder),
+            );
+            while let Some(chunk) = converted.next().await {
+                chunk.unwrap();
+            }
+
+            assert!(store.get("resp_1").is_none(), "status={status}");
         }
     }
 
