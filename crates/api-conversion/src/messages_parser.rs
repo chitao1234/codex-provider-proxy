@@ -31,6 +31,8 @@ pub struct MessagesParser {
     tools: HashMap<usize, ToolAccumulator>,
     /// Anthropic content block index -> protocol-neutral tool call index.
     tool_blocks: HashMap<usize, usize>,
+    /// Anthropic content block indices whose type is not modeled semantically.
+    extension_blocks: HashSet<usize>,
     /// Next tool index to assign (Anthropic blocks have no index, use sequence).
     next_tool_index: usize,
     usage: ChatUsage,
@@ -38,7 +40,7 @@ pub struct MessagesParser {
     end_emitted: bool,
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl Default for MessagesParser {
     fn default() -> Self {
@@ -55,6 +57,7 @@ impl MessagesParser {
             model: String::new(),
             tools: HashMap::new(),
             tool_blocks: HashMap::new(),
+            extension_blocks: HashSet::new(),
             next_tool_index: 0,
             usage: ChatUsage::default(),
             end_emitted: false,
@@ -107,26 +110,33 @@ impl MessagesParser {
                     .and_then(Value::as_u64)
                     .map(|i| i as usize)
                     .unwrap_or_default();
-                if block_type == "tool_use" {
-                    let id = block
-                        .and_then(|b| b.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = block
-                        .and_then(|b| b.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let tool_index = self.next_tool_index;
-                    self.next_tool_index += 1;
-                    self.tool_blocks.insert(index, tool_index);
-                    self.tools.insert(tool_index, ToolAccumulator::default());
-                    out.push(StreamEvent::ToolCallStart {
-                        index: tool_index,
-                        id,
-                        name,
-                    });
+                match block_type {
+                    "tool_use" => {
+                        let id = block
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = block
+                            .and_then(|b| b.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let tool_index = self.next_tool_index;
+                        self.next_tool_index += 1;
+                        self.tool_blocks.insert(index, tool_index);
+                        self.tools.insert(tool_index, ToolAccumulator::default());
+                        out.push(StreamEvent::ToolCallStart {
+                            index: tool_index,
+                            id,
+                            name,
+                        });
+                    }
+                    "text" | "thinking" => {}
+                    _ => {
+                        self.extension_blocks.insert(index);
+                        out.push(messages_extension(event_type, data));
+                    }
                 }
             }
             "content_block_delta" => {
@@ -191,7 +201,7 @@ impl MessagesParser {
                             });
                         }
                     }
-                    Some(_) => {}
+                    Some(_) => out.push(messages_extension(event_type, data)),
                 }
             }
             "content_block_stop" => {
@@ -201,6 +211,9 @@ impl MessagesParser {
                     .map(|index| index as usize)
                 {
                     self.tool_blocks.remove(&index);
+                    if self.extension_blocks.remove(&index) {
+                        out.push(messages_extension(event_type, data));
+                    }
                 }
             }
             "message_delta" => {
@@ -250,9 +263,7 @@ impl MessagesParser {
                         .map(str::to_owned),
                 });
             }
-            _ => {
-                // Unknown events (e.g. ping) are ignored.
-            }
+            _ => out.push(messages_extension(event_type, data)),
         }
         Ok(())
     }
@@ -274,6 +285,14 @@ impl MessagesParser {
                 usage: self.usage,
             });
         }
+    }
+}
+
+fn messages_extension(kind: &str, payload: &Value) -> StreamEvent {
+    StreamEvent::Extension {
+        namespace: "anthropic.messages".to_owned(),
+        kind: kind.to_owned(),
+        payload: payload.clone(),
     }
 }
 
@@ -530,6 +549,42 @@ mod tests {
         assert!(
             matches!(&out[0], StreamEvent::Error { message, code } if message == "boom" && code.as_deref() == Some("api_error"))
         );
+    }
+
+    #[test]
+    fn preserves_unknown_block_lifecycle_as_extensions() {
+        let mut parser = MessagesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event(
+                "content_block_start",
+                &json!({"index": 3, "content_block": {"type": "server_tool_use", "id": "srv_1"}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "content_block_delta",
+                &json!({"index": 3, "delta": {"type": "server_tool_delta", "payload": 1}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event("content_block_stop", &json!({"index": 3}), &mut out)
+            .unwrap();
+
+        assert_eq!(out.len(), 3);
+        for (event, kind) in out.iter().zip([
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+        ]) {
+            assert!(matches!(
+                event,
+                StreamEvent::Extension { namespace, kind: actual, .. }
+                    if namespace == "anthropic.messages" && actual == kind
+            ));
+        }
     }
 
     #[test]
