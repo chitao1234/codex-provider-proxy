@@ -32,6 +32,7 @@ pub struct RequestIr {
     instructions: Vec<Value>,
     tools: Vec<IrTool>,
     tool_choice: Option<Value>,
+    generation: GenerationControls,
     /// Top-level fields not modeled by the neutral IR. They are opaque provider/client
     /// extensions and are preserved without participating in semantic mapping.
     opaque_extensions: BTreeMap<String, Value>,
@@ -77,6 +78,95 @@ struct CacheContext {
     retention: Option<Value>,
     /// Top-level Anthropic `cache_control` (auto breakpoint).
     control: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct GenerationControls {
+    output_config: Option<Value>,
+    reasoning: Option<Value>,
+    thinking: Option<Value>,
+    text: Option<Value>,
+    stop: Option<Value>,
+    stop_sequences: Option<Value>,
+    parallel_tool_use: Option<Value>,
+    parallel_tool_calls: Option<Value>,
+    reasoning_effort: Option<Value>,
+}
+
+impl GenerationControls {
+    fn parse(source: &Map<String, Value>) -> Self {
+        Self {
+            output_config: source.get("output_config").cloned(),
+            reasoning: source.get("reasoning").cloned(),
+            thinking: source.get("thinking").cloned(),
+            text: source.get("text").cloned(),
+            stop: source.get("stop").cloned(),
+            stop_sequences: source.get("stop_sequences").cloned(),
+            parallel_tool_use: source.get("parallel_tool_use").cloned(),
+            parallel_tool_calls: source.get("parallel_tool_calls").cloned(),
+            reasoning_effort: source.get("reasoning_effort").cloned(),
+        }
+    }
+
+    fn apply_source_fields(&self, out: &mut Map<String, Value>) {
+        for (key, value) in [
+            ("output_config", self.output_config.as_ref()),
+            ("reasoning", self.reasoning.as_ref()),
+            ("thinking", self.thinking.as_ref()),
+            ("text", self.text.as_ref()),
+            ("stop", self.stop.as_ref()),
+            ("stop_sequences", self.stop_sequences.as_ref()),
+            ("parallel_tool_use", self.parallel_tool_use.as_ref()),
+            ("parallel_tool_calls", self.parallel_tool_calls.as_ref()),
+            ("reasoning_effort", self.reasoning_effort.as_ref()),
+        ] {
+            if let Some(value) = value {
+                out.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+
+    fn effort(&self) -> Option<String> {
+        self.output_config
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("effort"))
+            .or_else(|| {
+                self.reasoning
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|reasoning| reasoning.get("effort"))
+            })
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn thinking_type(&self) -> Option<&str> {
+        self.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+    }
+
+    fn output_format(&self) -> Option<&Value> {
+        self.output_config
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("format"))
+            .or_else(|| {
+                self.text
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|text| text.get("format"))
+            })
+    }
+
+    fn has_output_effort(&self) -> bool {
+        self.output_config
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|config| config.contains_key("effort"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +273,7 @@ impl RequestIr {
             instructions: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
+            generation: GenerationControls::parse(&original),
             opaque_extensions: BTreeMap::new(),
             context: RequestContext::default(),
         };
@@ -528,6 +619,15 @@ impl RequestIr {
             "max_tokens",
             "max_completion_tokens",
             "max_output_tokens",
+            "output_config",
+            "reasoning",
+            "thinking",
+            "text",
+            "stop",
+            "stop_sequences",
+            "parallel_tool_use",
+            "parallel_tool_calls",
+            "reasoning_effort",
         ];
         for (key, value) in source {
             if !STRUCTURAL.contains(&key.as_str()) {
@@ -567,6 +667,7 @@ impl RequestIr {
 
     fn base_output(&self) -> Map<String, Value> {
         let mut out: Map<String, Value> = self.opaque_extensions.clone().into_iter().collect();
+        self.generation.apply_source_fields(&mut out);
         if let Some(model) = &self.model {
             out.insert("model".to_owned(), Value::String(model.clone()));
         }
@@ -764,26 +865,8 @@ impl RequestIr {
         }
         // Downstream effort arrives as Messages `output_config.effort` or Responses
         // `reasoning.effort`; both map to the upstream thinking/reasoning controls.
-        let effort = self
-            .opaque_extensions
-            .get("output_config")
-            .and_then(Value::as_object)
-            .and_then(|config| config.get("effort"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                self.opaque_extensions
-                    .get("reasoning")
-                    .and_then(Value::as_object)
-                    .and_then(|reasoning| reasoning.get("effort"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        let thinking_type = self
-            .opaque_extensions
-            .get("thinking")
-            .and_then(|thinking| thinking.get("type"))
-            .and_then(Value::as_str);
+        let effort = self.generation.effort();
+        let thinking_type = self.generation.thinking_type();
         match caps.thinking_param {
             ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
                 // A Messages thinking block maps its type; a Responses request has no
@@ -792,7 +875,7 @@ impl RequestIr {
                     ThinkingParam::Adaptive => "adaptive",
                     _ => "enabled",
                 };
-                let mapped = if self.opaque_extensions.contains_key("thinking") {
+                let mapped = if self.generation.thinking.is_some() {
                     // A Messages thinking block maps its type; a missing type means on.
                     Some(if thinking_type == Some("disabled") {
                         "disabled"
@@ -843,8 +926,9 @@ impl RequestIr {
         if !caps.accept_stop {
             out.remove("stop");
         } else if let Some(sequences) = self
-            .opaque_extensions
-            .get("stop_sequences")
+            .generation
+            .stop_sequences
+            .as_ref()
             .and_then(Value::as_array)
         {
             let sequences: Vec<Value> = sequences
@@ -864,8 +948,9 @@ impl RequestIr {
             }
         }
         if let Some(parallel) = self
-            .opaque_extensions
-            .get("parallel_tool_use")
+            .generation
+            .parallel_tool_use
+            .as_ref()
             .and_then(Value::as_bool)
         {
             out.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
@@ -892,18 +977,7 @@ impl RequestIr {
                 }
             }
         }
-        let format = self
-            .opaque_extensions
-            .get("output_config")
-            .and_then(Value::as_object)
-            .and_then(|config| config.get("format"))
-            .or_else(|| {
-                // OpenAI Responses shape: {"text": {"format": ...}}.
-                self.opaque_extensions
-                    .get("text")
-                    .and_then(Value::as_object)
-                    .and_then(|text| text.get("format"))
-            });
+        let format = self.generation.output_format();
         if let Some(format) = format {
             match format.get("type").and_then(Value::as_str).unwrap_or("text") {
                 "text" => {}
@@ -1174,7 +1248,7 @@ impl RequestIr {
         // accept the thinking object; qwen-style upstreams document reasoning.effort
         // as the control and ignore an unknown thinking object.
         if self.protocol == Protocol::AnthropicMessages {
-            if let Some(thinking) = self.opaque_extensions.get("thinking") {
+            if let Some(thinking) = self.generation.thinking.as_ref() {
                 let thinking_type = thinking.get("type").and_then(Value::as_str);
                 match caps.thinking_param {
                     ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
@@ -1198,12 +1272,7 @@ impl RequestIr {
                         // force the disabled case when no explicit effort was provided
                         // (an explicit output_config.effort is respected).
                         out.remove("thinking");
-                        let has_explicit_effort = self
-                            .opaque_extensions
-                            .get("output_config")
-                            .and_then(Value::as_object)
-                            .and_then(|config| config.get("effort"))
-                            .is_some();
+                        let has_explicit_effort = self.generation.has_output_effort();
                         if thinking_type == Some("disabled") && !has_explicit_effort {
                             out.insert(
                                 "reasoning".to_owned(),
@@ -2723,6 +2792,40 @@ mod tests {
         .unwrap();
         assert_eq!(ir.context.represented_extensions["session_id"], "session-7");
         assert_eq!(ir.opaque_extensions["provider_budget"]["tokens"], 123);
+    }
+
+    #[test]
+    fn separates_generation_controls_from_opaque_extensions() {
+        let request = json!({
+            "model": "m",
+            "input": "hello",
+            "reasoning": {"effort": "high", "provider_mode": "deep"},
+            "text": {
+                "format": {"type": "json_object"},
+                "verbosity": "low"
+            },
+            "parallel_tool_calls": true,
+            "provider_budget": {"tokens": 123}
+        });
+        let ir = RequestIr::parse(Protocol::OpenAiResponses, &request).unwrap();
+
+        assert_eq!(ir.generation.effort().as_deref(), Some("high"));
+        assert_eq!(
+            ir.generation.reasoning.as_ref().unwrap()["provider_mode"],
+            "deep"
+        );
+        assert!(!ir.opaque_extensions.contains_key("reasoning"));
+        assert!(!ir.opaque_extensions.contains_key("text"));
+        assert!(!ir.opaque_extensions.contains_key("parallel_tool_calls"));
+        assert_eq!(ir.opaque_extensions["provider_budget"]["tokens"], 123);
+
+        let rendered = ir
+            .render(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(rendered["reasoning"]["provider_mode"], "deep");
+        assert_eq!(rendered["text"]["verbosity"], "low");
+        assert_eq!(rendered["parallel_tool_calls"], true);
+        assert_eq!(rendered["provider_budget"]["tokens"], 123);
     }
 
     #[test]
