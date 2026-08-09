@@ -21,6 +21,7 @@ use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
 use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
+use codex_provider_proxy_api_conversion::stream::StreamingResponseIr;
 use codex_provider_proxy_api_conversion::{error::ConversionError, sse};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
@@ -444,32 +445,22 @@ impl ResponseRecorder {
         }
     }
 
-    /// Store the transcript for `response_id` (appending the assistant turn when present)
-    /// together with reasoning belonging to that response chain.
-    pub fn record(&self, response_id: &str, assistant_turn: Option<Value>) {
-        let last_reasoning = assistant_turn
-            .as_ref()
-            .and_then(|turn| turn.get("reasoning_content"))
-            .and_then(Value::as_str)
-            .filter(|reasoning| !reasoning.trim().is_empty())
-            .map(str::to_owned);
+    pub fn record_ir(&self, response_id: &str, response: &ResponseIr) {
         let mut request_ir = self.request_ir.clone();
-        if let Some(turn) = assistant_turn {
-            request_ir.append_chat_assistant_turn(&turn);
-        }
+        response.append_to_request(&mut request_ir);
         let now = crate::response_state::now_unix();
         self.store.put(crate::response_state::ResponseState::new(
             response_id.to_string(),
             self.provider_name.clone(),
             self.model.clone(),
             request_ir,
-            last_reasoning,
+            response.last_reasoning().map(str::to_owned),
             now,
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
         ));
     }
 
-    pub fn record_ir(&self, response_id: &str, response: &ResponseIr) {
+    pub fn record_stream(&self, response_id: &str, response: &StreamingResponseIr) {
         let mut request_ir = self.request_ir.clone();
         response.append_to_request(&mut request_ir);
         let now = crate::response_state::now_unix();
@@ -613,7 +604,6 @@ impl ChatStreamTarget for MessagesStreamTarget {
 #[doc(hidden)]
 pub struct ResponsesStreamTarget {
     renderer: ResponsesRenderer,
-    recorder: Option<ResponseRecorder>,
 }
 
 impl ChatStreamTarget for ResponsesStreamTarget {
@@ -627,9 +617,6 @@ impl ChatStreamTarget for ResponsesStreamTarget {
 
     fn finish(&mut self, out: &mut Vec<Bytes>) {
         self.renderer.finish(out);
-        if let (Some(recorder), Some(response_id)) = (&self.recorder, self.renderer.response_id()) {
-            recorder.record(response_id, self.renderer.assistant_turn().cloned());
-        }
     }
 }
 
@@ -639,6 +626,8 @@ pin_project! {
         inner: S,
         parser: ChatParser,
         target: T,
+        recorder: Option<ResponseRecorder>,
+        response: StreamingResponseIr,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         finished: bool,
@@ -650,7 +639,7 @@ pub type ChatToResponsesStream<S> = ChatConversionStream<S, ResponsesStreamTarge
 
 impl<S> ChatConversionStream<S, MessagesStreamTarget> {
     pub fn new(inner: S) -> Self {
-        Self::from_target(inner, MessagesStreamTarget(MessagesRenderer::new()))
+        Self::from_target(inner, MessagesStreamTarget(MessagesRenderer::new()), None)
     }
 }
 
@@ -662,18 +651,20 @@ impl<S> ChatConversionStream<S, ResponsesStreamTarget> {
             inner,
             ResponsesStreamTarget {
                 renderer: ResponsesRenderer::new(),
-                recorder,
             },
+            recorder,
         )
     }
 }
 
 impl<S, T> ChatConversionStream<S, T> {
-    fn from_target(inner: S, target: T) -> Self {
+    fn from_target(inner: S, target: T, recorder: Option<ResponseRecorder>) -> Self {
         Self {
             inner,
             parser: ChatParser::new(),
             target,
+            recorder,
+            response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             finished: false,
@@ -714,6 +705,7 @@ where
                     }
                     let mut rendered = Vec::new();
                     for event in &events {
+                        this.response.on_event(event);
                         this.target.on_event(event, &mut rendered);
                     }
                     if !rendered.is_empty() {
@@ -734,9 +726,15 @@ where
                     this.parser.finish(&mut events);
                     let mut rendered = Vec::new();
                     for event in &events {
+                        this.response.on_event(event);
                         this.target.on_event(event, &mut rendered);
                     }
                     this.target.finish(&mut rendered);
+                    if let (Some(recorder), Some(response_id)) =
+                        (this.recorder.as_ref(), this.response.openai_response_id())
+                    {
+                        recorder.record_stream(&response_id, this.response);
+                    }
                     if rendered.is_empty() {
                         return Poll::Ready(None);
                     }
@@ -1262,5 +1260,42 @@ accept_downstream_apis = ["openai_responses"]
             assert_eq!(messages[1]["content"][0]["text"], "answer");
             assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
         }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_recorder_consumes_streaming_response_ir() {
+        let store = crate::response_state::ResponseStateStore::new(4);
+        let request_ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &serde_json::json!({"model":"m", "input":"hi"}),
+        )
+        .unwrap();
+        let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thought\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body.as_bytes()))]);
+        let mut converted = ChatToResponsesStream::with_recorder(inner, Some(recorder));
+        while let Some(chunk) = converted.next().await {
+            chunk.unwrap();
+        }
+
+        let state = store
+            .get("resp_chatcmpl_1")
+            .expect("stream response state recorded");
+        assert_eq!(state.last_reasoning.as_deref(), Some("thought"));
+        let rendered = state
+            .request_ir
+            .render_with_report(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(rendered["messages"][1]["reasoning_content"], "thought");
+        assert_eq!(rendered["messages"][1]["content"][0]["text"], "answer");
     }
 }

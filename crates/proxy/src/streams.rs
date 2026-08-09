@@ -14,7 +14,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::sse;
-use codex_provider_proxy_api_conversion::stream::StreamEvent;
+use codex_provider_proxy_api_conversion::stream::{StreamEvent, StreamingResponseIr};
 use futures_util::Stream;
 use pin_project_lite::pin_project;
 use serde_json::Value;
@@ -36,12 +36,6 @@ pub trait Parser {
 pub trait Renderer {
     fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>);
     fn finish(&mut self, out: &mut Vec<Bytes>);
-    fn response_id(&self) -> Option<&str> {
-        None
-    }
-    fn assistant_turn(&self) -> Option<&Value> {
-        None
-    }
 }
 
 impl Parser for codex_provider_proxy_api_conversion::messages_parser::MessagesParser {
@@ -92,14 +86,6 @@ impl Renderer for codex_provider_proxy_api_conversion::responses_renderer::Respo
     fn finish(&mut self, out: &mut Vec<Bytes>) {
         self.finish(out);
     }
-
-    fn response_id(&self) -> Option<&str> {
-        self.response_id()
-    }
-
-    fn assistant_turn(&self) -> Option<&Value> {
-        self.assistant_turn()
-    }
 }
 
 pin_project! {
@@ -109,6 +95,7 @@ pin_project! {
         parser: P,
         renderer: R,
         recorder: Option<ResponseRecorder>,
+        response: StreamingResponseIr,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         finished: bool,
@@ -122,6 +109,7 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             parser,
             renderer,
             recorder: None,
+            response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             finished: false,
@@ -139,6 +127,7 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             parser,
             renderer,
             recorder,
+            response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             finished: false,
@@ -184,6 +173,7 @@ where
                         }
                     }
                     for event in &events {
+                        this.response.on_event(event);
                         this.renderer.on_event(event, &mut rendered);
                     }
                     events.clear();
@@ -204,13 +194,14 @@ where
                     let mut final_events = Vec::new();
                     this.parser.finish(&mut final_events);
                     for event in &final_events {
+                        this.response.on_event(event);
                         this.renderer.on_event(event, &mut rendered);
                     }
                     this.renderer.finish(&mut rendered);
-                    if let Some(recorder) = &this.recorder {
-                        if let Some(response_id) = this.renderer.response_id() {
-                            recorder.record(response_id, this.renderer.assistant_turn().cloned());
-                        }
+                    if let (Some(recorder), Some(response_id)) =
+                        (this.recorder.as_ref(), this.response.openai_response_id())
+                    {
+                        recorder.record_stream(&response_id, this.response);
                     }
                     if rendered.is_empty() {
                         return Poll::Ready(None);

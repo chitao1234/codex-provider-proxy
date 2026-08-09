@@ -429,16 +429,6 @@ impl RequestIr {
             .collect();
     }
 
-    pub fn append_chat_assistant_turn(&mut self, turn: &Value) {
-        let Ok(parsed) = Self::parse(
-            Protocol::OpenAiChatCompletions,
-            &serde_json::json!({"messages": [turn]}),
-        ) else {
-            return;
-        };
-        self.transcript.extend(parsed.transcript);
-    }
-
     pub(crate) fn append_assistant_output(
         &mut self,
         content: Vec<IrContent>,

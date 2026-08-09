@@ -36,7 +36,6 @@ pub struct ResponsesRenderer {
     message_item: Option<usize>,
     message_text: String,
     function_calls: HashMap<usize, FunctionCallState>,
-    assistant_turn: Option<Value>,
     usage: ChatUsage,
 }
 
@@ -60,20 +59,13 @@ impl ResponsesRenderer {
             message_item: None,
             message_text: String::new(),
             function_calls: HashMap::new(),
-            assistant_turn: None,
             usage: ChatUsage::default(),
         }
     }
 
     /// The synthesized downstream `response_id`, available once the stream started.
     pub fn response_id(&self) -> Option<&str> {
-        self.started.then_some(self.response_id.as_str())
-    }
-
-    /// The assistant chat message produced by this stream (text and/or tool calls),
-    /// for transcript storage. Available after the stream ends.
-    pub fn assistant_turn(&self) -> Option<&Value> {
-        self.assistant_turn.as_ref()
+        (self.started && !self.response_id.is_empty()).then_some(self.response_id.as_str())
     }
 
     /// Process one semantic event, appending Responses SSE bytes to `out`.
@@ -290,13 +282,9 @@ impl ResponsesRenderer {
                 },
             }));
         }
-        // Build the assistant chat turn for transcript storage as items close.
-        let mut assistant = json!({"role": "assistant", "content": ""});
-        let reasoning_text = std::mem::take(&mut self.reasoning_text);
-        let mut tool_calls: Vec<Value> = Vec::new();
+        self.reasoning_text.clear();
         if let Some(index) = self.message_item.take() {
             let text = std::mem::take(&mut self.message_text);
-            assistant["content"] = json!(text);
             items_done.push(json!({
                 "type": "response.output_item.done",
                 "output_index": index,
@@ -309,11 +297,6 @@ impl ResponsesRenderer {
                 },
             }));
         }
-        // Carry the upstream reasoning so a later turn can reattach it as
-        // reasoning_content (MiMo requires it on tool-call turns, else 400).
-        if !reasoning_text.trim().is_empty() {
-            assistant["reasoning_content"] = json!(reasoning_text);
-        }
         // Function call items: close each with the accumulated arguments
         // (function_call_arguments.done), then emit the completed item carrying
         // the full name/arguments for clients that rebuild calls from done events.
@@ -322,11 +305,6 @@ impl ResponsesRenderer {
             let Some(state) = self.function_calls.remove(&index) else {
                 continue;
             };
-            tool_calls.push(json!({
-                "id": state.call_id,
-                "type": "function",
-                "function": {"name": state.name, "arguments": state.arguments},
-            }));
             args_done.push(json!({
                 "type": "response.function_call_arguments.done",
                 "item_id": state.item_id,
@@ -345,13 +323,6 @@ impl ResponsesRenderer {
                     "arguments": state.arguments,
                 },
             }));
-        }
-        if !tool_calls.is_empty() {
-            assistant["tool_calls"] = json!(tool_calls);
-        }
-        // A turn is worth recording when the assistant said something or called tools.
-        if !assistant["content"].as_str().is_none_or(str::is_empty) || !tool_calls.is_empty() {
-            self.assistant_turn = Some(assistant);
         }
         for event in args_done {
             self.emit("response.function_call_arguments.done", &event, out);
@@ -606,51 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn exposes_assistant_turn_with_reasoning() {
-        let mut renderer = ResponsesRenderer::new();
-        let mut out = Vec::new();
-        renderer.on_event(
-            &StreamEvent::Start {
-                id: "x".to_string(),
-                model: "m".to_string(),
-            },
-            &mut out,
-        );
-        renderer.on_event(
-            &StreamEvent::ReasoningDelta {
-                text: "think".to_string(),
-                signature: None,
-            },
-            &mut out,
-        );
-        renderer.on_event(
-            &StreamEvent::ToolCallStart {
-                index: 0,
-                id: "call_1".to_string(),
-                name: "f".to_string(),
-            },
-            &mut out,
-        );
-        renderer.on_event(
-            &StreamEvent::ToolCallArgsDelta {
-                index: 0,
-                args: "{}".to_string(),
-            },
-            &mut out,
-        );
-        renderer.on_event(
-            &StreamEvent::End {
-                stop_reason: StopReason::ToolUse,
-                usage: ChatUsage::default(),
-            },
-            &mut out,
-        );
-        let turn = renderer.assistant_turn().expect("assistant turn recorded");
-        assert_eq!(turn["reasoning_content"], "think");
-        assert_eq!(turn["tool_calls"][0]["function"]["name"], "f");
-    }
-
-    #[test]
     fn converts_messages_response_to_responses_non_streaming() {
         let body = json!({
             "id": "msg_123",
@@ -748,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_exposes_response_id_and_assistant_turn() {
+    fn pipeline_exposes_response_id() {
         let mut parser = ChatParser::new();
         let mut renderer = ResponsesRenderer::new();
         let mut out = Vec::new();
@@ -765,39 +691,6 @@ mod tests {
             }
         }
         assert_eq!(renderer.response_id(), Some("resp_chatcmpl-9"));
-        let turn = renderer.assistant_turn().expect("assistant turn recorded");
-        assert_eq!(turn["role"], "assistant");
-        assert_eq!(turn["tool_calls"][0]["function"]["name"], "get_weather");
-        assert_eq!(
-            turn["tool_calls"][0]["function"]["arguments"],
-            r#"{"city":"Paris"}"#
-        );
-    }
-
-    #[test]
-    fn pipeline_assistant_turn_carries_text() {
-        let mut parser = ChatParser::new();
-        let mut renderer = ResponsesRenderer::new();
-        let mut out = Vec::new();
-        for chunk in [
-            r#"{"id":"x","choices":[{"index":0,"delta":{"content":"Hi "},"finish_reason":null}]}"#,
-            r#"{"id":"x","choices":[{"index":0,"delta":{"content":"there"},"finish_reason":"stop"}]}"#,
-        ] {
-            let mut events = Vec::new();
-            parser.on_chunk(chunk, &mut events).unwrap();
-            for event in &events {
-                renderer.on_event(event, &mut out);
-            }
-        }
-        let mut events = Vec::new();
-        parser.finish(&mut events);
-        for event in &events {
-            renderer.on_event(event, &mut out);
-        }
-        renderer.finish(&mut out);
-        let turn = renderer.assistant_turn().expect("assistant turn recorded");
-        assert_eq!(turn["content"], "Hi there");
-        assert!(turn.get("tool_calls").is_none());
     }
 
     #[test]
