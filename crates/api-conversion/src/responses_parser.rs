@@ -304,10 +304,17 @@ impl ResponsesParser {
                 } else {
                     StopReason::Stop
                 };
+                let protocol_reason = response
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(status)
+                    .to_owned();
                 self.end_emitted = true;
                 self.finished = true;
                 out.push(StreamEvent::End {
                     stop_reason,
+                    protocol_reason: Some(protocol_reason),
                     usage: self.usage,
                 });
             }
@@ -354,6 +361,7 @@ impl ResponsesParser {
             self.end_emitted = true;
             out.push(StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: self.usage,
             });
         }
@@ -464,7 +472,7 @@ mod tests {
         assert!(matches!(&out[2], StreamEvent::TextDelta { text } if text == "Hi"));
         let end = out.last().unwrap();
         assert!(
-            matches!(end, StreamEvent::End { stop_reason, usage } if *stop_reason == StopReason::Stop && usage.reasoning_tokens == Some(3))
+            matches!(end, StreamEvent::End { stop_reason, usage, .. } if *stop_reason == StopReason::Stop && usage.reasoning_tokens == Some(3))
         );
     }
 
@@ -686,7 +694,9 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(out.last().unwrap(), StreamEvent::End { stop_reason, .. } if *stop_reason == StopReason::MaxTokens)
+            matches!(out.last().unwrap(), StreamEvent::End { stop_reason, protocol_reason, .. }
+                if *stop_reason == StopReason::MaxTokens
+                    && protocol_reason.as_deref() == Some("max_output_tokens"))
         );
     }
 }

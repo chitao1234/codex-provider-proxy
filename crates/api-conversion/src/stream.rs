@@ -55,6 +55,8 @@ pub enum StreamEvent {
     /// The response ended, with the stop reason and final usage.
     End {
         stop_reason: StopReason,
+        /// Original protocol/provider reason before normalization.
+        protocol_reason: Option<String>,
         usage: ChatUsage,
     },
     /// An upstream stream error; the renderer terminates without faking a completion.
@@ -80,6 +82,7 @@ pub struct StreamingResponseIr {
     text: String,
     tools: BTreeMap<usize, StreamingToolCall>,
     stop_reason: Option<StopReason>,
+    protocol_stop_reason: Option<String>,
     failed: bool,
     extensions: Vec<(String, Value)>,
 }
@@ -117,7 +120,14 @@ impl StreamingResponseIr {
                     tool.arguments.push_str(args);
                 }
             }
-            StreamEvent::End { stop_reason, .. } => self.stop_reason = Some(*stop_reason),
+            StreamEvent::End {
+                stop_reason,
+                protocol_reason,
+                ..
+            } => {
+                self.stop_reason = Some(*stop_reason);
+                self.protocol_stop_reason.clone_from(protocol_reason);
+            }
             StreamEvent::Error { .. } => self.failed = true,
             StreamEvent::Extension {
                 namespace,
@@ -146,6 +156,10 @@ impl StreamingResponseIr {
 
     pub fn stop_reason(&self) -> Option<StopReason> {
         self.stop_reason
+    }
+
+    pub fn protocol_stop_reason(&self) -> Option<&str> {
+        self.protocol_stop_reason.as_deref()
     }
 
     pub fn last_reasoning(&self) -> Option<&str> {
@@ -257,6 +271,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::ToolUse,
+                protocol_reason: Some("tool_calls".to_owned()),
                 usage: ChatUsage::default(),
             },
         ] {
@@ -268,6 +283,7 @@ mod tests {
             Some("resp_chatcmpl_1")
         );
         assert_eq!(response.stop_reason(), Some(StopReason::ToolUse));
+        assert_eq!(response.protocol_stop_reason(), Some("tool_calls"));
         let mut request = RequestIr::parse(
             Protocol::AnthropicMessages,
             &json!({"model":"m", "max_tokens":16, "messages":[{"role":"user", "content":"hi"}]}),
@@ -294,6 +310,7 @@ mod tests {
         });
         response.on_event(&StreamEvent::End {
             stop_reason: StopReason::Stop,
+            protocol_reason: Some("stop".to_owned()),
             usage: ChatUsage::default(),
         });
         assert_eq!(response.openai_response_id(), None);

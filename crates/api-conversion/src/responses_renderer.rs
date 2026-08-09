@@ -185,7 +185,9 @@ impl ResponsesRenderer {
                     out,
                 );
             }
-            StreamEvent::End { stop_reason, usage } => {
+            StreamEvent::End {
+                stop_reason, usage, ..
+            } => {
                 self.usage = *usage;
                 self.emit_completed(*stop_reason, out);
             }
@@ -488,6 +490,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);
@@ -524,6 +527,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::ToolUse,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);
@@ -569,6 +573,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);

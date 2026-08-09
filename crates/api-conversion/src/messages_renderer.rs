@@ -145,7 +145,9 @@ impl MessagesRenderer {
                     }
                 }
             }
-            StreamEvent::End { stop_reason, usage } => {
+            StreamEvent::End {
+                stop_reason, usage, ..
+            } => {
                 self.stop_reason = Some(map_stop_reason(*stop_reason));
                 self.usage = *usage;
                 self.close_blocks(out);
@@ -433,6 +435,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);
@@ -462,6 +465,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);
@@ -493,6 +497,7 @@ mod tests {
             },
             StreamEvent::End {
                 stop_reason: StopReason::ToolUse,
+                protocol_reason: None,
                 usage: ChatUsage::default(),
             },
         ]);

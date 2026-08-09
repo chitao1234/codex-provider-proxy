@@ -206,9 +206,10 @@ impl MessagesParser {
             "message_delta" => {
                 // stop_reason + usage.
                 let delta = data.get("delta").and_then(Value::as_object);
-                let stop_reason = delta
+                let protocol_reason = delta
                     .and_then(|d| d.get("stop_reason"))
-                    .and_then(Value::as_str)
+                    .and_then(Value::as_str);
+                let stop_reason = protocol_reason
                     .map(map_stop_reason)
                     .unwrap_or(StopReason::Stop);
                 if let Some(usage) = data.get("usage") {
@@ -218,6 +219,7 @@ impl MessagesParser {
                     self.end_emitted = true;
                     out.push(StreamEvent::End {
                         stop_reason,
+                        protocol_reason: protocol_reason.map(str::to_owned),
                         usage: self.usage,
                     });
                 }
@@ -228,6 +230,7 @@ impl MessagesParser {
                     self.end_emitted = true;
                     out.push(StreamEvent::End {
                         stop_reason: StopReason::Stop,
+                        protocol_reason: None,
                         usage: self.usage,
                     });
                 }
@@ -267,6 +270,7 @@ impl MessagesParser {
             self.end_emitted = true;
             out.push(StreamEvent::End {
                 stop_reason: StopReason::Stop,
+                protocol_reason: None,
                 usage: self.usage,
             });
         }
@@ -365,7 +369,9 @@ mod tests {
         assert!(matches!(&out[2], StreamEvent::TextDelta { text } if text == "Hi"));
         let end = out.last().unwrap();
         assert!(
-            matches!(end, StreamEvent::End { stop_reason, .. } if *stop_reason == StopReason::Stop)
+            matches!(end, StreamEvent::End { stop_reason, protocol_reason, .. }
+                if *stop_reason == StopReason::Stop
+                    && protocol_reason.as_deref() == Some("end_turn"))
         );
     }
 

@@ -100,6 +100,7 @@ impl ChatParser {
             let saw_tool_call = self.tools.values().any(|tool| tool.name.is_some());
             out.push(StreamEvent::End {
                 stop_reason: map_chat_finish_reason(Some(finish_reason), saw_tool_call),
+                protocol_reason: Some(finish_reason.to_owned()),
                 usage: self.usage,
             });
             // The response is complete once a finish_reason arrives; subsequent
@@ -301,7 +302,9 @@ mod tests {
         assert!(matches!(&events[1], StreamEvent::ReasoningDelta { text, .. } if text == "We"));
         assert!(matches!(&events[2], StreamEvent::TextDelta { text } if text == "Hi"));
         assert!(
-            matches!(&events[3], StreamEvent::End { stop_reason, .. } if *stop_reason == crate::stream::StopReason::Stop)
+            matches!(&events[3], StreamEvent::End { stop_reason, protocol_reason, .. }
+                if *stop_reason == crate::stream::StopReason::Stop
+                    && protocol_reason.as_deref() == Some("stop"))
         );
     }
 
