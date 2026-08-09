@@ -38,93 +38,39 @@ const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestParserKind {
-    AnthropicMessages,
-    OpenAiResponses,
-}
-
-impl RequestParserKind {
-    fn protocol(self) -> Protocol {
-        match self {
-            Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAiResponses => Protocol::OpenAiResponses,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestRendererKind {
-    OpenAiChatCompletions,
-    AnthropicMessages,
-    OpenAiResponses,
-}
-
-impl RequestRendererKind {
-    fn protocol(self) -> Protocol {
-        match self {
-            Self::OpenAiChatCompletions => Protocol::OpenAiChatCompletions,
-            Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAiResponses => Protocol::OpenAiResponses,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestNormalizerKind {
     ArkResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPipeline {
-    pub parser: RequestParserKind,
-    pub renderer: RequestRendererKind,
+    pub target: Protocol,
     pub normalizer: Option<RequestNormalizerKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestAction {
-    Passthrough {
-        normalizer: Option<RequestNormalizerKind>,
-    },
+    Passthrough,
     Transform(RequestPipeline),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseParserKind {
-    OpenAiChatCompletions,
-    AnthropicMessages,
-    OpenAiResponses,
-}
-
-impl ResponseParserKind {
-    fn protocol(self) -> Protocol {
-        match self {
-            Self::OpenAiChatCompletions => Protocol::OpenAiChatCompletions,
-            Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAiResponses => Protocol::OpenAiResponses,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseRendererKind {
-    AnthropicMessages,
-    OpenAiResponses,
-}
-
-impl ResponseRendererKind {
-    fn protocol(self) -> Protocol {
-        match self {
-            Self::AnthropicMessages => Protocol::AnthropicMessages,
-            Self::OpenAiResponses => Protocol::OpenAiResponses,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsePipeline {
-    pub parser: ResponseParserKind,
-    pub renderer: ResponseRendererKind,
+    pub source: Protocol,
+    pub target: DownstreamApi,
+}
+
+impl ResponsePipeline {
+    fn target_protocol(self) -> Protocol {
+        downstream_protocol(self.target)
+    }
+}
+
+fn downstream_protocol(downstream: DownstreamApi) -> Protocol {
+    match downstream {
+        DownstreamApi::AnthropicMessages => Protocol::AnthropicMessages,
+        DownstreamApi::OpenAiResponses => Protocol::OpenAiResponses,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,8 +116,7 @@ pub fn resolve_conversion_plan(
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::AnthropicMessages,
-                renderer: RequestRendererKind::OpenAiChatCompletions,
+                target: Protocol::OpenAiChatCompletions,
                 normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
@@ -180,8 +125,7 @@ pub fn resolve_conversion_plan(
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::OpenAiResponses,
-                renderer: RequestRendererKind::OpenAiChatCompletions,
+                target: Protocol::OpenAiChatCompletions,
                 normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
@@ -189,15 +133,14 @@ pub fn resolve_conversion_plan(
         (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
-            request: RequestAction::Passthrough { normalizer: None },
+            request: RequestAction::Passthrough,
             response: response_pipeline(provider.upstream_api, downstream),
         },
         (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAiResponses) => ConversionPlan {
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::OpenAiResponses,
-                renderer: RequestRendererKind::AnthropicMessages,
+                target: Protocol::AnthropicMessages,
                 normalizer: None,
             }),
             response: response_pipeline(provider.upstream_api, downstream),
@@ -206,8 +149,7 @@ pub fn resolve_conversion_plan(
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::OpenAiResponses,
-                renderer: RequestRendererKind::OpenAiResponses,
+                target: Protocol::OpenAiResponses,
                 normalizer: Some(RequestNormalizerKind::ArkResponses),
             }),
             response: response_pipeline(provider.upstream_api, downstream),
@@ -216,8 +158,7 @@ pub fn resolve_conversion_plan(
             downstream,
             upstream: provider.upstream_api,
             request: RequestAction::Transform(RequestPipeline {
-                parser: RequestParserKind::AnthropicMessages,
-                renderer: RequestRendererKind::OpenAiResponses,
+                target: Protocol::OpenAiResponses,
                 normalizer: Some(RequestNormalizerKind::ArkResponses),
             }),
             response: response_pipeline(provider.upstream_api, downstream),
@@ -307,21 +248,9 @@ pub fn convert_request_body(
         .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
         .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
     let (converted, report) = match plan.request {
-        RequestAction::Passthrough { normalizer: None } => return Ok(body),
-        RequestAction::Passthrough {
-            normalizer: Some(RequestNormalizerKind::ArkResponses),
-        } => {
-            let mut rendered = json;
-            normalize_rendered_request(
-                Some(RequestNormalizerKind::ArkResponses),
-                RequestRendererKind::OpenAiResponses,
-                &caps,
-                &mut rendered,
-            );
-            (rendered, Default::default())
-        }
+        RequestAction::Passthrough => return Ok(body),
         RequestAction::Transform(pipeline) => {
-            let source = pipeline.parser.protocol();
+            let source = downstream_protocol(plan.downstream);
             let request = if source == Protocol::OpenAiResponses {
                 RequestIr::parse_with_context(source, &json, previous_request, last_reasoning)
             } else {
@@ -331,17 +260,12 @@ pub fn convert_request_body(
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
             let (mut rendered, report) = request
-                .render_with_report(pipeline.renderer.protocol(), &caps)
+                .render_with_report(pipeline.target, &caps)
                 .map_err(|err| {
                     RequestConversionRejected::from_conversion_error(err, plan.downstream)
                 })?;
-            normalize_rendered_request(
-                pipeline.normalizer,
-                pipeline.renderer,
-                &caps,
-                &mut rendered,
-            );
-            if pipeline.renderer == RequestRendererKind::OpenAiResponses {
+            normalize_rendered_request(pipeline.normalizer, pipeline.target, &caps, &mut rendered);
+            if pipeline.target == Protocol::OpenAiResponses {
                 inject_ark_explicit_cache(&caps, &json, &mut rendered);
             }
             (rendered, report)
@@ -433,13 +357,13 @@ fn inject_ark_explicit_cache(caps: &ModelCapabilities, original: &Value, request
 
 fn normalize_rendered_request(
     normalizer: Option<RequestNormalizerKind>,
-    renderer: RequestRendererKind,
+    target: Protocol,
     caps: &ModelCapabilities,
     request: &mut Value,
 ) {
     if normalizer == Some(RequestNormalizerKind::ArkResponses)
         && caps.ark_style
-        && renderer == RequestRendererKind::OpenAiResponses
+        && target == Protocol::OpenAiResponses
     {
         if let Some(object) = request.as_object_mut() {
             codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
@@ -579,13 +503,13 @@ pub fn convert_non_streaming_body_with_pipeline(
             "upstream response is not valid JSON",
         )
     })?;
-    if pipeline.parser == ResponseParserKind::AnthropicMessages
-        && pipeline.renderer == ResponseRendererKind::AnthropicMessages
+    if pipeline.source == Protocol::AnthropicMessages
+        && pipeline.target == DownstreamApi::AnthropicMessages
     {
         return Ok(body);
     }
-    let converted = ResponseIr::parse(pipeline.parser.protocol(), &json)
-        .and_then(|response| response.render(pipeline.renderer.protocol()))
+    let converted = ResponseIr::parse(pipeline.source, &json)
+        .and_then(|response| response.render(pipeline.target_protocol()))
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     serde_json::to_vec(&converted)
         .map(Bytes::from)
@@ -599,17 +523,14 @@ pub fn convert_non_streaming_body_with_pipeline(
 
 pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> ResponsePipeline {
     ResponsePipeline {
-        parser: match upstream {
-            UpstreamApi::AnthropicMessages => ResponseParserKind::AnthropicMessages,
-            UpstreamApi::OpenAiResponses => ResponseParserKind::OpenAiResponses,
+        source: match upstream {
+            UpstreamApi::AnthropicMessages => Protocol::AnthropicMessages,
+            UpstreamApi::OpenAiResponses => Protocol::OpenAiResponses,
             UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough => {
-                ResponseParserKind::OpenAiChatCompletions
+                Protocol::OpenAiChatCompletions
             }
         },
-        renderer: match downstream {
-            DownstreamApi::AnthropicMessages => ResponseRendererKind::AnthropicMessages,
-            DownstreamApi::OpenAiResponses => ResponseRendererKind::OpenAiResponses,
-        },
+        target: downstream,
     }
 }
 
@@ -910,13 +831,12 @@ mod tests {
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
                 RequestAction::Transform(RequestPipeline {
-                    parser: RequestParserKind::AnthropicMessages,
-                    renderer: RequestRendererKind::OpenAiChatCompletions,
+                    target: Protocol::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAiChatCompletions,
-                    renderer: ResponseRendererKind::AnthropicMessages,
+                    source: Protocol::OpenAiChatCompletions,
+                    target: DownstreamApi::AnthropicMessages,
                 },
             ),
             (
@@ -924,23 +844,22 @@ mod tests {
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
-                    parser: RequestParserKind::OpenAiResponses,
-                    renderer: RequestRendererKind::OpenAiChatCompletions,
+                    target: Protocol::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAiChatCompletions,
-                    renderer: ResponseRendererKind::OpenAiResponses,
+                    source: Protocol::OpenAiChatCompletions,
+                    target: DownstreamApi::OpenAiResponses,
                 },
             ),
             (
                 UpstreamApi::AnthropicMessages,
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
-                RequestAction::Passthrough { normalizer: None },
+                RequestAction::Passthrough,
                 ResponsePipeline {
-                    parser: ResponseParserKind::AnthropicMessages,
-                    renderer: ResponseRendererKind::AnthropicMessages,
+                    source: Protocol::AnthropicMessages,
+                    target: DownstreamApi::AnthropicMessages,
                 },
             ),
             (
@@ -948,13 +867,12 @@ mod tests {
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
-                    parser: RequestParserKind::OpenAiResponses,
-                    renderer: RequestRendererKind::OpenAiResponses,
+                    target: Protocol::OpenAiResponses,
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
                 }),
                 ResponsePipeline {
-                    parser: ResponseParserKind::OpenAiResponses,
-                    renderer: ResponseRendererKind::OpenAiResponses,
+                    source: Protocol::OpenAiResponses,
+                    target: DownstreamApi::OpenAiResponses,
                 },
             ),
         ];
