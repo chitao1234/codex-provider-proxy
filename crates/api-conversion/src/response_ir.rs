@@ -350,34 +350,36 @@ impl ResponseIr {
             .ok_or_else(|| ConversionError::invalid("Messages response is not an object"))?;
         let id = string_field(message, "id");
         let model = string_field(message, "model");
-        let mut reasoning_items = Vec::new();
-        let mut opaque_items = Vec::new();
-        let mut tool_items = Vec::new();
+        let mut items = Vec::new();
         let mut message_content = Vec::new();
         if let Some(content) = message.get("content").and_then(Value::as_array) {
             for block in content {
                 let Some(object) = block.as_object() else {
-                    opaque_items.push(ResponseItem::Opaque(block.clone()));
+                    flush_message_content(&mut items, &mut message_content);
+                    items.push(ResponseItem::Opaque(block.clone()));
                     continue;
                 };
                 match object.get("type").and_then(Value::as_str) {
-                    Some("thinking") => reasoning_items.push(ResponseItem::Reasoning {
-                        id: None,
-                        status: Some("completed".to_owned()),
-                        text: object
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        signature: object
-                            .get("signature")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        opaque_extensions: opaque_fields(
-                            object,
-                            &["type", "thinking", "signature"],
-                        ),
-                    }),
+                    Some("thinking") => {
+                        flush_message_content(&mut items, &mut message_content);
+                        items.push(ResponseItem::Reasoning {
+                            id: None,
+                            status: Some("completed".to_owned()),
+                            text: object
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            signature: object
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            opaque_extensions: opaque_fields(
+                                object,
+                                &["type", "thinking", "signature"],
+                            ),
+                        });
+                    }
                     Some("text") => message_content.push(ResponseText {
                         text: object
                             .get("text")
@@ -387,37 +389,36 @@ impl ResponseIr {
                         annotations: Vec::new(),
                         opaque_extensions: opaque_fields(object, &["type", "text"]),
                     }),
-                    Some("tool_use") => tool_items.push(ResponseItem::ToolCall {
-                        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
-                        call_id: object
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        name: object
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        arguments: object.get("input").cloned().unwrap_or_else(|| json!({})),
-                        status: Some("completed".to_owned()),
-                        opaque_extensions: opaque_fields(object, &["type", "id", "name", "input"]),
-                    }),
-                    _ => opaque_items.push(ResponseItem::Opaque(block.clone())),
+                    Some("tool_use") => {
+                        flush_message_content(&mut items, &mut message_content);
+                        items.push(ResponseItem::ToolCall {
+                            id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+                            call_id: object
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            name: object
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            arguments: object.get("input").cloned().unwrap_or_else(|| json!({})),
+                            status: Some("completed".to_owned()),
+                            opaque_extensions: opaque_fields(
+                                object,
+                                &["type", "id", "name", "input"],
+                            ),
+                        });
+                    }
+                    _ => {
+                        flush_message_content(&mut items, &mut message_content);
+                        items.push(ResponseItem::Opaque(block.clone()));
+                    }
                 }
             }
         }
-        let mut items = reasoning_items;
-        if !message_content.is_empty() {
-            items.push(ResponseItem::Message {
-                id: None,
-                status: Some("completed".to_owned()),
-                content: message_content,
-                opaque_extensions: Map::new(),
-            });
-        }
-        items.extend(tool_items);
-        items.extend(opaque_items);
+        flush_message_content(&mut items, &mut message_content);
         let stop_reason = match message.get("stop_reason").and_then(Value::as_str) {
             Some("tool_use") => StopReason::ToolUse,
             Some("max_tokens") => StopReason::MaxTokens,
@@ -781,6 +782,18 @@ impl ResponseIr {
     }
 }
 
+fn flush_message_content(items: &mut Vec<ResponseItem>, content: &mut Vec<ResponseText>) {
+    if content.is_empty() {
+        return;
+    }
+    items.push(ResponseItem::Message {
+        id: None,
+        status: Some("completed".to_owned()),
+        content: std::mem::take(content),
+        opaque_extensions: Map::new(),
+    });
+}
+
 impl ResponseUsage {
     fn render_messages(&self) -> Value {
         let mut out = self.opaque_extensions.clone();
@@ -1122,6 +1135,33 @@ mod tests {
         assert_eq!(output["output"][2]["arguments"], "{\"q\":1}");
         assert_eq!(output["usage"]["input_tokens_details"]["cached_tokens"], 2);
         assert!(output["usage"].get("total_tokens").is_none());
+    }
+
+    #[test]
+    fn messages_to_responses_preserves_interleaved_block_order() {
+        let output = convert(
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            json!({
+                "id": "msg-1",
+                "model": "m",
+                "content": [
+                    {"type":"text", "text":"before"},
+                    {"type":"tool_use", "id":"call-1", "name":"lookup", "input":{}},
+                    {"type":"vendor_block", "payload":1},
+                    {"type":"thinking", "thinking":"later", "signature":"sig"},
+                    {"type":"text", "text":"after"}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 2}
+            }),
+        );
+        let output = output["output"].as_array().unwrap();
+        assert_eq!(output[0]["content"][0]["text"], "before");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[2]["type"], "vendor_block");
+        assert_eq!(output[3]["type"], "reasoning");
+        assert_eq!(output[4]["content"][0]["text"], "after");
     }
 
     #[test]
