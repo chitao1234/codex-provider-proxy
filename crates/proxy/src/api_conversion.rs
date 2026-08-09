@@ -519,25 +519,30 @@ fn convert_non_streaming_response(
     body: Bytes,
     pipeline: ResponsePipeline,
 ) -> Result<ConvertedNonStreamingResponse, std::io::Error> {
+    if pipeline.source == pipeline.target_protocol() {
+        let response = (pipeline.source == Protocol::OpenAiResponses)
+            .then(|| {
+                serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|json| ResponseIr::parse(pipeline.source, &json).ok())
+            })
+            .flatten();
+        let response_id = response
+            .as_ref()
+            .and_then(ResponseIr::id)
+            .map(str::to_owned);
+        return Ok(ConvertedNonStreamingResponse {
+            body,
+            response_id,
+            response,
+        });
+    }
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "upstream response is not valid JSON",
         )
     })?;
-    if pipeline.source == Protocol::AnthropicMessages
-        && pipeline.target == DownstreamApi::AnthropicMessages
-    {
-        return Ok(ConvertedNonStreamingResponse {
-            response_id: json
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned),
-            response: None,
-            body,
-        });
-    }
     let response = ResponseIr::parse(pipeline.source, &json)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     let converted = response
@@ -1183,6 +1188,43 @@ accept_downstream_apis = ["openai_responses"]
             resolve_conversion_plan(&provider, &Method::POST, "/v1/messages").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn same_protocol_non_streaming_responses_preserve_original_bytes() {
+        let body = Bytes::from_static(
+            b"{ \"id\": \"resp_1\", \"model\": \"m\", \"status\": \"completed\", \"output\": [], \"vendor_field\": {\"x\":1} }\n",
+        );
+        let converted = convert_non_streaming_response(
+            body.clone(),
+            ResponsePipeline {
+                source: Protocol::OpenAiResponses,
+                target: DownstreamApi::OpenAiResponses,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(converted.body, body);
+        assert_eq!(converted.response_id.as_deref(), Some("resp_1"));
+        assert!(converted.response.is_some());
+    }
+
+    #[test]
+    fn same_protocol_non_streaming_passthrough_ignores_invalid_json() {
+        for (source, target) in [
+            (
+                Protocol::AnthropicMessages,
+                DownstreamApi::AnthropicMessages,
+            ),
+            (Protocol::OpenAiResponses, DownstreamApi::OpenAiResponses),
+        ] {
+            let body = Bytes::from_static(b"provider returned non-json diagnostics");
+            let converted =
+                convert_non_streaming_response(body.clone(), ResponsePipeline { source, target })
+                    .unwrap();
+            assert_eq!(converted.body, body);
+            assert!(converted.response.is_none());
+        }
     }
 
     #[tokio::test]
