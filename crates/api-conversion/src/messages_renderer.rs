@@ -105,6 +105,11 @@ impl MessagesRenderer {
                 self.open_text(out);
                 self.text_delta(text, out);
             }
+            StreamEvent::RefusalDelta { refusal } => {
+                self.close_thinking(out);
+                self.open_text(out);
+                self.text_delta(refusal, out);
+            }
             StreamEvent::ToolCallStart {
                 index,
                 id,
@@ -609,6 +614,21 @@ mod tests {
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("upstream exploded"));
         assert!(!text.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn pipeline_degrades_chat_refusal_to_messages_text() {
+        let text = pipeline(
+            &[
+                r#"{"id":"x","choices":[{"index":0,"delta":{"refusal":"not allowed"},"finish_reason":null}]}"#,
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#,
+                "[DONE]",
+            ],
+            true,
+        );
+        assert!(text.contains("\"type\":\"text_delta\""));
+        assert!(text.contains("\"text\":\"not allowed\""));
+        assert!(text.contains("\"stop_reason\":\"refusal\""));
     }
 
     #[test]

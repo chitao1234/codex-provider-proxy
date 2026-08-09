@@ -165,6 +165,11 @@ impl ChatParser {
                 text: text.to_string(),
             });
         }
+        if let Some(refusal) = delta_string(delta, "refusal") {
+            out.push(StreamEvent::RefusalDelta {
+                refusal: refusal.to_string(),
+            });
+        }
         if let Some(annotations) = delta.get("annotations") {
             // MiMo streams search sources in delta.annotations (url_citation items);
             // surface them as a trailing sources text block.
@@ -306,7 +311,13 @@ fn chat_chunk_extension(chunk: &Value) -> Option<StreamEvent> {
         if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
             let delta_extensions = opaque_fields(
                 delta,
-                &["role", "reasoning_content", "content", "tool_calls"],
+                &[
+                    "role",
+                    "reasoning_content",
+                    "content",
+                    "refusal",
+                    "tool_calls",
+                ],
             );
             if !delta_extensions.is_empty() {
                 payload.insert("delta".to_owned(), Value::Object(delta_extensions));
@@ -591,6 +602,26 @@ mod tests {
                 opaque_extensions,
                 function_extensions,
             } if opaque_extensions["x_call"] == 3 && function_extensions["x_function"] == 4
+        )));
+    }
+
+    #[test]
+    fn parses_streaming_refusal_as_standard_ir() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        parser
+            .on_chunk(
+                r#"{"id":"x","choices":[{"index":0,"delta":{"refusal":"not allowed"},"finish_reason":null}]}"#,
+                &mut events,
+            )
+            .unwrap();
+
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::RefusalDelta { refusal } if refusal == "not allowed")
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Extension { payload, .. } if payload.get("delta").is_some_and(|delta| delta.get("refusal").is_some())
         )));
     }
 

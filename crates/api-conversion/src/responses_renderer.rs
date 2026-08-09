@@ -37,6 +37,8 @@ pub struct ResponsesRenderer {
     reasoning_text: String,
     message_item: Option<usize>,
     message_text: String,
+    refusal_item: Option<usize>,
+    refusal_text: String,
     function_calls: HashMap<usize, FunctionCallState>,
     usage: ChatUsage,
 }
@@ -60,6 +62,8 @@ impl ResponsesRenderer {
             reasoning_text: String::new(),
             message_item: None,
             message_text: String::new(),
+            refusal_item: None,
+            refusal_text: String::new(),
             function_calls: HashMap::new(),
             usage: ChatUsage::default(),
         }
@@ -128,6 +132,22 @@ impl ResponsesRenderer {
                         "output_index": index,
                         "content_index": 0,
                         "delta": text,
+                    }),
+                    out,
+                );
+            }
+            StreamEvent::RefusalDelta { refusal } => {
+                self.ensure_refusal_item(out);
+                self.refusal_text.push_str(refusal);
+                let index = self.refusal_item.unwrap_or(0);
+                self.emit(
+                    "response.refusal.delta",
+                    &json!({
+                        "type": "response.refusal.delta",
+                        "item_id": format!("msg_{}_refusal", self.response_id_suffix()),
+                        "output_index": index,
+                        "content_index": 0,
+                        "delta": refusal,
                     }),
                     out,
                 );
@@ -288,6 +308,30 @@ impl ResponsesRenderer {
         );
     }
 
+    fn ensure_refusal_item(&mut self, out: &mut Vec<Bytes>) {
+        if self.refusal_item.is_some() {
+            return;
+        }
+        let index = self.output_index;
+        self.output_index += 1;
+        self.refusal_item = Some(index);
+        self.emit(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "id": format!("msg_{}_refusal", self.response_id_suffix()),
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": ""}],
+                },
+            }),
+            out,
+        );
+    }
+
     fn emit_completed(&mut self, _stop_reason: StopReason, out: &mut Vec<Bytes>) {
         self.finished = true;
         // Close open items.
@@ -317,6 +361,20 @@ impl ResponsesRenderer {
                     "status": "completed",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": text, "annotations": []}],
+                },
+            }));
+        }
+        if let Some(index) = self.refusal_item.take() {
+            let refusal = std::mem::take(&mut self.refusal_text);
+            items_done.push(json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "id": format!("msg_{}_refusal", self.response_id_suffix()),
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": refusal}],
                 },
             }));
         }
@@ -735,6 +793,21 @@ mod tests {
         );
         assert!(text.contains("\"x_call\":1"));
         assert!(text.contains("\"function\":{\"x_function\":2}"));
+    }
+
+    #[test]
+    fn pipeline_preserves_chat_refusal_as_responses_refusal() {
+        let text = pipeline(
+            &[
+                r#"{"id":"x","choices":[{"index":0,"delta":{"refusal":"not allowed"},"finish_reason":null}]}"#,
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#,
+                "[DONE]",
+            ],
+            true,
+        );
+        assert!(text.contains("event: response.refusal.delta"));
+        assert!(text.contains("\"type\":\"refusal\""));
+        assert!(text.contains("\"refusal\":\"not allowed\""));
     }
 
     #[test]

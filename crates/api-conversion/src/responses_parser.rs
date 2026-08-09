@@ -47,6 +47,8 @@ pub struct ResponsesParser {
     reasoning_open: bool,
     /// Whether the message item is open.
     message_open: bool,
+    refusal: String,
+    refusal_emitted_len: usize,
     usage: ChatUsage,
     /// Whether the response ended (response.completed / response.incomplete / error).
     end_emitted: bool,
@@ -81,6 +83,8 @@ impl ResponsesParser {
             next_tool_index: 0,
             reasoning_open: false,
             message_open: false,
+            refusal: String::new(),
+            refusal_emitted_len: 0,
             usage: ChatUsage::default(),
             end_emitted: false,
         }
@@ -199,6 +203,21 @@ impl ResponsesParser {
                     out.push(StreamEvent::TextDelta {
                         text: delta.to_string(),
                     });
+                }
+            }
+            "response.refusal.delta" => {
+                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                    self.refusal.push_str(delta);
+                    self.emit_refusal_increment(out);
+                }
+            }
+            "response.refusal.done" => {
+                if let Some(refusal) = data.get("refusal").and_then(Value::as_str) {
+                    if refusal.len() >= self.refusal.len() && refusal.starts_with(&self.refusal) {
+                        self.refusal.clear();
+                        self.refusal.push_str(refusal);
+                    }
+                    self.emit_refusal_increment(out);
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -416,6 +435,14 @@ impl ResponsesParser {
                     .then(|| self.function_calls.keys().next().copied())
                     .flatten()
             })
+    }
+
+    fn emit_refusal_increment(&mut self, out: &mut Vec<StreamEvent>) {
+        if self.refusal_emitted_len < self.refusal.len() {
+            let refusal = self.refusal[self.refusal_emitted_len..].to_owned();
+            self.refusal_emitted_len = self.refusal.len();
+            out.push(StreamEvent::RefusalDelta { refusal });
+        }
     }
 }
 
@@ -711,6 +738,31 @@ mod tests {
                     && kind == "response.web_search_call.searching"
                     && payload == &event
         ));
+    }
+
+    #[test]
+    fn parses_refusal_delta_and_done_without_duplication() {
+        let mut parser = ResponsesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event("response.refusal.delta", &json!({"delta":"not "}), &mut out)
+            .unwrap();
+        parser
+            .on_event(
+                "response.refusal.done",
+                &json!({"refusal":"not allowed"}),
+                &mut out,
+            )
+            .unwrap();
+
+        let refusal = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::RefusalDelta { refusal } => Some(refusal.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(refusal, "not allowed");
     }
 
     #[test]

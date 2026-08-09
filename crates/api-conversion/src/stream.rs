@@ -44,6 +44,8 @@ pub enum StreamEvent {
     },
     /// Increment of visible output text.
     TextDelta { text: String },
+    /// Increment of a model refusal.
+    RefusalDelta { refusal: String },
     /// A tool call began (id + name known; arguments may follow incrementally).
     ToolCallStart {
         index: usize,
@@ -88,6 +90,7 @@ pub struct StreamingResponseIr {
     reasoning: String,
     reasoning_signature: Option<String>,
     text: String,
+    refusal: String,
     tools: BTreeMap<usize, StreamingToolCall>,
     stop_reason: Option<StopReason>,
     protocol_stop_reason: Option<String>,
@@ -116,6 +119,7 @@ impl StreamingResponseIr {
                 }
             }
             StreamEvent::TextDelta { text } => self.text.push_str(text),
+            StreamEvent::RefusalDelta { refusal } => self.refusal.push_str(refusal),
             StreamEvent::ToolCallStart {
                 index,
                 id,
@@ -233,6 +237,12 @@ impl StreamingResponseIr {
         if !self.text.is_empty() {
             content.push(IrContent::Text {
                 text: self.text.clone(),
+                extensions: ContentExtensions::default(),
+            });
+        }
+        if !self.refusal.is_empty() {
+            content.push(IrContent::Refusal {
+                refusal: self.refusal.clone(),
                 extensions: ContentExtensions::default(),
             });
         }
