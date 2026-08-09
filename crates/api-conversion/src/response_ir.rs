@@ -1,6 +1,9 @@
 //! Protocol-neutral representation of a completed, non-streaming response.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::{json, Map, Value};
 
@@ -22,6 +25,7 @@ pub struct ResponseIr {
     items: Vec<ResponseItem>,
     usage: ResponseUsage,
     opaque_extensions: Map<String, Value>,
+    protocol_extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +50,7 @@ enum ResponseItem {
         arguments: Value,
         status: Option<String>,
         opaque_extensions: Map<String, Value>,
+        function_extensions: Map<String, Value>,
     },
     Opaque(Value),
 }
@@ -58,8 +63,15 @@ struct ResponseText {
 }
 
 #[derive(Debug, Clone)]
+struct ResponseRefusal {
+    refusal: String,
+    opaque_extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
 enum ResponseContent {
     Text(ResponseText),
+    Refusal(ResponseRefusal),
     Opaque(Value),
 }
 
@@ -146,6 +158,10 @@ impl ResponseIr {
             && matches!(self.status.as_str(), "completed" | "incomplete")
     }
 
+    pub fn protocol_extension(&self, namespace: &str) -> Option<&Value> {
+        self.protocol_extensions.get(namespace)
+    }
+
     pub fn last_reasoning(&self) -> Option<&str> {
         self.items.iter().rev().find_map(|item| match item {
             ResponseItem::Reasoning { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
@@ -209,6 +225,13 @@ impl ResponseIr {
                                 },
                             }
                         }
+                        ResponseContent::Refusal(part) => IrContent::Refusal {
+                            refusal: part.refusal.clone(),
+                            extensions: ContentExtensions {
+                                cache_control: None,
+                                opaque: part.opaque_extensions.clone(),
+                            },
+                        },
                         ResponseContent::Opaque(value) => IrContent::Raw(value.clone()),
                     }));
                 }
@@ -219,6 +242,7 @@ impl ResponseIr {
                     arguments,
                     status,
                     opaque_extensions,
+                    function_extensions,
                 } => {
                     output.phase = 2;
                     output.tool_calls.push(IrToolCall {
@@ -228,6 +252,7 @@ impl ResponseIr {
                         arguments: arguments.clone(),
                         status: status.clone(),
                         opaque_extensions: opaque_extensions.clone(),
+                        function_extensions: function_extensions.clone(),
                     });
                 }
                 ResponseItem::Opaque(value) => {
@@ -240,12 +265,14 @@ impl ResponseIr {
     }
 
     fn parse_chat(body: &Value) -> Result<Self, ConversionError> {
-        if first_choice(body).is_none() {
-            return Err(ConversionError::invalid(
-                "upstream chat response missing choices",
-            ));
-        }
+        let response = body
+            .as_object()
+            .ok_or_else(|| ConversionError::invalid("Chat response is not an object"))?;
+        let choice = first_choice(body)
+            .and_then(Value::as_object)
+            .ok_or_else(|| ConversionError::invalid("upstream chat response missing choices"))?;
         let message = first_choice_message(body)
+            .and_then(Value::as_object)
             .ok_or_else(|| ConversionError::invalid("upstream chat response missing message"))?;
         let id = upstream_id(body).unwrap_or_default().to_owned();
         let model = upstream_model(body).unwrap_or_default().to_owned();
@@ -263,46 +290,78 @@ impl ResponseIr {
                 opaque_extensions: Map::new(),
             });
         }
-        let mut content = Vec::new();
-        if let Some(text) = message
-            .get("content")
+        let mut content = parse_chat_message_content(message);
+        if let Some(refusal) = message
+            .get("refusal")
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
+            .filter(|refusal| !refusal.is_empty())
         {
-            content.push(ResponseContent::Text(ResponseText {
-                text: text.to_owned(),
-                annotations: message
-                    .get("annotations")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-                opaque_extensions: Map::new(),
-            }));
+            let already_present = content.iter().any(
+                |part| matches!(part, ResponseContent::Refusal(part) if part.refusal == refusal),
+            );
+            if !already_present {
+                content.push(ResponseContent::Refusal(ResponseRefusal {
+                    refusal: refusal.to_owned(),
+                    opaque_extensions: Map::new(),
+                }));
+            }
         }
-        if !content.is_empty() {
+        let message_structural = if message.get("content").is_some_and(Value::is_string) {
+            &[
+                "role",
+                "content",
+                "reasoning_content",
+                "tool_calls",
+                "annotations",
+                "refusal",
+            ][..]
+        } else {
+            &[
+                "role",
+                "content",
+                "reasoning_content",
+                "tool_calls",
+                "refusal",
+            ][..]
+        };
+        let message_extensions = opaque_fields(message, message_structural);
+        if !content.is_empty() || !message_extensions.is_empty() {
             items.push(ResponseItem::Message {
                 id: None,
                 status: Some("completed".to_owned()),
                 content,
-                opaque_extensions: Map::new(),
+                opaque_extensions: message_extensions,
             });
         }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
-                let Some(call) = call.as_object() else {
+                let Some(call_object) = call.as_object() else {
+                    items.push(ResponseItem::Opaque(call.clone()));
                     continue;
                 };
-                let function = call.get("function").and_then(Value::as_object);
+                let function = call_object.get("function").and_then(Value::as_object);
                 let name = function
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if name.is_empty() {
+                    items.push(ResponseItem::Opaque(call.clone()));
                     continue;
                 }
+                let mut opaque_extensions = opaque_fields(call_object, &["id", "type", "function"]);
+                if let Some(function) = function {
+                    let function_extensions = opaque_fields(function, &["name", "arguments"]);
+                    if !function_extensions.is_empty() {
+                        opaque_extensions
+                            .insert("function".to_owned(), Value::Object(function_extensions));
+                    }
+                }
                 items.push(ResponseItem::ToolCall {
-                    id: call.get("id").and_then(Value::as_str).map(str::to_owned),
-                    call_id: call
+                    id: call_object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    call_id: call_object
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
@@ -313,43 +372,48 @@ impl ResponseIr {
                         .cloned()
                         .unwrap_or_else(|| Value::String("{}".to_owned())),
                     status: Some("completed".to_owned()),
-                    opaque_extensions: Map::new(),
+                    opaque_extensions,
+                    function_extensions: function
+                        .map(|function| opaque_fields(function, &["name", "arguments"]))
+                        .unwrap_or_default(),
                 });
             }
         }
         let saw_tool_call = items
             .iter()
             .any(|item| matches!(item, ResponseItem::ToolCall { .. }));
-        let stop_reason = map_chat_finish_reason(
-            body.get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("finish_reason"))
-                .and_then(Value::as_str),
-            saw_tool_call,
-        );
+        let protocol_reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let stop_reason = map_chat_finish_reason(protocol_reason.as_deref(), saw_tool_call);
         let usage = extract_usage(body);
         let total_tokens = body
             .get("usage")
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
             .or_else(|| sum_tokens(usage.prompt_tokens, usage.completion_tokens));
+        let mut protocol_extensions = BTreeMap::new();
+        let choice_extensions = opaque_fields(choice, &["message", "finish_reason"]);
+        if !choice_extensions.is_empty() {
+            protocol_extensions.insert(
+                "openai.chat_completions.choice".to_owned(),
+                Value::Object(choice_extensions),
+            );
+        }
         Ok(Self {
             id,
             model,
-            created_at: Some(json!(now_unix_seconds())),
+            created_at: response
+                .get("created")
+                .cloned()
+                .or_else(|| Some(json!(now_unix_seconds()))),
             status: status_for_stop(stop_reason).to_owned(),
             incomplete_details: incomplete_details_for_stop(stop_reason),
             error: None,
             termination: ResponseTermination {
                 reason: stop_reason,
-                protocol_reason: body
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|choices| choices.first())
-                    .and_then(|choice| choice.get("finish_reason"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                protocol_reason,
                 stop_sequence: None,
             },
             items,
@@ -381,7 +445,11 @@ impl ResponseIr {
                     })
                     .unwrap_or_default(),
             },
-            opaque_extensions: Map::new(),
+            opaque_extensions: opaque_fields(
+                response,
+                &["id", "object", "created", "model", "choices", "usage"],
+            ),
+            protocol_extensions,
         })
     }
 
@@ -450,6 +518,7 @@ impl ResponseIr {
                                 object,
                                 &["type", "id", "name", "input"],
                             ),
+                            function_extensions: Map::new(),
                         });
                     }
                     _ => {
@@ -496,6 +565,7 @@ impl ResponseIr {
                     "usage",
                 ],
             ),
+            protocol_extensions: BTreeMap::new(),
         })
     }
 
@@ -541,27 +611,36 @@ impl ResponseIr {
                                 let Some(part_object) = part.as_object() else {
                                     return ResponseContent::Opaque(part.clone());
                                 };
-                                if part_object.get("type").and_then(Value::as_str)
-                                    != Some("output_text")
-                                {
-                                    return ResponseContent::Opaque(part.clone());
+                                match part_object.get("type").and_then(Value::as_str) {
+                                    Some("output_text") => ResponseContent::Text(ResponseText {
+                                        text: part_object
+                                            .get("text")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                        annotations: part_object
+                                            .get("annotations")
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        opaque_extensions: opaque_fields(
+                                            part_object,
+                                            &["type", "text", "annotations"],
+                                        ),
+                                    }),
+                                    Some("refusal") => ResponseContent::Refusal(ResponseRefusal {
+                                        refusal: part_object
+                                            .get("refusal")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                        opaque_extensions: opaque_fields(
+                                            part_object,
+                                            &["type", "refusal"],
+                                        ),
+                                    }),
+                                    _ => ResponseContent::Opaque(part.clone()),
                                 }
-                                ResponseContent::Text(ResponseText {
-                                    text: part_object
-                                        .get("text")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_owned(),
-                                    annotations: part_object
-                                        .get("annotations")
-                                        .and_then(Value::as_array)
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    opaque_extensions: opaque_fields(
-                                        part_object,
-                                        &["type", "text", "annotations"],
-                                    ),
-                                })
                             })
                             .collect();
                         items.push(ResponseItem::Message {
@@ -601,6 +680,7 @@ impl ResponseIr {
                             object,
                             &["id", "type", "status", "call_id", "name", "arguments"],
                         ),
+                        function_extensions: Map::new(),
                     }),
                     _ => items.push(ResponseItem::Opaque(item.clone())),
                 }
@@ -637,6 +717,7 @@ impl ResponseIr {
                     "usage",
                 ],
             ),
+            protocol_extensions: BTreeMap::new(),
         })
     }
 
@@ -662,18 +743,27 @@ impl ResponseIr {
                 }
                 ResponseItem::Message { content: parts, .. } => {
                     for part in parts {
-                        if let ResponseContent::Text(part) = part {
-                            let mut block = part.opaque_extensions.clone();
-                            block.insert("type".to_owned(), json!("text"));
-                            block.insert("text".to_owned(), json!(part.text));
-                            content.push(Value::Object(block));
-                            if !part.annotations.is_empty() {
-                                if let Some(sources) = format_url_citations(Some(&Value::Array(
-                                    part.annotations.clone(),
-                                ))) {
-                                    content.push(json!({"type":"text", "text":sources}));
+                        match part {
+                            ResponseContent::Text(part) => {
+                                let mut block = part.opaque_extensions.clone();
+                                block.insert("type".to_owned(), json!("text"));
+                                block.insert("text".to_owned(), json!(part.text));
+                                content.push(Value::Object(block));
+                                if !part.annotations.is_empty() {
+                                    if let Some(sources) = format_url_citations(Some(
+                                        &Value::Array(part.annotations.clone()),
+                                    )) {
+                                        content.push(json!({"type":"text", "text":sources}));
+                                    }
                                 }
                             }
+                            ResponseContent::Refusal(part) => {
+                                let mut block = part.opaque_extensions.clone();
+                                block.insert("type".to_owned(), json!("text"));
+                                block.insert("text".to_owned(), json!(part.refusal));
+                                content.push(Value::Object(block));
+                            }
+                            ResponseContent::Opaque(_) => {}
                         }
                     }
                 }
@@ -768,6 +858,12 @@ impl ResponseIr {
                                 );
                                 rendered_content.push(Value::Object(rendered));
                             }
+                            ResponseContent::Refusal(part) => {
+                                let mut rendered = part.opaque_extensions.clone();
+                                rendered.insert("type".to_owned(), json!("refusal"));
+                                rendered.insert("refusal".to_owned(), json!(part.refusal));
+                                rendered_content.push(Value::Object(rendered));
+                            }
                             ResponseContent::Opaque(value) => {
                                 rendered_content.push(value.clone());
                             }
@@ -794,8 +890,15 @@ impl ResponseIr {
                     arguments,
                     status,
                     opaque_extensions,
+                    function_extensions,
                 } => {
                     let mut rendered = opaque_extensions.clone();
+                    if !function_extensions.is_empty() {
+                        rendered.insert(
+                            "function".to_owned(),
+                            Value::Object(function_extensions.clone()),
+                        );
+                    }
                     rendered.insert(
                         "id".to_owned(),
                         json!(id.clone().unwrap_or_else(|| format!("fc_{suffix}_{index}"))),
@@ -849,6 +952,56 @@ fn flush_message_content(items: &mut Vec<ResponseItem>, content: &mut Vec<Respon
         content: std::mem::take(content),
         opaque_extensions: Map::new(),
     });
+}
+
+fn parse_chat_message_content(message: &Map<String, Value>) -> Vec<ResponseContent> {
+    match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![ResponseContent::Text(ResponseText {
+                text: text.clone(),
+                annotations: message
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                opaque_extensions: Map::new(),
+            })]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|part| {
+                let Some(object) = part.as_object() else {
+                    return ResponseContent::Opaque(part.clone());
+                };
+                match object.get("type").and_then(Value::as_str) {
+                    Some("text" | "output_text") => ResponseContent::Text(ResponseText {
+                        text: object
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        annotations: object
+                            .get("annotations")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                        opaque_extensions: opaque_fields(object, &["type", "text", "annotations"]),
+                    }),
+                    Some("refusal") => ResponseContent::Refusal(ResponseRefusal {
+                        refusal: object
+                            .get("refusal")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        opaque_extensions: opaque_fields(object, &["type", "refusal"]),
+                    }),
+                    _ => ResponseContent::Opaque(part.clone()),
+                }
+            })
+            .collect(),
+        Some(value) if !value.is_null() => vec![ResponseContent::Opaque(value.clone())],
+        _ => Vec::new(),
+    }
 }
 
 impl ResponseUsage {
@@ -1269,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_message_preserves_unknown_content_parts() {
+    fn responses_message_preserves_refusal_and_unknown_content_parts() {
         let body = json!({
             "id": "resp-1",
             "model": "m",
@@ -1297,9 +1450,87 @@ mod tests {
 
         let messages = response.render(Protocol::AnthropicMessages).unwrap();
         let content = messages["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
+        assert_eq!(content.len(), 3);
         assert_eq!(content[0]["text"], "before");
-        assert_eq!(content[1]["text"], "after");
+        assert_eq!(content[1]["text"], "not allowed");
+        assert_eq!(content[1]["vendor_code"], 7);
+        assert_eq!(content[2]["text"], "after");
+    }
+
+    #[test]
+    fn chat_response_preserves_refusal_and_opaque_fields() {
+        let body = json!({
+            "id": "chat-1",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "m",
+            "service_tier": "priority",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "content_filter",
+                "logprobs": {"vendor": true},
+                "x_choice": 1,
+                "message": {
+                    "role": "assistant",
+                    "x_message": 2,
+                    "content": [
+                        {"type":"text", "text":"before", "x_part":3},
+                        {"type":"refusal", "refusal":"not allowed", "x_refusal":4},
+                        {"type":"vendor_content", "payload":5}
+                    ],
+                    "tool_calls": [{
+                        "id":"call_1",
+                        "type":"function",
+                        "x_call":6,
+                        "function": {
+                            "name":"lookup",
+                            "arguments":"{\"q\":1}",
+                            "x_function":7
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens":1, "completion_tokens":2}
+        });
+        let response = ResponseIr::parse(Protocol::OpenAiChatCompletions, &body).unwrap();
+
+        assert_eq!(
+            response.protocol_extension("openai.chat_completions.choice"),
+            Some(&json!({"index":0, "logprobs":{"vendor":true}, "x_choice":1}))
+        );
+        let responses = response.render(Protocol::OpenAiResponses).unwrap();
+        assert_eq!(responses["created_at"], 123);
+        assert_eq!(responses["service_tier"], "priority");
+        assert_eq!(responses["output"][0]["x_message"], 2);
+        assert_eq!(responses["output"][0]["content"][0]["x_part"], 3);
+        assert_eq!(responses["output"][0]["content"][1]["type"], "refusal");
+        assert_eq!(responses["output"][0]["content"][1]["x_refusal"], 4);
+        assert_eq!(responses["output"][0]["content"][2]["payload"], 5);
+        assert_eq!(responses["output"][1]["x_call"], 6);
+        assert_eq!(responses["output"][1]["function"]["x_function"], 7);
+
+        let messages = response.render(Protocol::AnthropicMessages).unwrap();
+        assert_eq!(messages["content"][0]["text"], "before");
+        assert_eq!(messages["content"][1]["text"], "not allowed");
+
+        let mut request = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({"model":"m", "input":"hi"}),
+        )
+        .unwrap();
+        response.append_to_request(&mut request);
+        let chat = request
+            .render_with_report(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap()
+            .0;
+        let assistant = &chat["messages"][1];
+        assert_eq!(assistant["x_message"], 2);
+        assert_eq!(assistant["refusal"], "not allowed");
+        assert_eq!(assistant["tool_calls"][0]["x_call"], 6);
+        assert_eq!(assistant["tool_calls"][0]["function"]["x_function"], 7);
     }
 
     #[test]

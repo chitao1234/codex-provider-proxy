@@ -231,6 +231,10 @@ pub(crate) enum IrContent {
         text: String,
         extensions: ContentExtensions,
     },
+    Refusal {
+        refusal: String,
+        extensions: ContentExtensions,
+    },
     Thinking {
         id: Option<String>,
         status: Option<String>,
@@ -257,6 +261,7 @@ pub(crate) struct IrToolCall {
     pub(crate) arguments: Value,
     pub(crate) status: Option<String>,
     pub(crate) opaque_extensions: Map<String, Value>,
+    pub(crate) function_extensions: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2060,6 +2065,14 @@ impl IrContent {
                     .to_owned(),
                 extensions: ContentExtensions::parse(object, &["type", "text", "cache_control"]),
             },
+            Some("refusal") => Self::Refusal {
+                refusal: object
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                extensions: ContentExtensions::parse(object, &["type", "refusal", "cache_control"]),
+            },
             Some("thinking" | "reasoning_text") => Self::Thinking {
                 id: object.get("id").and_then(Value::as_str).map(str::to_owned),
                 status: object
@@ -2125,6 +2138,15 @@ impl IrContent {
                 object.insert("text".to_owned(), Value::String(text.clone()));
                 Value::Object(object)
             }
+            Self::Refusal {
+                refusal,
+                extensions,
+            } => {
+                let mut object = extensions.render(true);
+                object.insert("type".to_owned(), Value::String("refusal".to_owned()));
+                object.insert("refusal".to_owned(), Value::String(refusal.clone()));
+                Value::Object(object)
+            }
             Self::Thinking {
                 id: _,
                 status: _,
@@ -2166,6 +2188,9 @@ impl IrContent {
                 object.insert("text".to_owned(), Value::String(text.clone()));
                 Value::Object(object)
             }
+            Self::Refusal { refusal, .. } => {
+                serde_json::json!({"type":"text", "text":refusal})
+            }
             Self::Thinking { text, .. } => serde_json::json!({"type":"text", "text":text}),
             Self::Image(value) => image_to_chat(value),
             other => other.raw_value(),
@@ -2173,7 +2198,18 @@ impl IrContent {
     }
 
     fn to_messages(&self) -> Value {
-        self.raw_value()
+        match self {
+            Self::Refusal {
+                refusal,
+                extensions,
+            } => {
+                let mut object = extensions.render(true);
+                object.insert("type".to_owned(), Value::String("text".to_owned()));
+                object.insert("text".to_owned(), Value::String(refusal.clone()));
+                Value::Object(object)
+            }
+            _ => self.raw_value(),
+        }
     }
 
     fn to_responses(&self, role: &str) -> Value {
@@ -2193,6 +2229,18 @@ impl IrContent {
                 );
                 object.insert("text".to_owned(), Value::String(text.clone()));
                 Value::Object(object)
+            }
+            Self::Refusal {
+                refusal,
+                extensions,
+            } if role == "assistant" => {
+                let mut object = extensions.render(true);
+                object.insert("type".to_owned(), Value::String("refusal".to_owned()));
+                object.insert("refusal".to_owned(), Value::String(refusal.clone()));
+                Value::Object(object)
+            }
+            Self::Refusal { refusal, .. } => {
+                serde_json::json!({"type":"input_text", "text":refusal})
             }
             Self::Image(value) => {
                 let mut object = value.as_object().cloned().unwrap_or_default();
@@ -2219,6 +2267,17 @@ fn prepared_content(content: &[IrContent], keep_cache_control: bool) -> Vec<IrCo
                 extensions.cache_control = None;
                 IrContent::Text {
                     text: text.clone(),
+                    extensions,
+                }
+            }
+            IrContent::Refusal {
+                refusal,
+                extensions,
+            } => {
+                let mut extensions = extensions.clone();
+                extensions.cache_control = None;
+                IrContent::Refusal {
+                    refusal: refusal.clone(),
                     extensions,
                 }
             }
@@ -2329,7 +2388,10 @@ impl IrMessage {
         let visible_content = content
             .iter()
             .filter(|content| {
-                !matches!(content, IrContent::ToolUse(_) | IrContent::Thinking { .. })
+                !matches!(
+                    content,
+                    IrContent::ToolUse(_) | IrContent::Thinking { .. } | IrContent::Refusal { .. }
+                )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2339,6 +2401,12 @@ impl IrMessage {
             _ => None,
         }) {
             object.insert("reasoning_content".to_owned(), Value::String(reasoning));
+        }
+        if let Some(refusal) = content.iter().find_map(|content| match content {
+            IrContent::Refusal { refusal, .. } => Some(refusal.clone()),
+            _ => None,
+        }) {
+            object.insert("refusal".to_owned(), Value::String(refusal));
         }
         if !calls.is_empty() {
             object.insert(
@@ -2496,6 +2564,7 @@ fn content_as_string(content: &[IrContent]) -> String {
         .iter()
         .filter_map(|part| match part {
             IrContent::Text { text, .. } => Some(text.as_str()),
+            IrContent::Refusal { refusal, .. } => Some(refusal.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -2579,6 +2648,9 @@ impl IrToolCall {
                 .as_object()
                 .map(|object| opaque_fields(object, &["id", "type", "function", "status"]))
                 .unwrap_or_default(),
+            function_extensions: function
+                .map(|function| opaque_fields(function, &["name", "arguments"]))
+                .unwrap_or_default(),
         }
     }
 
@@ -2603,6 +2675,7 @@ impl IrToolCall {
                 .as_object()
                 .map(|object| opaque_fields(object, &["id", "type", "name", "input", "status"]))
                 .unwrap_or_default(),
+            function_extensions: Map::new(),
         }
     }
 
@@ -2635,6 +2708,7 @@ impl IrToolCall {
                     )
                 })
                 .unwrap_or_default(),
+            function_extensions: Map::new(),
         }
     }
 
@@ -2654,10 +2728,10 @@ impl IrToolCall {
             ),
         );
         call.insert("type".to_owned(), Value::String("function".to_owned()));
-        call.insert(
-            "function".to_owned(),
-            serde_json::json!({"name":self.name, "arguments":arguments}),
-        );
+        let mut function = self.function_extensions.clone();
+        function.insert("name".to_owned(), Value::String(self.name.clone()));
+        function.insert("arguments".to_owned(), Value::String(arguments));
+        call.insert("function".to_owned(), Value::Object(function));
         Value::Object(call)
     }
 

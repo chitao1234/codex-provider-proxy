@@ -204,6 +204,7 @@ impl StreamingResponseIr {
                 arguments: serde_json::Value::String(tool.arguments.clone()),
                 status: Some("completed".to_owned()),
                 opaque_extensions: Map::new(),
+                function_extensions: Map::new(),
             })
             .collect();
         request.append_assistant_output(
