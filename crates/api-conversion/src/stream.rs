@@ -52,6 +52,12 @@ pub enum StreamEvent {
         opaque_extensions: Map<String, Value>,
         function_extensions: Map<String, Value>,
     },
+    /// Additional opaque metadata for a tool call that arrived after its start.
+    ToolCallExtensions {
+        index: usize,
+        opaque_extensions: Map<String, Value>,
+        function_extensions: Map<String, Value>,
+    },
     /// Increment of a tool call's arguments (never cumulative).
     ToolCallArgsDelta { index: usize, args: String },
     /// The response ended, with the stop reason and final usage.
@@ -130,6 +136,16 @@ impl StreamingResponseIr {
             StreamEvent::ToolCallArgsDelta { index, args } => {
                 if let Some(tool) = self.tools.get_mut(index) {
                     tool.arguments.push_str(args);
+                }
+            }
+            StreamEvent::ToolCallExtensions {
+                index,
+                opaque_extensions,
+                function_extensions,
+            } => {
+                if let Some(tool) = self.tools.get_mut(index) {
+                    tool.opaque_extensions.extend(opaque_extensions.clone());
+                    tool.function_extensions.extend(function_extensions.clone());
                 }
             }
             StreamEvent::End {
@@ -303,6 +319,11 @@ mod tests {
                 index: 0,
                 args: "{\"q\":1}".to_owned(),
             },
+            StreamEvent::ToolCallExtensions {
+                index: 0,
+                opaque_extensions: Map::from_iter([("x_late".to_owned(), json!(3))]),
+                function_extensions: Map::from_iter([("x_function_late".to_owned(), json!(4))]),
+            },
             StreamEvent::End {
                 stop_reason: StopReason::ToolUse,
                 protocol_reason: Some("tool_calls".to_owned()),
@@ -349,7 +370,9 @@ mod tests {
         assert_eq!(assistant["content"][1]["text"], "answer");
         assert_eq!(assistant["content"][2]["id"], "call_1");
         assert_eq!(assistant["content"][2]["x_call"], 1);
+        assert_eq!(assistant["content"][2]["x_late"], 3);
         assert_eq!(assistant["content"][2]["function"]["x_function"], 2);
+        assert_eq!(assistant["content"][2]["function"]["x_function_late"], 4);
     }
 
     #[test]

@@ -162,6 +162,7 @@ impl MessagesRenderer {
                     }
                 }
             }
+            StreamEvent::ToolCallExtensions { .. } => {}
             StreamEvent::End {
                 stop_reason, usage, ..
             } => {

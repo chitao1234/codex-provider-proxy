@@ -210,8 +210,9 @@ impl ChatParser {
             .unwrap_or_default();
 
         // Announce the tool call once id + name are both known.
-        let announce = {
+        let (announce, update_extensions) = {
             let accumulator = self.tools.entry(index).or_default();
+            let was_announced = accumulator.announced;
             if let Some(id) = new_id {
                 accumulator.id = Some(id);
             }
@@ -221,9 +222,16 @@ impl ChatParser {
             if let Some(arguments) = new_args {
                 accumulator.arguments.push_str(&arguments);
             }
-            accumulator.opaque_extensions.extend(call_extensions);
-            accumulator.function_extensions.extend(function_extensions);
-            !accumulator.announced && accumulator.id.is_some() && accumulator.name.is_some()
+            accumulator
+                .opaque_extensions
+                .extend(call_extensions.clone());
+            accumulator
+                .function_extensions
+                .extend(function_extensions.clone());
+            (
+                !was_announced && accumulator.id.is_some() && accumulator.name.is_some(),
+                was_announced && (!call_extensions.is_empty() || !function_extensions.is_empty()),
+            )
         };
         if announce {
             let (id, name, opaque_extensions, function_extensions) = {
@@ -244,6 +252,13 @@ impl ChatParser {
             });
             let acc = self.tools.get_mut(&index).expect("inserted above");
             acc.announced = true;
+        }
+        if update_extensions {
+            out.push(StreamEvent::ToolCallExtensions {
+                index,
+                opaque_extensions: call_extensions,
+                function_extensions,
+            });
         }
 
         // Emit only the arguments increment since the last emission.
@@ -556,6 +571,27 @@ mod tests {
                     && payload["choice"]["x_choice"] == 1
                     && payload["delta"]["x_delta"] == 2
         ));
+    }
+
+    #[test]
+    fn preserves_tool_extensions_that_arrive_after_start() {
+        let mut parser = ChatParser::new();
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"x_call":3,"function":{"arguments":"{}","x_function":4}}]},"finish_reason":null}]}"#,
+        ] {
+            parser.on_chunk(payload, &mut events).unwrap();
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallExtensions {
+                index: 0,
+                opaque_extensions,
+                function_extensions,
+            } if opaque_extensions["x_call"] == 3 && function_extensions["x_function"] == 4
+        )));
     }
 
     #[test]

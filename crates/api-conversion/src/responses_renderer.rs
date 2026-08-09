@@ -201,6 +201,18 @@ impl ResponsesRenderer {
                     out,
                 );
             }
+            StreamEvent::ToolCallExtensions {
+                index,
+                opaque_extensions,
+                function_extensions,
+            } => {
+                if let Some(state) = self.function_calls.get_mut(index) {
+                    state.opaque_extensions.extend(opaque_extensions.clone());
+                    state
+                        .function_extensions
+                        .extend(function_extensions.clone());
+                }
+            }
             StreamEvent::End {
                 stop_reason, usage, ..
             } => {
@@ -708,6 +720,21 @@ mod tests {
         assert!(text.contains("\"x_call\":1"));
         assert!(text.contains("\"function\":{\"x_function\":2}"));
         assert_eq!(text.matches("\"x_call\":1").count(), 2);
+    }
+
+    #[test]
+    fn pipeline_preserves_late_chat_tool_call_extensions() {
+        let text = pipeline(
+            &[
+                r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}"#,
+                r#"{"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"x_call":1,"function":{"arguments":"{}","x_function":2}}]},"finish_reason":null}]}"#,
+                r#"{"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ],
+            true,
+        );
+        assert!(text.contains("\"x_call\":1"));
+        assert!(text.contains("\"function\":{\"x_function\":2}"));
     }
 
     #[test]

@@ -251,6 +251,38 @@ impl ResponsesParser {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if item_type == "function_call" {
+                    if let Some(index) = self.resolve_tool_index(data) {
+                        let item_object = item.and_then(Value::as_object);
+                        let function = item_object
+                            .and_then(|item| item.get("function"))
+                            .and_then(Value::as_object);
+                        let opaque_extensions = item_object
+                            .map(|item| {
+                                opaque_fields(
+                                    item,
+                                    &[
+                                        "id",
+                                        "type",
+                                        "status",
+                                        "call_id",
+                                        "name",
+                                        "arguments",
+                                        "function",
+                                    ],
+                                )
+                            })
+                            .unwrap_or_default();
+                        let function_extensions = function
+                            .map(|function| opaque_fields(function, &[]))
+                            .unwrap_or_default();
+                        if !opaque_extensions.is_empty() || !function_extensions.is_empty() {
+                            out.push(StreamEvent::ToolCallExtensions {
+                                index,
+                                opaque_extensions,
+                                function_extensions,
+                            });
+                        }
+                    }
                     if let Some(arguments) = item
                         .and_then(|item| item.get("arguments"))
                         .and_then(Value::as_str)
@@ -571,6 +603,35 @@ mod tests {
         assert!(
             matches!(&out[3], StreamEvent::ToolCallArgsDelta { index: 0, args } if args == "ris\"}")
         );
+    }
+
+    #[test]
+    fn preserves_function_call_extensions_from_done_item() {
+        let mut parser = ResponsesParser::new();
+        let mut out = Vec::new();
+        parser
+            .on_event(
+                "response.output_item.added",
+                &json!({"output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": ""}}),
+                &mut out,
+            )
+            .unwrap();
+        parser
+            .on_event(
+                "response.output_item.done",
+                &json!({"output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "x_call": 3, "function": {"x_function": 4}}}),
+                &mut out,
+            )
+            .unwrap();
+
+        assert!(out.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallExtensions {
+                index: 0,
+                opaque_extensions,
+                function_extensions,
+            } if opaque_extensions["x_call"] == 3 && function_extensions["x_function"] == 4
+        )));
     }
 
     #[test]
