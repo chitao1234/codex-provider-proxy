@@ -12,7 +12,6 @@ use crate::stream::{map_chat_finish_reason, StopReason};
 
 #[derive(Debug, Clone)]
 pub struct ResponseIr {
-    source: Protocol,
     id: String,
     model: String,
     created_at: Option<Value>,
@@ -61,6 +60,7 @@ struct ResponseText {
 struct ResponseUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
     cache_miss_tokens: Option<u64>,
@@ -191,8 +191,12 @@ impl ResponseIr {
             saw_tool_call,
         );
         let usage = extract_usage(body);
+        let total_tokens = body
+            .get("usage")
+            .and_then(|usage| usage.get("total_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| sum_tokens(usage.prompt_tokens, usage.completion_tokens));
         Ok(Self {
-            source: Protocol::OpenAiChatCompletions,
             id,
             model,
             created_at: Some(json!(now_unix_seconds())),
@@ -203,6 +207,7 @@ impl ResponseIr {
             usage: ResponseUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
+                total_tokens,
                 cached_tokens: usage.cached_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
                 cache_miss_tokens: usage.prompt_cache_miss_tokens,
@@ -312,7 +317,6 @@ impl ResponseIr {
             _ => StopReason::Other,
         };
         Ok(Self {
-            source: Protocol::AnthropicMessages,
             id,
             model,
             created_at: None,
@@ -438,7 +442,6 @@ impl ResponseIr {
             }
         }
         Ok(Self {
-            source: Protocol::OpenAiResponses,
             id: string_field(response, "id"),
             model: string_field(response, "model"),
             created_at: response.get("created_at").cloned(),
@@ -647,11 +650,7 @@ impl ResponseIr {
         );
         out.insert("model".to_owned(), json!(self.model));
         out.insert("output".to_owned(), Value::Array(output));
-        out.insert(
-            "usage".to_owned(),
-            self.usage
-                .render_responses(self.source != Protocol::AnthropicMessages),
-        );
+        out.insert("usage".to_owned(), self.usage.render_responses());
         Value::Object(out)
     }
 }
@@ -676,15 +675,11 @@ impl ResponseUsage {
         Value::Object(out)
     }
 
-    fn render_responses(&self, include_total_tokens: bool) -> Value {
+    fn render_responses(&self) -> Value {
         let mut out = self.opaque_extensions.clone();
         insert_u64(&mut out, "input_tokens", self.input_tokens);
         insert_u64(&mut out, "output_tokens", self.output_tokens);
-        if include_total_tokens {
-            if let (Some(input), Some(output)) = (self.input_tokens, self.output_tokens) {
-                out.insert("total_tokens".to_owned(), json!(input + output));
-            }
-        }
+        insert_u64(&mut out, "total_tokens", self.total_tokens);
         let mut input_details = Map::new();
         insert_u64(&mut input_details, "cached_tokens", self.cached_tokens);
         insert_u64(
@@ -718,6 +713,7 @@ fn parse_messages_usage(usage: Option<&Value>) -> ResponseUsage {
     ResponseUsage {
         input_tokens: nested_u64(usage, "input_tokens"),
         output_tokens: nested_u64(usage, "output_tokens"),
+        total_tokens: None,
         cached_tokens: nested_u64(usage, "cache_read_input_tokens"),
         cache_write_tokens: nested_u64(usage, "cache_creation_input_tokens"),
         cache_miss_tokens: None,
@@ -751,9 +747,13 @@ fn parse_responses_usage(usage: Option<&Value>) -> ResponseUsage {
     let output_details = usage
         .and_then(|usage| usage.get("output_tokens_details"))
         .and_then(Value::as_object);
+    let input_tokens = nested_u64(usage, "input_tokens");
+    let output_tokens = nested_u64(usage, "output_tokens");
     ResponseUsage {
-        input_tokens: nested_u64(usage, "input_tokens"),
-        output_tokens: nested_u64(usage, "output_tokens"),
+        input_tokens,
+        output_tokens,
+        total_tokens: nested_u64(usage, "total_tokens")
+            .or_else(|| sum_tokens(input_tokens, output_tokens)),
         cached_tokens: nested_u64(input_details, "cached_tokens"),
         cache_write_tokens: nested_u64(input_details, "cache_write_tokens"),
         cache_miss_tokens: nested_u64(input_details, "cache_miss_tokens"),
@@ -795,6 +795,10 @@ fn nested_u64(object: Option<&Map<String, Value>>, field: &str) -> Option<u64> {
     object
         .and_then(|object| object.get(field))
         .and_then(Value::as_u64)
+}
+
+fn sum_tokens(input_tokens: Option<u64>, output_tokens: Option<u64>) -> Option<u64> {
+    input_tokens?.checked_add(output_tokens?)
 }
 
 fn insert_u64(object: &mut Map<String, Value>, field: &str, value: Option<u64>) {
@@ -960,6 +964,7 @@ mod tests {
         assert_eq!(output["output"][1]["content"][0]["text"], "answer");
         assert_eq!(output["output"][2]["arguments"], "{\"q\":1}");
         assert_eq!(output["usage"]["input_tokens_details"]["cached_tokens"], 2);
+        assert!(output["usage"].get("total_tokens").is_none());
     }
 
     #[test]
