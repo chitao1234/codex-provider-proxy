@@ -3844,7 +3844,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(b"attempt-0"));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -3879,7 +3879,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(b"attempt-0"));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
