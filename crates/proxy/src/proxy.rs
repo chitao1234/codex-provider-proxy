@@ -4650,30 +4650,33 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_event_disables_slow_down_filter_without_dropping_bytes() {
-        let oversized = Bytes::from(vec![
-            b'x';
-            codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES
-                + 1
-        ]);
-        let slow_down = Bytes::from_static(concat!(
-            "event: response.failed\n",
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
-        ).as_bytes());
-        let inner = stream::iter([
-            Ok::<_, std::io::Error>(oversized.clone()),
-            Ok(slow_down.clone()),
-        ]);
-        let mut filtered =
-            super::ResponsesSlowDownDropStream::new(inner, 1, None, "provider".to_owned());
-        let mut delivered = BytesMut::new();
-        while let Some(chunk) = filtered.next().await {
-            delivered.extend_from_slice(&chunk.unwrap());
-        }
+        for terminated in [false, true] {
+            let mut oversized =
+                vec![b'x'; codex_provider_proxy_api_conversion::sse::MAX_EVENT_BYTES + 1];
+            if terminated {
+                oversized.extend_from_slice(b"\n\n");
+            }
+            let oversized = Bytes::from(oversized);
+            let slow_down = Bytes::from_static(concat!(
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\"}}}\n\n",
+            ).as_bytes());
+            let inner = stream::iter([
+                Ok::<_, std::io::Error>(oversized.clone()),
+                Ok(slow_down.clone()),
+            ]);
+            let mut filtered =
+                super::ResponsesSlowDownDropStream::new(inner, 1, None, "provider".to_owned());
+            let mut delivered = BytesMut::new();
+            while let Some(chunk) = filtered.next().await {
+                delivered.extend_from_slice(&chunk.unwrap());
+            }
 
-        let mut expected = BytesMut::new();
-        expected.extend_from_slice(&oversized);
-        expected.extend_from_slice(&slow_down);
-        assert_eq!(delivered, expected);
+            let mut expected = BytesMut::new();
+            expected.extend_from_slice(&oversized);
+            expected.extend_from_slice(&slow_down);
+            assert_eq!(delivered, expected, "terminated={terminated}");
+        }
     }
 
     #[tokio::test]
