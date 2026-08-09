@@ -208,17 +208,9 @@ impl ResponsesRenderer {
         }
     }
 
-    /// End the stream (upstream ended without a finish_reason): emit completed
-    /// (or incomplete) if not already sent.
-    pub fn finish(&mut self, out: &mut Vec<Bytes>) {
-        if self.finished {
-            return;
-        }
+    /// Mark transport EOF without inventing a protocol-level completion.
+    pub fn finish(&mut self, _out: &mut Vec<Bytes>) {
         self.finished = true;
-        if !self.started {
-            return;
-        }
-        self.emit_completed(StopReason::Other, out);
     }
 
     fn ensure_reasoning_item(&mut self, out: &mut Vec<Bytes>) {
@@ -716,12 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_finish_without_done_emits_completed() {
+    fn pipeline_finish_without_done_does_not_emit_completed() {
         let text = pipeline(
             &[r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#],
             true,
         );
-        assert!(text.contains("event: response.completed"));
-        assert_eq!(text.matches("event: response.completed").count(), 1);
+        assert!(!text.contains("event: response.completed"));
     }
 }

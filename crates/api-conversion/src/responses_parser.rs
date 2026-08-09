@@ -348,23 +348,9 @@ impl ResponsesParser {
         Ok(())
     }
 
-    /// End of the upstream stream without a completed event: emit a final End.
-    pub fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        if self.finished {
-            return;
-        }
+    /// Mark transport EOF without inventing a protocol-level completion.
+    pub fn finish(&mut self, _out: &mut Vec<StreamEvent>) {
         self.finished = true;
-        if !self.started {
-            return;
-        }
-        if !self.end_emitted {
-            self.end_emitted = true;
-            out.push(StreamEvent::End {
-                stop_reason: StopReason::Stop,
-                protocol_reason: None,
-                usage: self.usage,
-            });
-        }
     }
 
     fn resolve_tool_index(&self, data: &Value) -> Option<usize> {

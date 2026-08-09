@@ -482,4 +482,37 @@ mod tests {
         assert_eq!(received, body);
         assert!(store.get("resp_1").is_none());
     }
+
+    #[tokio::test]
+    async fn recording_passthrough_does_not_record_unterminated_response() {
+        let store = crate::response_state::ResponseStateStore::new(4);
+        let request_ir = RequestIr::parse(
+            Protocol::OpenAiResponses,
+            &serde_json::json!({"model":"model", "input":"hi"}),
+        )
+        .unwrap();
+        let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
+        let body = Bytes::from_static(
+            concat!(
+                "event: response.created\n",
+                "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"model\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"partial\"}\n\n",
+            )
+            .as_bytes(),
+        );
+        let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
+        let mut passthrough = RecordingPassthroughStream::new(
+            inner,
+            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            Some(recorder),
+        );
+        let mut received = Vec::new();
+        while let Some(chunk) = passthrough.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(received, body);
+        assert!(store.get("resp_1").is_none());
+    }
 }

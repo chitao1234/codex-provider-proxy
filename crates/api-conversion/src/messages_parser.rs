@@ -268,23 +268,9 @@ impl MessagesParser {
         Ok(())
     }
 
-    /// End of the upstream stream without a message_stop: emit a final End event.
-    pub fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        if self.finished {
-            return;
-        }
+    /// Mark transport EOF without inventing a protocol-level completion.
+    pub fn finish(&mut self, _out: &mut Vec<StreamEvent>) {
         self.finished = true;
-        if !self.started {
-            return;
-        }
-        if !self.end_emitted {
-            self.end_emitted = true;
-            out.push(StreamEvent::End {
-                stop_reason: StopReason::Stop,
-                protocol_reason: None,
-                usage: self.usage,
-            });
-        }
     }
 }
 
@@ -588,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_without_stop_emits_end() {
+    fn finish_without_stop_does_not_invent_end() {
         let mut parser = MessagesParser::new();
         let mut out = Vec::new();
         parser
@@ -613,7 +599,9 @@ mod tests {
             )
             .unwrap();
         parser.finish(&mut out);
-        assert!(matches!(out.last().unwrap(), StreamEvent::End { .. }));
+        assert!(!out
+            .iter()
+            .any(|event| matches!(event, StreamEvent::End { .. })));
     }
 
     #[test]

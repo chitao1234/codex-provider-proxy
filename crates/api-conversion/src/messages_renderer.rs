@@ -174,19 +174,9 @@ impl MessagesRenderer {
         }
     }
 
-    /// End the stream (upstream ended without a finish_reason): close open blocks and
-    /// emit terminators exactly once.
-    pub fn finish(&mut self, out: &mut Vec<bytes::Bytes>) {
-        if self.ended {
-            return;
-        }
+    /// Mark transport EOF without inventing protocol terminators.
+    pub fn finish(&mut self, _out: &mut Vec<bytes::Bytes>) {
         self.ended = true;
-        if !self.started {
-            return;
-        }
-        self.close_blocks(out);
-        self.emit_message_delta(out);
-        self.emit_message_stop(out);
     }
 
     fn open_text(&mut self, out: &mut Vec<bytes::Bytes>) {
@@ -583,14 +573,13 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_finish_without_done_emits_terminators() {
+    fn pipeline_finish_without_done_does_not_emit_terminators() {
         let text = pipeline(
             &[r#"{"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}"#],
             true,
         );
-        assert!(text.contains("event: message_delta"));
-        assert!(text.contains("event: message_stop"));
-        assert_eq!(text.matches("event: message_stop").count(), 1);
+        assert!(!text.contains("event: message_delta"));
+        assert!(!text.contains("event: message_stop"));
     }
 
     #[test]
