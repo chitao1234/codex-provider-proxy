@@ -223,7 +223,7 @@ pub fn convert_request_body(
     provider_name: &str,
     path: &str,
     body: Bytes,
-    previous_request: Option<&RequestIr>,
+    previous_request: Option<&codex_provider_proxy_api_conversion::ir::RequestIr>,
     last_reasoning: Option<&str>,
 ) -> Result<Bytes, RequestConversionRejected> {
     let provider = cfg
@@ -255,10 +255,8 @@ pub fn convert_request_body(
         RequestAction::Transform(pipeline) => {
             let source = downstream_protocol(plan.downstream);
             let adapter = RequestAdapterKind::for_protocol(source);
-            let previous_v2 = previous_request
-                .map(codex_provider_proxy_api_conversion::request_ir::RequestIr::to_v2);
             let request = adapter
-                .parse_v2_with_context(&json, previous_v2.as_ref(), last_reasoning)
+                .parse_v2_with_context(&json, previous_request, last_reasoning)
                 .map_err(|err| {
                     RequestConversionRejected::from_conversion_error(err, plan.downstream)
                 })?;

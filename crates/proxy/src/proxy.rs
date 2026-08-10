@@ -1553,7 +1553,9 @@ fn maybe_convert_request_body(
         &attempt.provider_name,
         forwarded_path,
         body,
-        previous_state.as_ref().map(|previous| &previous.request_ir),
+        previous_state
+            .as_ref()
+            .and_then(|previous| previous.semantic_request.as_ref()),
         last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
