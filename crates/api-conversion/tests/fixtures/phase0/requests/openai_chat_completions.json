@@ -1,0 +1,7 @@
+{
+  "model": "phase0-model",
+  "messages": [{"role": "user", "content": "hello"}],
+  "stream": false,
+  "user": "phase0-user",
+  "x_client_field": {"keep": true}
+}

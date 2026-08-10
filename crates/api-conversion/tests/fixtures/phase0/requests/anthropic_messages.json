@@ -1,0 +1,7 @@
+{
+  "model": "phase0-model",
+  "max_tokens": 32,
+  "messages": [{"role": "user", "content": "hello"}],
+  "cache_control": {"type": "ephemeral"},
+  "x_client_field": {"keep": true}
+}

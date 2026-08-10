@@ -1,0 +1,12 @@
+{
+  "id": "chatcmpl_phase0",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "phase0-model",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "hello", "refusal": null},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+}

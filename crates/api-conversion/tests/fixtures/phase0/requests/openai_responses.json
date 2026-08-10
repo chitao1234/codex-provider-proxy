@@ -1,0 +1,7 @@
+{
+  "model": "phase0-model",
+  "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+  "stream": false,
+  "prompt_cache_key": "phase0-cache",
+  "x_client_field": {"keep": true}
+}

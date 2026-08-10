@@ -1,0 +1,14 @@
+{
+  "id": "resp_phase0",
+  "object": "response",
+  "status": "completed",
+  "model": "phase0-model",
+  "output": [{
+    "id": "msg_phase0",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+  }],
+  "usage": {"input_tokens": 3, "output_tokens": 2}
+}

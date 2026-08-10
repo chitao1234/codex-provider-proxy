@@ -1,0 +1,6 @@
+{"event_type":"response.created","data":{"type":"response.created","response":{"id":"resp_phase0","model":"phase0-model","status":"in_progress"}}}
+{"event_type":"response.output_item.added","data":{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_phase0","type":"message","status":"in_progress","role":"assistant","content":[]}}}
+{"event_type":"response.output_text.delta","data":{"type":"response.output_text.delta","output_index":0,"delta":"hello"}}
+{"event_type":"response.output_text.done","data":{"type":"response.output_text.done","output_index":0,"text":"hello"}}
+{"event_type":"response.output_item.done","data":{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_phase0","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]}}}
+{"event_type":"response.completed","data":{"type":"response.completed","response":{"id":"resp_phase0","status":"completed","model":"phase0-model","usage":{"input_tokens":3,"output_tokens":2}}}}

@@ -1,0 +1,3 @@
+{"id":"chatcmpl_phase0","model":"phase0-model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}
+{"id":"chatcmpl_phase0","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}
+[DONE]
