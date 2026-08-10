@@ -1,0 +1,287 @@
+use serde_json::{Map, Value};
+
+use crate::{
+    dialect::{ModelCapabilities, RequestConversionReport, ThinkingParam},
+    error::ConversionError,
+    ir::{ContentItem, ContentPart, GenerationControls, RequestIr},
+};
+
+pub fn render(
+    request: &RequestIr,
+    capabilities: &ModelCapabilities,
+) -> Result<(Value, RequestConversionReport), ConversionError> {
+    let mut output = opaque_root(request);
+    if let Some(model) = &request.model {
+        output.insert("model".to_owned(), Value::String(model.clone()));
+    }
+    if let Some(stream) = request.stream {
+        output.insert("stream".to_owned(), Value::Bool(stream));
+    }
+    render_state(request, &mut output);
+    render_generation(&request.generation, capabilities, &mut output);
+
+    let mut system_parts = request
+        .instructions
+        .iter()
+        .flat_map(content_item_text)
+        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for item in &request.transcript {
+        match item {
+            ContentItem::Message { role, content, .. }
+                if role == "system" || role == "developer" =>
+            {
+                system_parts.extend(content.iter().filter_map(text_part));
+            }
+            ContentItem::Message { role, content, .. } => {
+                messages.push(serde_json::json!({
+                    "role": normalize_role(role),
+                    "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                }));
+            }
+            ContentItem::Reasoning { content, .. } => messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": content.iter().map(render_thinking_part).collect::<Vec<_>>(),
+            })),
+            ContentItem::Refusal { content, .. } => messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+            })),
+            ContentItem::ToolUse { id, call } => messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": [render_tool_use(id.as_deref(), call)],
+            })),
+            ContentItem::ToolResult { result } => messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": result.call_id,
+                    "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    "is_error": result.is_error,
+                }],
+            })),
+            ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
+                if payload.is_object() {
+                    messages.push(serde_json::json!({"role": "assistant", "content": [payload]}));
+                }
+            }
+        }
+    }
+    if !system_parts.is_empty() {
+        output.insert(
+            "system".to_owned(),
+            Value::String(system_parts.join("\n\n")),
+        );
+    }
+    output.insert("messages".to_owned(), Value::Array(messages));
+    if !request.tools.is_empty() {
+        output.insert(
+            "tools".to_owned(),
+            Value::Array(request.tools.iter().map(render_tool).collect()),
+        );
+    }
+    if let Some(choice) = &request.tool_choice {
+        output.insert("tool_choice".to_owned(), render_tool_choice(choice));
+    }
+    Ok((Value::Object(output), RequestConversionReport::default()))
+}
+
+fn opaque_root(request: &RequestIr) -> Map<String, Value> {
+    request
+        .opaque
+        .iter()
+        .filter(|extension| extension.scope == crate::ir::ExtensionScope::Request)
+        .map(|extension| (extension.key.clone(), extension.value.clone()))
+        .collect()
+}
+
+fn render_state(request: &RequestIr, output: &mut Map<String, Value>) {
+    if let Some(key) = request
+        .state
+        .cache
+        .key
+        .as_ref()
+        .or(request.state.identity.user_id.as_ref())
+    {
+        output.insert("metadata".to_owned(), serde_json::json!({"user_id": key}));
+    }
+}
+
+fn render_generation(
+    generation: &GenerationControls,
+    capabilities: &ModelCapabilities,
+    output: &mut Map<String, Value>,
+) {
+    if let Some(tokens) = generation.max_output_tokens.as_ref() {
+        let value = tokens.as_u64().map_or(tokens.clone(), |tokens| {
+            Value::from(
+                capabilities
+                    .max_tokens_cap
+                    .map_or(tokens, |cap| tokens.min(cap)),
+            )
+        });
+        output.insert("max_tokens".to_owned(), value);
+    } else if let Some(default) = capabilities.default_max_tokens {
+        output.insert(
+            "max_tokens".to_owned(),
+            Value::from(
+                capabilities
+                    .max_tokens_cap
+                    .map_or(default, |cap| default.min(cap)),
+            ),
+        );
+    }
+    if let Some(config) = &generation.output_config {
+        output.insert("output_config".to_owned(), config.clone());
+    }
+    let effort = generation.reasoning_effort.as_ref().or_else(|| {
+        generation
+            .reasoning
+            .as_ref()
+            .and_then(|value| value.get("effort"))
+    });
+    let thinking_type = generation
+        .thinking
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str);
+    match capabilities.thinking_param {
+        ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+            if generation.thinking.is_some() || effort.is_some() {
+                let enabled = thinking_type != Some("disabled")
+                    && effort
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value != "none" && value != "minimal");
+                output.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({"type": if enabled { "enabled" } else { "disabled" }}),
+                );
+            }
+        }
+        ThinkingParam::EnableThinking => {
+            if generation.thinking.is_some() || effort.is_some() {
+                output.insert(
+                    "enable_thinking".to_owned(),
+                    Value::Bool(thinking_type != Some("disabled")),
+                );
+            }
+        }
+        ThinkingParam::None => {}
+    }
+    if let Some(stop) = generation
+        .stop_sequences
+        .as_ref()
+        .or(generation.stop.as_ref())
+    {
+        let values = match stop {
+            Value::String(value) if !value.is_empty() => vec![Value::String(value.clone())],
+            Value::Array(values) => values.clone(),
+            _ => Vec::new(),
+        };
+        if !values.is_empty() {
+            output.insert("stop_sequences".to_owned(), Value::Array(values));
+        }
+    }
+    if let Some(parallel) = generation
+        .parallel_tool_use
+        .as_ref()
+        .or(generation.parallel_tool_calls.as_ref())
+    {
+        output.insert("parallel_tool_use".to_owned(), parallel.clone());
+    }
+}
+
+fn render_content_part(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
+        ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
+        ContentPart::Reasoning { text, signature } => {
+            let mut value = serde_json::json!({"type": "thinking", "thinking": text});
+            if let Some(signature) = signature {
+                value["signature"] = Value::String(signature.clone());
+            }
+            value
+        }
+        ContentPart::Image {
+            media_type,
+            data,
+            url,
+        } => {
+            if let Some(url) = url {
+                serde_json::json!({"type": "image", "source": {"type": "url", "url": url}})
+            } else {
+                serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+            }
+        }
+        ContentPart::Json(value) => value.clone(),
+    }
+}
+
+fn render_thinking_part(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Json(value) => value.clone(),
+        _ => render_content_part(part),
+    }
+}
+
+fn render_tool_use(id: Option<&str>, call: &crate::ir::ToolCall) -> Value {
+    let arguments = serde_json::from_str::<Value>(&call.arguments)
+        .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+    let mut value = serde_json::json!({
+        "type": "tool_use",
+        "id": call.id.as_deref().or(id).unwrap_or_default(),
+        "name": call.name,
+        "input": arguments,
+    });
+    if let Some(status) = &call.status {
+        value["status"] = Value::String(status.clone());
+    }
+    value
+}
+
+fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
+    let mut value = serde_json::json!({
+        "name": tool.name,
+        "input_schema": tool.input_schema.clone().unwrap_or_else(|| serde_json::json!({})),
+    });
+    if let Some(description) = &tool.description {
+        value["description"] = Value::String(description.clone());
+    }
+    value
+}
+
+fn render_tool_choice(choice: &Value) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("auto") => serde_json::json!({"type": "auto"}),
+        Some("none") => serde_json::json!({"type": "none"}),
+        Some("any") | Some("required") => serde_json::json!({"type": "any"}),
+        Some("tool") | Some("function") => choice
+            .get("name")
+            .map(|name| serde_json::json!({"type": "tool", "name": name}))
+            .unwrap_or_else(|| serde_json::json!({"type": "auto"})),
+        _ => choice.clone(),
+    }
+}
+
+fn normalize_role(role: &str) -> &str {
+    match role {
+        "assistant" => "assistant",
+        _ => "user",
+    }
+}
+
+fn text_part(part: &ContentPart) -> Option<String> {
+    match part {
+        ContentPart::Text(text) | ContentPart::Refusal(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn content_item_text(item: &ContentItem) -> Vec<String> {
+    match item {
+        ContentItem::Message { content, .. }
+        | ContentItem::Refusal { content, .. }
+        | ContentItem::Reasoning { content, .. } => content.iter().filter_map(text_part).collect(),
+        _ => Vec::new(),
+    }
+}

@@ -132,3 +132,28 @@ fn responses_v2_renderer_matches_legacy_fixture_shape() {
         assert_eq!(rendered["input"], legacy["input"], "{fixture_name}");
     }
 }
+
+#[test]
+fn messages_v2_renderer_preserves_identity_and_message_semantics() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::AnthropicMessages);
+    let source = fixture("anthropic_messages");
+    let legacy = adapter
+        .parse(&source)
+        .unwrap()
+        .render_with_report(Protocol::AnthropicMessages, &ModelCapabilities::default())
+        .unwrap()
+        .0;
+    let v2 = adapter.parse_v2(&source).unwrap();
+    let rendered = adapter
+        .render_v2(
+            &v2,
+            Protocol::AnthropicMessages,
+            &ModelCapabilities::default(),
+        )
+        .unwrap()
+        .body;
+
+    assert_eq!(rendered["model"], legacy["model"]);
+    assert_eq!(rendered["messages"], legacy["messages"]);
+    assert_eq!(rendered["metadata"], legacy["metadata"]);
+}

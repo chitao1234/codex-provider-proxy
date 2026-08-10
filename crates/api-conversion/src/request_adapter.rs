@@ -68,14 +68,20 @@ pub trait RequestAdapter {
         target: Protocol,
         capabilities: &ModelCapabilities,
     ) -> Result<RenderedRequest, ConversionError> {
-        if target != Protocol::OpenAiResponses {
-            return Err(ConversionError::unsupported(
-                "request.v2.target",
-                "only OpenAiResponses v2 rendering is migrated",
-            ));
-        }
-        let (body, report) =
-            crate::protocols::openai_responses::request::render(request, capabilities)?;
+        let (body, report) = match target {
+            Protocol::OpenAiResponses => {
+                crate::protocols::openai_responses::request::render(request, capabilities)?
+            }
+            Protocol::AnthropicMessages => {
+                crate::protocols::anthropic_messages::request::render(request, capabilities)?
+            }
+            Protocol::OpenAiChatCompletions => {
+                return Err(ConversionError::unsupported(
+                    "request.v2.target",
+                    "OpenAiChatCompletions v2 rendering is not migrated",
+                ))
+            }
+        };
         Ok(RenderedRequest { body, report })
     }
 }
