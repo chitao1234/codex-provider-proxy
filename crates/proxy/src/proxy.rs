@@ -539,10 +539,7 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::api_conversion::ChatConversionStream::<
-                    _,
-                    crate::api_conversion::MessagesStreamTarget,
-                >::new(resp_stream)) as BoxRespStream,
+                ) => Box::pin(crate::api_conversion::V2ChatConversionStream::<_, crate::api_conversion::MessagesV2StreamTarget>::messages(resp_stream)) as BoxRespStream,
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
@@ -564,10 +561,7 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::api_conversion::ChatConversionStream::<
-                    _,
-                    crate::api_conversion::ResponsesStreamTarget,
-                >::with_recorder(
+                ) => Box::pin(crate::api_conversion::V2ChatConversionStream::<_, crate::api_conversion::ResponsesV2StreamTarget>::responses(
                     resp_stream,
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,

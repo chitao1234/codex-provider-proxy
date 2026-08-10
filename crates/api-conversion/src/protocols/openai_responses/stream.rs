@@ -19,15 +19,18 @@ impl Renderer {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
     pub fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
         if self.finished {
             return;
         }
         match event {
             CanonicalResponseEvent::StreamStarted { response_id, model } => {
-                self.response_id.clone_from(response_id);
+                self.response_id = response_id.as_deref().map(synth_response_id);
                 self.model.clone_from(model);
-                let response = json!({"id": response_id, "object":"response", "model":model, "status":"in_progress", "output":[]});
+                let response = json!({"id": self.response_id, "object":"response", "model":model, "status":"in_progress", "output":[]});
                 self.emit(
                     "response.created",
                     json!({"type":"response.created","response":response}),
@@ -113,6 +116,13 @@ impl Renderer {
     pub fn finish(&mut self, _out: &mut Vec<Bytes>) {}
     fn emit(&self, kind: &str, data: serde_json::Value, out: &mut Vec<Bytes>) {
         out.push(sse::encode_sse_event(kind, &data));
+    }
+}
+fn synth_response_id(upstream_id: &str) -> String {
+    if upstream_id.starts_with("resp_") {
+        upstream_id.to_owned()
+    } else {
+        format!("resp_{upstream_id}")
     }
 }
 fn stop_reason_name(reason: &StopReason) -> &'static str {

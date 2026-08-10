@@ -9,8 +9,8 @@ use crate::{
     },
     error::ConversionError,
     ir::{
-        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ReplayPolicy, StopReason,
-        ToolCall, Usage,
+        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
+        StopReason, ToolCall, Usage,
     },
 };
 
@@ -30,6 +30,9 @@ pub struct Parser {
     tools: BTreeMap<usize, ToolState>,
     usage: Usage,
     pending_stop: Option<(StopReason, String)>,
+    message_started: bool,
+    reasoning_started: bool,
+    refusal_started: bool,
 }
 
 impl Default for Parser {
@@ -46,6 +49,9 @@ impl Parser {
             tools: BTreeMap::new(),
             usage: Usage::default(),
             pending_stop: None,
+            message_started: false,
+            reasoning_started: false,
+            refusal_started: false,
         }
     }
 
@@ -150,12 +156,26 @@ impl Parser {
 
     fn delta(&mut self, delta: &Map<String, Value>, out: &mut Vec<CanonicalResponseEvent>) {
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !self.message_started {
+                self.message_started = true;
+                out.push(CanonicalResponseEvent::ItemStarted {
+                    item_id: "message".into(),
+                    item: ItemKind::Message,
+                });
+            }
             out.push(CanonicalResponseEvent::ContentDelta {
                 item_id: "message".into(),
                 content: ContentPart::Text(text.into()),
             });
         }
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+            if !self.reasoning_started {
+                self.reasoning_started = true;
+                out.push(CanonicalResponseEvent::ItemStarted {
+                    item_id: "reasoning".into(),
+                    item: ItemKind::Reasoning,
+                });
+            }
             out.push(CanonicalResponseEvent::ContentDelta {
                 item_id: "reasoning".into(),
                 content: ContentPart::Reasoning {
@@ -165,6 +185,13 @@ impl Parser {
             });
         }
         if let Some(text) = delta.get("refusal").and_then(Value::as_str) {
+            if !self.refusal_started {
+                self.refusal_started = true;
+                out.push(CanonicalResponseEvent::ItemStarted {
+                    item_id: "refusal".into(),
+                    item: ItemKind::Refusal,
+                });
+            }
             out.push(CanonicalResponseEvent::ContentDelta {
                 item_id: "refusal".into(),
                 content: ContentPart::Refusal(text.into()),
