@@ -381,7 +381,16 @@ pub fn convert_non_streaming_body(
     let downstream = downstream_api_for_path(path).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown downstream path")
     })?;
-    convert_non_streaming_body_with_pipeline(body, response_pipeline(upstream_api, downstream))
+    let source = upstream_protocol(upstream_api).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "passthrough has no response protocol",
+        )
+    })?;
+    convert_non_streaming_body_with_pipeline(
+        body,
+        ResponsePipeline::new(source, downstream_protocol(downstream)),
+    )
 }
 
 #[cfg(test)]
@@ -457,20 +466,6 @@ fn convert_non_streaming_response(
         response_id,
         semantic_response: Some(semantic_response),
     })
-}
-
-#[cfg(test)]
-pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> ResponsePipeline {
-    ResponsePipeline {
-        source: match upstream {
-            UpstreamApi::AnthropicMessages => Protocol::AnthropicMessages,
-            UpstreamApi::OpenAiResponses => Protocol::OpenAiResponses,
-            UpstreamApi::OpenAiChatCompletions | UpstreamApi::Passthrough => {
-                Protocol::OpenAiChatCompletions
-            }
-        },
-        target: downstream_protocol(downstream),
-    }
 }
 
 // Adapt a non-streaming upstream Chat Completions body into the downstream dialect,

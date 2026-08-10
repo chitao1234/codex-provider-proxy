@@ -39,6 +39,12 @@ pub struct ResponsePipeline {
     pub target: Protocol,
 }
 
+impl ResponsePipeline {
+    pub const fn new(source: Protocol, target: Protocol) -> Self {
+        Self { source, target }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConversionPlan {
     pub downstream: DownstreamApi,

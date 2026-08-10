@@ -4842,9 +4842,9 @@ mod tests {
         let mut stream = crate::api_conversion::NonStreamingConversionStream::with_recorder(
             inner,
             1024 * 1024,
-            crate::api_conversion::response_pipeline(
-                codex_provider_proxy_api_conversion::dialect::UpstreamApi::OpenAiChatCompletions,
-                crate::api_conversion::DownstreamApi::AnthropicMessages,
+            codex_provider_proxy_api_conversion::plan::ResponsePipeline::new(
+                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions,
+                codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages,
             ),
             None,
         );
