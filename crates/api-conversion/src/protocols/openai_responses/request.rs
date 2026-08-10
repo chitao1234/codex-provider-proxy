@@ -40,7 +40,7 @@ pub fn render(
             request
                 .transcript
                 .iter()
-                .flat_map(render_input_item)
+                .flat_map(|item| render_input_item(item, capabilities))
                 .collect(),
         ),
     );
@@ -78,21 +78,30 @@ fn render_generation(
     output: &mut Map<String, Value>,
 ) {
     for (key, value) in [
-        ("reasoning", generation.reasoning.as_ref()),
-        ("text", generation.text.as_ref()),
-        ("stop", generation.stop.as_ref()),
+        ("temperature", generation.temperature.as_ref()),
+        ("top_p", generation.top_p.as_ref()),
     ] {
         if let Some(value) = value {
             output.insert(key.to_owned(), value.clone());
         }
     }
-    if let Some(parallel) = generation
-        .parallel_tool_calls
-        .as_ref()
-        .or(generation.parallel_tool_use.as_ref())
-        .and_then(Value::as_bool)
-    {
-        output.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
+    for (key, value) in [
+        ("reasoning", generation.reasoning.as_ref()),
+        ("text", generation.text.as_ref()),
+    ] {
+        if let Some(value) = value {
+            output.insert(key.to_owned(), value.clone());
+        }
+    }
+    if capabilities.parallel_tool_calls {
+        if let Some(parallel) = generation
+            .parallel_tool_calls
+            .as_ref()
+            .or(generation.parallel_tool_use.as_ref())
+            .and_then(Value::as_bool)
+        {
+            output.insert("parallel_tool_calls".to_owned(), Value::Bool(parallel));
+        }
     }
     if let Some(mut tokens) = generation.max_output_tokens.clone() {
         if let Some(cap) = capabilities.max_tokens_cap {
@@ -102,18 +111,60 @@ fn render_generation(
         }
         output.insert("max_output_tokens".to_owned(), tokens);
     }
-    if let Some(effort) = &generation.reasoning_effort {
-        output.insert(
-            "reasoning".to_owned(),
-            serde_json::json!({"effort": effort}),
-        );
+    if let Some(thinking) = generation.thinking.as_ref() {
+        let thinking_type = generation.thinking_type();
+        match capabilities.thinking_param {
+            crate::dialect::ThinkingParam::TopLevel | crate::dialect::ThinkingParam::Adaptive => {
+                let enabled_type =
+                    if capabilities.thinking_param == crate::dialect::ThinkingParam::Adaptive {
+                        "adaptive"
+                    } else {
+                        "enabled"
+                    };
+                let mut thinking = thinking.as_object().cloned().unwrap_or_default();
+                thinking.insert(
+                    "type".to_owned(),
+                    Value::String(
+                        if thinking_type == Some("disabled") {
+                            "disabled"
+                        } else {
+                            enabled_type
+                        }
+                        .to_owned(),
+                    ),
+                );
+                output.insert("thinking".to_owned(), Value::Object(thinking));
+            }
+            crate::dialect::ThinkingParam::EnableThinking => {
+                if thinking_type == Some("disabled")
+                    && generation
+                        .output_config
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .is_none_or(|config| !config.contains_key("effort"))
+                {
+                    insert_object_field(
+                        output,
+                        "reasoning",
+                        "effort",
+                        Value::String("none".into()),
+                    );
+                }
+            }
+            crate::dialect::ThinkingParam::None => {}
+        }
+    }
+    if let Some(effort) = generation.reasoning_effort.as_ref().or_else(|| {
+        generation
+            .reasoning
+            .as_ref()
+            .and_then(|value| value.get("effort"))
+    }) {
+        insert_object_field(output, "reasoning", "effort", effort.clone());
     }
     if let Some(config) = &generation.output_config {
         if let Some(effort) = config.get("effort") {
-            output.insert(
-                "reasoning".to_owned(),
-                serde_json::json!({"effort": effort}),
-            );
+            insert_object_field(output, "reasoning", "effort", effort.clone());
         }
         if let Some(format) = config.get("format") {
             output
@@ -123,6 +174,36 @@ fn render_generation(
                 text.insert("format".to_owned(), format.clone());
             }
         }
+    }
+    if capabilities.accept_stop {
+        let stop = generation.stop_values();
+        if !stop.is_empty() {
+            output.insert(
+                "stop".to_owned(),
+                if stop.len() == 1 {
+                    stop[0].clone()
+                } else {
+                    Value::Array(stop)
+                },
+            );
+        }
+    }
+}
+
+fn insert_object_field(
+    output: &mut Map<String, Value>,
+    object_key: &str,
+    field: &str,
+    value: Value,
+) {
+    let object = output
+        .entry(object_key.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !object.is_object() {
+        *object = Value::Object(Map::new());
+    }
+    if let Some(object) = object.as_object_mut() {
+        object.insert(field.to_owned(), value);
     }
 }
 
@@ -134,11 +215,11 @@ fn render_instructions(instructions: &[ContentItem]) -> String {
         .join("\n\n")
 }
 
-fn render_input_item(item: &ContentItem) -> Vec<Value> {
+fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Vec<Value> {
     match item {
         ContentItem::Message { role, content, .. } => vec![serde_json::json!({
             "type": "message",
-            "role": role,
+            "role": if role == "developer" && !capabilities.accept_developer_role { "system" } else { role },
             "content": content.iter().map(render_input_part).collect::<Vec<_>>(),
         })],
         ContentItem::Reasoning { id, content, .. } => {

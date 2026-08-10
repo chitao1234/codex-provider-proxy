@@ -1,7 +1,10 @@
 use serde_json::{Map, Value};
 
 use crate::{
-    dialect::{ModelCapabilities, RequestConversionReport},
+    dialect::{
+        MaxTokensField, ModelCapabilities, RequestConversionReport, ResponseFormatCap,
+        ThinkingParam,
+    },
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr, ToolCall},
 };
@@ -34,7 +37,12 @@ pub fn render(
         false,
         &mut output,
     );
-    render_generation(&request.generation, capabilities, &mut output);
+    render_generation(
+        &request.generation,
+        request.stream,
+        capabilities,
+        &mut output,
+    )?;
 
     let mut messages = Vec::new();
     for instruction in &request.instructions {
@@ -56,6 +64,11 @@ pub fn render(
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     if !text.is_empty() {
+                        let role = if role == "developer" && !capabilities.accept_developer_role {
+                            "system"
+                        } else {
+                            role
+                        };
                         messages.push(serde_json::json!({"role": role, "content": [{"type": "text", "text": text}]}));
                     }
                     continue;
@@ -137,9 +150,18 @@ pub fn render(
 
 fn render_generation(
     generation: &GenerationControls,
+    stream: Option<bool>,
     capabilities: &ModelCapabilities,
     output: &mut Map<String, Value>,
-) {
+) -> Result<(), ConversionError> {
+    for (key, value) in [
+        ("temperature", generation.temperature.as_ref()),
+        ("top_p", generation.top_p.as_ref()),
+    ] {
+        if let Some(value) = value {
+            output.insert(key.to_owned(), value.clone());
+        }
+    }
     if let Some(tokens) = &generation.max_output_tokens {
         let value = tokens.as_u64().map_or(tokens.clone(), |tokens| {
             Value::from(
@@ -148,39 +170,75 @@ fn render_generation(
                     .map_or(tokens, |cap| tokens.min(cap)),
             )
         });
-        output.insert("max_tokens".to_owned(), value);
+        let field = match capabilities.max_tokens_field {
+            MaxTokensField::MaxTokens => "max_tokens",
+            MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+        };
+        output.insert(field.to_owned(), value);
     }
-    if let Some(stop) = generation
-        .stop_sequences
-        .as_ref()
-        .or(generation.stop.as_ref())
-    {
-        output.insert("stop".to_owned(), stop.clone());
-    }
-    if let Some(reasoning) = &generation.reasoning_effort {
-        output.insert("reasoning_effort".to_owned(), reasoning.clone());
-    }
-    if let Some(thinking) = &generation.thinking {
-        let thinking_type = thinking.get("type").and_then(Value::as_str);
-        if matches!(
-            capabilities.thinking_param,
-            crate::dialect::ThinkingParam::TopLevel | crate::dialect::ThinkingParam::Adaptive
-        ) {
+    if capabilities.accept_stop {
+        let stop = generation.stop_values();
+        if !stop.is_empty() {
             output.insert(
-                "thinking".to_owned(),
-                serde_json::json!({
-                    "type": if thinking_type == Some("disabled") { "disabled" } else { "enabled" }
-                }),
+                "stop".to_owned(),
+                if stop.len() == 1 {
+                    stop[0].clone()
+                } else {
+                    Value::Array(stop)
+                },
             );
         }
     }
-    if let Some(config) = &generation.output_config {
-        if let Some(effort) = config.get("effort") {
-            output.insert("reasoning_effort".to_owned(), effort.clone());
+    if stream == Some(true) && capabilities.stream_include_usage {
+        output.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({"include_usage": true}),
+        );
+    }
+    if let Some(split) = capabilities.reasoning_split {
+        output.insert("reasoning_split".to_owned(), Value::Bool(split));
+    }
+    let effort = generation.effort();
+    let thinking_type = generation.thinking_type();
+    match capabilities.thinking_param {
+        ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
+            if generation.thinking.is_some() || effort.is_some() {
+                let enabled = thinking_type != Some("disabled")
+                    && effort.is_none_or(|effort| effort != "none" && effort != "minimal");
+                let enabled_type = if capabilities.thinking_param == ThinkingParam::Adaptive {
+                    "adaptive"
+                } else {
+                    "enabled"
+                };
+                output.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({"type": if enabled { enabled_type } else { "disabled" }}),
+                );
+            }
         }
-        if let Some(format) = config.get("format") {
-            output.insert("response_format".to_owned(), format.clone());
+        ThinkingParam::EnableThinking => {
+            if generation.thinking.is_some() || effort.is_some() {
+                let enabled = thinking_type != Some("disabled")
+                    && effort.is_none_or(|effort| effort != "none" && effort != "minimal");
+                output.insert("enable_thinking".to_owned(), Value::Bool(enabled));
+            }
         }
+        ThinkingParam::None => {}
+    }
+    if let Some(config) = capabilities
+        .reasoning_effort
+        .as_ref()
+        .filter(|config| config.enabled)
+    {
+        if let Some(level) = effort
+            .or(config.default.as_deref())
+            .and_then(|effort| capabilities.clamp_effort(effort))
+        {
+            output.insert("reasoning_effort".to_owned(), Value::String(level));
+        }
+    }
+    if let Some(format) = generation.output_format() {
+        render_response_format(format, capabilities, output)?;
     }
     if capabilities.parallel_tool_calls {
         if let Some(parallel) = generation
@@ -190,6 +248,62 @@ fn render_generation(
         {
             output.insert("parallel_tool_calls".to_owned(), parallel.clone());
         }
+    }
+    Ok(())
+}
+
+fn render_response_format(
+    format: &Value,
+    capabilities: &ModelCapabilities,
+    output: &mut Map<String, Value>,
+) -> Result<(), ConversionError> {
+    match format.get("type").and_then(Value::as_str).unwrap_or("text") {
+        "text" => Ok(()),
+        "json_object" => {
+            if capabilities.response_format == ResponseFormatCap::Text {
+                return Err(ConversionError::unsupported(
+                    "output_config.format",
+                    "upstream does not support structured output formats",
+                ));
+            }
+            output.insert(
+                "response_format".to_owned(),
+                serde_json::json!({"type": "json_object"}),
+            );
+            Ok(())
+        }
+        "json_schema" => match capabilities.response_format {
+            ResponseFormatCap::JsonSchema => {
+                output.insert(
+                    "response_format".to_owned(),
+                    serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": format.get("name").and_then(Value::as_str).unwrap_or("output"),
+                            "description": format.get("description"),
+                            "schema": format.get("schema").cloned().unwrap_or_else(|| serde_json::json!({})),
+                            "strict": format.get("strict").cloned().unwrap_or(Value::Bool(false)),
+                        }
+                    }),
+                );
+                Ok(())
+            }
+            ResponseFormatCap::JsonObject => {
+                output.insert(
+                    "response_format".to_owned(),
+                    serde_json::json!({"type": "json_object"}),
+                );
+                Ok(())
+            }
+            ResponseFormatCap::Text => Err(ConversionError::unsupported(
+                "output_config.format",
+                "upstream does not support structured output formats",
+            )),
+        },
+        _ => Err(ConversionError::unsupported(
+            "output_config.format",
+            "unsupported structured output format",
+        )),
     }
 }
 

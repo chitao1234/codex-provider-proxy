@@ -20,6 +20,58 @@ pub struct GenerationControls {
     pub parallel_tool_calls: Option<Value>,
 }
 
+impl GenerationControls {
+    pub(crate) fn effort(&self) -> Option<&str> {
+        self.output_config
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("effort"))
+            .or_else(|| {
+                self.reasoning
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|reasoning| reasoning.get("effort"))
+            })
+            .or(self.reasoning_effort.as_ref())
+            .and_then(Value::as_str)
+    }
+
+    pub(crate) fn thinking_type(&self) -> Option<&str> {
+        self.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+    }
+
+    pub(crate) fn output_format(&self) -> Option<&Value> {
+        self.output_config
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("format"))
+            .or_else(|| {
+                self.text
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|text| text.get("format"))
+            })
+    }
+
+    pub(crate) fn stop_values(&self) -> Vec<Value> {
+        let Some(stop) = self.stop_sequences.as_ref().or(self.stop.as_ref()) else {
+            return Vec::new();
+        };
+        match stop {
+            Value::String(value) if !value.is_empty() => vec![Value::String(value.clone())],
+            Value::Array(values) => values
+                .iter()
+                .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestIr {
     pub model: Option<String>,

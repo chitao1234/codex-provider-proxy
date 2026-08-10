@@ -1,7 +1,9 @@
 use std::fs;
 
 use codex_provider_proxy_api_conversion::{
-    dialect::ModelCapabilities,
+    dialect::{
+        MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap, ThinkingParam,
+    },
     request_adapter::{RequestAdapter, RequestAdapterKind},
     request_ir::Protocol,
 };
@@ -257,4 +259,144 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     assert!(disabled.get("prompt_cache_options").is_none());
     assert!(disabled.get("prompt_cache_retention").is_none());
     assert!(disabled.get("cache_control").is_none());
+}
+
+#[test]
+fn chat_v2_renderer_applies_generation_capabilities() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "input": "hello",
+            "max_output_tokens": 500,
+            "temperature": 0.4,
+            "top_p": 0.8,
+            "reasoning": {"effort": "xhigh"},
+            "text": {"format": {"type": "json_schema", "name": "answer", "schema": {"type": "object"}, "strict": true}},
+            "stop": ["END", ""],
+            "parallel_tool_calls": false
+        }))
+        .unwrap();
+    let capabilities = ModelCapabilities {
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        max_tokens_cap: Some(200),
+        thinking_param: ThinkingParam::Adaptive,
+        reasoning_effort: Some(ReasoningEffortConfig {
+            enabled: true,
+            levels: vec!["low".to_owned(), "high".to_owned()],
+            default: None,
+        }),
+        response_format: ResponseFormatCap::JsonSchema,
+        reasoning_split: Some(true),
+        ..ModelCapabilities::default()
+    };
+    let rendered = adapter
+        .render_v2(&request, Protocol::OpenAiChatCompletions, &capabilities)
+        .unwrap()
+        .body;
+
+    assert_eq!(rendered["max_completion_tokens"], 200);
+    assert!(rendered.get("max_tokens").is_none());
+    assert_eq!(rendered["temperature"], 0.4);
+    assert_eq!(rendered["top_p"], 0.8);
+    assert_eq!(rendered["thinking"]["type"], "adaptive");
+    assert_eq!(rendered["reasoning_effort"], "high");
+    assert_eq!(rendered["reasoning_split"], true);
+    assert_eq!(rendered["stop"], "END");
+    assert_eq!(rendered["stream_options"]["include_usage"], true);
+    assert_eq!(rendered["parallel_tool_calls"], false);
+    assert_eq!(rendered["response_format"]["type"], "json_schema");
+    assert_eq!(rendered["response_format"]["json_schema"]["name"], "answer");
+    assert_eq!(
+        rendered["response_format"]["json_schema"]["schema"]["type"],
+        "object"
+    );
+
+    let rejecting = ModelCapabilities {
+        accept_stop: false,
+        response_format: ResponseFormatCap::Text,
+        ..capabilities
+    };
+    assert!(adapter
+        .render_v2(&request, Protocol::OpenAiChatCompletions, &rejecting,)
+        .is_err());
+}
+
+#[test]
+fn messages_v2_renderer_maps_generation_controls_by_dialect() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "input": "hello",
+            "temperature": 0.3,
+            "top_p": 0.7,
+            "reasoning": {"effort": "high"},
+            "stop": ["END", ""],
+            "max_output_tokens": 400
+        }))
+        .unwrap();
+    let capabilities = ModelCapabilities {
+        thinking_param: ThinkingParam::Adaptive,
+        max_tokens_cap: Some(300),
+        ..ModelCapabilities::default()
+    };
+    let rendered = adapter
+        .render_v2(&request, Protocol::AnthropicMessages, &capabilities)
+        .unwrap()
+        .body;
+
+    assert_eq!(rendered["max_tokens"], 300);
+    assert_eq!(rendered["temperature"], 0.3);
+    assert_eq!(rendered["top_p"], 0.7);
+    assert_eq!(rendered["thinking"]["type"], "adaptive");
+    assert_eq!(rendered["stop_sequences"], serde_json::json!(["END"]));
+    assert!(rendered.get("reasoning").is_none());
+
+    let no_stop = ModelCapabilities {
+        accept_stop: false,
+        ..capabilities
+    };
+    let rendered = adapter
+        .render_v2(&request, Protocol::AnthropicMessages, &no_stop)
+        .unwrap()
+        .body;
+    assert!(rendered.get("stop_sequences").is_none());
+}
+
+#[test]
+fn responses_v2_renderer_preserves_reasoning_extensions_and_role_policy() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "policy"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ],
+            "reasoning": {"effort": "high", "provider_mode": "deep"},
+            "text": {"verbosity": "low", "format": {"type": "json_object"}},
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "stop": "END"
+        }))
+        .unwrap();
+    let capabilities = ModelCapabilities {
+        accept_developer_role: false,
+        ..ModelCapabilities::default()
+    };
+    let rendered = adapter
+        .render_v2(&request, Protocol::OpenAiResponses, &capabilities)
+        .unwrap()
+        .body;
+
+    assert_eq!(rendered["input"][0]["role"], "system");
+    assert_eq!(rendered["reasoning"]["effort"], "high");
+    assert_eq!(rendered["reasoning"]["provider_mode"], "deep");
+    assert_eq!(rendered["text"]["verbosity"], "low");
+    assert_eq!(rendered["text"]["format"]["type"], "json_object");
+    assert_eq!(rendered["temperature"], 0.2);
+    assert_eq!(rendered["top_p"], 0.9);
+    assert_eq!(rendered["stop"], "END");
 }

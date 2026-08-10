@@ -106,6 +106,14 @@ fn render_generation(
     capabilities: &ModelCapabilities,
     output: &mut Map<String, Value>,
 ) {
+    for (key, value) in [
+        ("temperature", generation.temperature.as_ref()),
+        ("top_p", generation.top_p.as_ref()),
+    ] {
+        if let Some(value) = value {
+            output.insert(key.to_owned(), value.clone());
+        }
+    }
     if let Some(tokens) = generation.max_output_tokens.as_ref() {
         let value = tokens.as_u64().map_or(tokens.clone(), |tokens| {
             Value::from(
@@ -128,50 +136,42 @@ fn render_generation(
     if let Some(config) = &generation.output_config {
         output.insert("output_config".to_owned(), config.clone());
     }
-    let effort = generation.reasoning_effort.as_ref().or_else(|| {
-        generation
-            .reasoning
-            .as_ref()
-            .and_then(|value| value.get("effort"))
-    });
-    let thinking_type = generation
-        .thinking
-        .as_ref()
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str);
+    let effort = generation.effort();
+    let thinking_type = generation.thinking_type();
     match capabilities.thinking_param {
         ThinkingParam::TopLevel | ThinkingParam::Adaptive => {
             if generation.thinking.is_some() || effort.is_some() {
                 let enabled = thinking_type != Some("disabled")
-                    && effort
-                        .and_then(Value::as_str)
-                        .is_none_or(|value| value != "none" && value != "minimal");
-                output.insert(
-                    "thinking".to_owned(),
-                    serde_json::json!({"type": if enabled { "enabled" } else { "disabled" }}),
+                    && effort.is_none_or(|value| value != "none" && value != "minimal");
+                let enabled_type = if capabilities.thinking_param == ThinkingParam::Adaptive {
+                    "adaptive"
+                } else {
+                    "enabled"
+                };
+                let mut thinking = generation
+                    .thinking
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                thinking.insert(
+                    "type".to_owned(),
+                    Value::String(if enabled { enabled_type } else { "disabled" }.to_owned()),
                 );
+                output.insert("thinking".to_owned(), Value::Object(thinking));
             }
         }
         ThinkingParam::EnableThinking => {
             if generation.thinking.is_some() || effort.is_some() {
-                output.insert(
-                    "enable_thinking".to_owned(),
-                    Value::Bool(thinking_type != Some("disabled")),
-                );
+                let enabled = thinking_type != Some("disabled")
+                    && effort.is_none_or(|value| value != "none" && value != "minimal");
+                output.insert("enable_thinking".to_owned(), Value::Bool(enabled));
             }
         }
         ThinkingParam::None => {}
     }
-    if let Some(stop) = generation
-        .stop_sequences
-        .as_ref()
-        .or(generation.stop.as_ref())
-    {
-        let values = match stop {
-            Value::String(value) if !value.is_empty() => vec![Value::String(value.clone())],
-            Value::Array(values) => values.clone(),
-            _ => Vec::new(),
-        };
+    if capabilities.accept_stop {
+        let values = generation.stop_values();
         if !values.is_empty() {
             output.insert("stop_sequences".to_owned(), Value::Array(values));
         }
