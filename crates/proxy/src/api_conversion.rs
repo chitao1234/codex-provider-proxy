@@ -391,7 +391,7 @@ impl ResponseRecorder {
         request.append_response(response);
         let last_reasoning = response.output.iter().rev().find_map(|item| match item {
             codex_provider_proxy_api_conversion::ir::ContentItem::Reasoning { content, .. } => {
-                content.iter().rev().find_map(|part| match part {
+                content.iter().rev().find_map(|part| match part.semantic() {
                     codex_provider_proxy_api_conversion::ir::ContentPart::Reasoning {
                         text,
                         ..

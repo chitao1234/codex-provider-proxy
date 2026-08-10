@@ -75,10 +75,11 @@ fn render_item(item: &ContentItem) -> Vec<Value> {
             .collect(),
         ContentItem::Reasoning { content, .. } => content
             .iter()
-            .filter_map(|part| match part {
-                ContentPart::Reasoning { text, signature } => {
-                    Some(json!({"type":"thinking","thinking":text,"signature":signature}))
-                }
+            .filter_map(|part| match part.semantic() {
+                ContentPart::Reasoning { text, signature } => Some(replay_content_part_extensions(
+                    json!({"type":"thinking","thinking":text,"signature":signature}),
+                    part,
+                )),
                 _ => None,
             })
             .map(|mut block| {
@@ -98,6 +99,7 @@ fn render_item(item: &ContentItem) -> Vec<Value> {
                 replay_map(object, &call.metadata);
                 replay_map(object, &call.function_metadata);
                 replay_scoped(object, &call.extensions, ExtensionScope::ToolCall);
+                replay_scoped(object, &call.extensions, ExtensionScope::ToolFunction);
             }
             vec![block]
         }
@@ -192,10 +194,18 @@ fn replay_map(
 }
 
 fn render_content(part: &ContentPart) -> Option<Value> {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Text(text) => Some(json!({"type":"text","text":text})),
         ContentPart::Refusal(text) => Some(json!({"type":"text","text":text})),
         ContentPart::Json(value) => Some(value.clone()),
         _ => None,
+    }?;
+    Some(replay_content_part_extensions(rendered, part))
+}
+
+fn replay_content_part_extensions(mut rendered: Value, part: &ContentPart) -> Value {
+    if let Some(object) = rendered.as_object_mut() {
+        replay_scoped(object, part.extensions(), ExtensionScope::ContentPart);
     }
+    rendered
 }

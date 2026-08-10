@@ -99,7 +99,7 @@ impl RequestIr {
             (role == "user").then(|| {
                 content
                     .iter()
-                    .filter_map(|part| match part {
+                    .filter_map(|part| match part.semantic() {
                         super::ContentPart::Text(text) => Some(text.as_str()),
                         _ => None,
                     })

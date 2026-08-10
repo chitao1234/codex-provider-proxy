@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     dialect::{ModelCapabilities, RequestConversionReport, ServerToolPolicy},
-    ir::ToolDefinition,
+    ir::{ExtensionScope, ToolDefinition},
 };
 
 const SERVER_TOOL_TYPE_PREFIXES: &[&str] = &[
@@ -186,7 +186,34 @@ fn merge_params(
 }
 
 fn opaque_value(tool: &ToolDefinition) -> Value {
-    Value::Object(tool.metadata.clone().into_iter().collect())
+    let mut object = Map::new();
+    if !tool.kind.is_empty() {
+        object.insert("type".to_owned(), Value::String(tool.kind.clone()));
+    }
+    if tool.name != "tool" {
+        object.insert("name".to_owned(), Value::String(tool.name.clone()));
+    }
+    if let Some(description) = &tool.description {
+        object.insert("description".to_owned(), Value::String(description.clone()));
+    }
+    if let Some(input_schema) = &tool.input_schema {
+        object.insert("input_schema".to_owned(), input_schema.clone());
+    }
+    for (key, value) in tool.metadata.iter().chain(&tool.function_metadata) {
+        object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    for extension in &tool.extensions {
+        if matches!(
+            extension.scope,
+            ExtensionScope::ToolDefinition | ExtensionScope::ToolFunction
+        ) && extension.is_replayable_as_opaque()
+        {
+            object
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
+    }
+    Value::Object(object)
 }
 
 fn is_server_tool(tool: &ToolDefinition) -> bool {
@@ -197,7 +224,13 @@ fn is_server_tool(tool: &ToolDefinition) -> bool {
 }
 
 fn is_freeform_tool(tool: &ToolDefinition) -> bool {
-    tool.kind == "custom" && tool.input_schema.is_none() && tool.metadata.contains_key("format")
+    tool.kind == "custom"
+        && tool.input_schema.is_none()
+        && (tool.metadata.contains_key("format")
+            || tool
+                .extensions
+                .iter()
+                .any(|extension| extension.key == "format"))
 }
 
 fn short_name(tool: &ToolDefinition) -> Option<&str> {

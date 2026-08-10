@@ -399,7 +399,7 @@ impl Renderer {
                 let Some(index) = self.items.get(item_id).map(|item| item.index) else {
                     return;
                 };
-                match content {
+                match content.semantic() {
                     ContentPart::Text(delta) => self.emit(
                         "response.output_text.delta",
                         json!({"type":"response.output_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":delta}),
@@ -416,6 +416,9 @@ impl Renderer {
                         out,
                     ),
                     ContentPart::Image { .. } | ContentPart::Json(_) => {}
+                    ContentPart::Extended { .. } => {
+                        unreachable!("semantic content is never extended")
+                    }
                 }
             }
             CanonicalResponseEvent::ToolCallStarted { item_id, .. } => {

@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{
     error::ConversionError,
-    ir::{ContentItem, ContentPart, RequestIr},
+    ir::{ContentItem, ContentPart, ExtensionScope, RequestIr},
     protocols::request_support::{self, object, parse_parts, parse_tool_call, parse_tool_result},
 };
 
@@ -15,7 +15,7 @@ pub fn parse(body: &Value) -> Result<RequestIr, ConversionError> {
             vec![ContentItem::Message {
                 id: None,
                 role: "system".to_owned(),
-                content: parse_parts(value),
+                content: parse_parts(value, "openai_responses"),
                 extensions: Vec::new(),
             }]
         })
@@ -60,13 +60,26 @@ fn parse_item(value: &Value) -> Vec<ContentItem> {
                 .and_then(Value::as_str)
                 .unwrap_or("user")
                 .to_owned(),
-            content: parse_parts(object.get("content").unwrap_or(&Value::Null)),
-            extensions: Vec::new(),
+            content: parse_parts(
+                object.get("content").unwrap_or(&Value::Null),
+                "openai_responses",
+            ),
+            extensions: request_support::object_extensions(
+                object,
+                &["type", "id", "role", "content", "status"],
+                ExtensionScope::Message,
+                "openai_responses",
+            ),
         }],
         Some("reasoning") => vec![ContentItem::Reasoning {
             id: object.get("id").and_then(Value::as_str).map(str::to_owned),
             content: vec![ContentPart::Json(value.clone())],
-            extensions: Vec::new(),
+            extensions: request_support::object_extensions(
+                object,
+                &["type", "id", "summary", "content", "status"],
+                ExtensionScope::ContentItem,
+                "openai_responses",
+            ),
         }],
         Some("function_call" | "custom_tool_call") => vec![ContentItem::ToolUse {
             id: object
@@ -74,15 +87,20 @@ fn parse_item(value: &Value) -> Vec<ContentItem> {
                 .or_else(|| object.get("call_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            call: parse_tool_call(object),
+            call: parse_tool_call(object, "openai_responses"),
         }],
         Some("function_call_output") => vec![ContentItem::ToolResult {
-            result: parse_tool_result(object),
+            result: parse_tool_result(object, "openai_responses"),
         }],
         Some("refusal") => vec![ContentItem::Refusal {
             id: object.get("id").and_then(Value::as_str).map(str::to_owned),
-            content: parse_parts(object.get("content").unwrap_or(value)),
-            extensions: Vec::new(),
+            content: parse_parts(object.get("content").unwrap_or(value), "openai_responses"),
+            extensions: request_support::object_extensions(
+                object,
+                &["type", "id", "role", "content", "status"],
+                ExtensionScope::ContentItem,
+                "openai_responses",
+            ),
         }],
         _ => vec![ContentItem::Unknown {
             id: object.get("id").and_then(Value::as_str).map(str::to_owned),

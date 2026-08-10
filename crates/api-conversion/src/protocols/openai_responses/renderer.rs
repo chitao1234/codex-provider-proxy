@@ -80,7 +80,7 @@ pub(crate) fn render_item(index: usize, item: &ContentItem) -> Value {
             json!({"id": id.clone().unwrap_or_else(|| format!("msg_{index}")), "type": "message", "status": "completed", "role": role, "content": content.iter().filter_map(render_content).collect::<Vec<_>>() })
         }
         ContentItem::Reasoning { id, content, .. } => {
-            json!({"id": id.clone().unwrap_or_else(|| format!("rs_{index}")), "type": "reasoning", "status": "completed", "summary": content.iter().filter_map(|part| match part { ContentPart::Reasoning { text, .. } => Some(json!({"type":"summary_text","text":text})), ContentPart::Text(text) => Some(json!({"type":"summary_text","text":text})), _ => None }).collect::<Vec<_>>() })
+            json!({"id": id.clone().unwrap_or_else(|| format!("rs_{index}")), "type": "reasoning", "status": "completed", "summary": content.iter().filter_map(render_summary_content).collect::<Vec<_>>() })
         }
         ContentItem::Refusal { id, content, .. } => {
             json!({"id": id.clone().unwrap_or_else(|| format!("msg_{index}")), "type": "message", "status": "completed", "role": "assistant", "content": content.iter().filter_map(render_content).collect::<Vec<_>>() })
@@ -131,6 +131,7 @@ fn replay_item_extensions(output: &mut Map<String, Value>, item: &ContentItem) {
             replay_map(output, &call.metadata);
             replay_map(output, &call.function_metadata);
             replay_scoped(output, &call.extensions, ExtensionScope::ToolCall);
+            replay_scoped(output, &call.extensions, ExtensionScope::ToolFunction);
         }
         ContentItem::ToolResult { result } => {
             replay_scoped(output, &result.extensions, ExtensionScope::ContentItem)
@@ -158,17 +159,36 @@ fn replay_map(
 }
 
 fn render_content(part: &ContentPart) -> Option<Value> {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Text(text) => Some(json!({"type":"output_text","text":text,"annotations":[]})),
         ContentPart::Refusal(text) => Some(json!({"type":"refusal","refusal":text})),
         ContentPart::Json(value) => Some(value.clone()),
         _ => None,
-    }
+    }?;
+    Some(replay_content_part_extensions(rendered, part))
 }
 fn render_part_value(part: &ContentPart) -> Option<Value> {
-    match part {
+    match part.semantic() {
         ContentPart::Text(text) | ContentPart::Refusal(text) => Some(Value::String(text.clone())),
         ContentPart::Json(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn render_summary_content(part: &ContentPart) -> Option<Value> {
+    let rendered = match part.semantic() {
+        ContentPart::Reasoning { text, .. } | ContentPart::Text(text) => {
+            json!({"type":"summary_text","text":text})
+        }
+        ContentPart::Json(value) => value.clone(),
+        _ => return None,
+    };
+    Some(replay_content_part_extensions(rendered, part))
+}
+
+fn replay_content_part_extensions(mut rendered: Value, part: &ContentPart) -> Value {
+    if let Some(object) = rendered.as_object_mut() {
+        replay_scoped(object, part.extensions(), ExtensionScope::ContentPart);
+    }
+    rendered
 }

@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{
     error::ConversionError,
-    ir::{ContentItem, ContentPart, RequestIr},
+    ir::{ContentItem, ContentPart, ExtensionScope, RequestIr},
     protocols::request_support::{self, object, parse_parts, parse_tool_call},
 };
 
@@ -28,19 +28,58 @@ fn parse_message(value: &Value) -> Vec<ContentItem> {
         .and_then(Value::as_str)
         .unwrap_or("user")
         .to_owned();
-    let mut items = vec![ContentItem::Message {
-        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
-        role,
-        content: parse_parts(object.get("content").unwrap_or(&Value::Null)),
-        extensions: Vec::new(),
-    }];
+    if role == "tool" {
+        return vec![ContentItem::ToolResult {
+            result: request_support::parse_tool_result(object, "openai_chat_completions"),
+        }];
+    }
+    let content = match object.get("content") {
+        Some(Value::Null) | None => Vec::new(),
+        Some(value) => parse_parts(value, "openai_chat_completions"),
+    };
+    let extensions = request_support::object_extensions(
+        object,
+        &[
+            "id",
+            "role",
+            "content",
+            "tool_calls",
+            "reasoning_content",
+            "refusal",
+        ],
+        ExtensionScope::Message,
+        "openai_chat_completions",
+    );
+    let has_tool_calls = object
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    let mut items = Vec::new();
+    if !content.is_empty() || !extensions.is_empty() || !has_tool_calls {
+        items.push(ContentItem::Message {
+            id: object.get("id").and_then(Value::as_str).map(str::to_owned),
+            role,
+            content,
+            extensions,
+        });
+    }
     if let Some(tool_calls) = object.get("tool_calls").and_then(Value::as_array) {
         items.extend(tool_calls.iter().filter_map(|tool| {
             let object = tool.as_object()?;
             let function = object.get("function").and_then(Value::as_object)?;
+            let mut call = parse_tool_call(function, "openai_chat_completions");
+            for extension in &mut call.extensions {
+                extension.scope = ExtensionScope::ToolFunction;
+            }
+            call.extensions.extend(request_support::object_extensions(
+                object,
+                &["id", "type", "function"],
+                ExtensionScope::ToolCall,
+                "openai_chat_completions",
+            ));
             Some(ContentItem::ToolUse {
                 id: object.get("id").and_then(Value::as_str).map(str::to_owned),
-                call: parse_tool_call(function),
+                call,
             })
         }));
     }

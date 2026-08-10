@@ -588,18 +588,19 @@ fn opaque_block(item_id: &str, kind: &str, payload: &Value) -> Value {
 }
 
 fn content_block(content: &ContentPart) -> Value {
-    match content {
+    match content.semantic() {
         ContentPart::Reasoning { .. } => {
             json!({"type":"thinking","thinking":"","signature":null})
         }
         ContentPart::Text(_) | ContentPart::Refusal(_) => json!({"type":"text","text":""}),
         ContentPart::Json(value) => value.clone(),
         ContentPart::Image { .. } => json!({"type":"unknown"}),
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     }
 }
 
 fn content_delta(content: &ContentPart) -> Option<Value> {
-    match content {
+    match content.semantic() {
         ContentPart::Reasoning { text, signature } if text.is_empty() => signature
             .as_ref()
             .map(|signature| json!({"type":"signature_delta","signature":signature})),
@@ -610,6 +611,7 @@ fn content_delta(content: &ContentPart) -> Option<Value> {
             Some(json!({"type":"text_delta","text":text}))
         }
         ContentPart::Json(_) | ContentPart::Image { .. } => None,
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     }
 }
 

@@ -4,6 +4,7 @@ use crate::{
     dialect::{ModelCapabilities, RequestConversionReport},
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr, ToolCall},
+    protocols::request_support,
     provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
@@ -225,14 +226,14 @@ fn render_instructions(instructions: &[ContentItem]) -> String {
 }
 
 fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Vec<Value> {
-    match item {
+    let rendered = match item {
         ContentItem::Message { role, content, .. } => vec![serde_json::json!({
             "type": "message",
             "role": if role == "developer" && !capabilities.accept_developer_role { "system" } else { role },
             "content": content.iter().map(render_input_part).collect::<Vec<_>>(),
         })],
         ContentItem::Reasoning { id, content, .. } => {
-            if let Some(raw) = content.iter().find_map(|part| match part {
+            if let Some(raw) = content.iter().find_map(|part| match part.semantic() {
                 ContentPart::Json(value) if value.get("type").is_some() => Some(value.clone()),
                 _ => None,
             }) {
@@ -268,11 +269,15 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
         ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
             vec![payload.clone()]
         }
-    }
+    };
+    rendered
+        .into_iter()
+        .map(|value| request_support::replay_item_extensions(value, item))
+        .collect()
 }
 
 fn render_input_part(part: &ContentPart) -> Value {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "input_text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Reasoning { text, .. } => {
@@ -296,17 +301,20 @@ fn render_input_part(part: &ContentPart) -> Value {
             }
             object
         }
-    }
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
+    };
+    request_support::replay_content_extensions(rendered, part)
 }
 
 fn render_summary_part(part: &ContentPart) -> Value {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Reasoning { text, .. } | ContentPart::Text(text) => {
             serde_json::json!({"type": "summary_text", "text": text})
         }
         ContentPart::Json(value) => value.clone(),
         other => render_input_part(other),
-    }
+    };
+    request_support::replay_content_extensions(rendered, part)
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
@@ -320,9 +328,17 @@ fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
         object["status"] = Value::String(status.clone());
     }
     if let Some(object) = object.as_object_mut() {
-        for (key, value) in &call.metadata {
+        for (key, value) in call.metadata.iter().chain(&call.function_metadata) {
             object.entry(key.clone()).or_insert_with(|| value.clone());
         }
+        request_support::replay_scoped_extensions(
+            object,
+            &call.extensions,
+            &[
+                crate::ir::ExtensionScope::ToolCall,
+                crate::ir::ExtensionScope::ToolFunction,
+            ],
+        );
     }
     object
 }
@@ -339,9 +355,17 @@ fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
         object["parameters"] = schema.clone();
     }
     if let Some(object) = object.as_object_mut() {
-        for (key, value) in &tool.metadata {
+        for (key, value) in tool.metadata.iter().chain(&tool.function_metadata) {
             object.entry(key.clone()).or_insert_with(|| value.clone());
         }
+        request_support::replay_scoped_extensions(
+            object,
+            &tool.extensions,
+            &[
+                crate::ir::ExtensionScope::ToolDefinition,
+                crate::ir::ExtensionScope::ToolFunction,
+            ],
+        );
     }
     object
 }
@@ -368,7 +392,7 @@ fn item_has_image(item: &ContentItem) -> bool {
 }
 
 fn part_has_image(part: &ContentPart) -> bool {
-    match part {
+    match part.semantic() {
         ContentPart::Image { .. } => true,
         ContentPart::Json(value) => value
             .get("type")
@@ -384,7 +408,7 @@ fn content_item_text(item: &ContentItem) -> Vec<String> {
         | ContentItem::Refusal { content, .. }
         | ContentItem::Reasoning { content, .. } => content
             .iter()
-            .filter_map(|part| match part {
+            .filter_map(|part| match part.semantic() {
                 ContentPart::Text(text)
                 | ContentPart::Refusal(text)
                 | ContentPart::Reasoning { text, .. } => Some(text.clone()),

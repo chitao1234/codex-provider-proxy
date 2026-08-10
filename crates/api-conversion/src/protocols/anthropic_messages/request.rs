@@ -4,6 +4,7 @@ use crate::{
     dialect::{ModelCapabilities, RequestConversionReport, ThinkingParam},
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr},
+    protocols::request_support,
     provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
@@ -41,31 +42,39 @@ pub fn render(
                 system_parts.extend(content.iter().filter_map(text_part));
             }
             ContentItem::Message { role, content, .. } => {
-                messages.push(serde_json::json!({
-                    "role": normalize_role(role),
-                    "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
-                }));
+                messages.push(request_support::replay_item_extensions(
+                    serde_json::json!({
+                        "role": normalize_role(role),
+                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    }),
+                    item,
+                ));
             }
-            ContentItem::Reasoning { content, .. } => messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": content.iter().map(render_thinking_part).collect::<Vec<_>>(),
-            })),
-            ContentItem::Refusal { content, .. } => messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
-            })),
+            ContentItem::Reasoning { content, .. } => {
+                messages.push(request_support::replay_item_extensions(
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": content.iter().map(render_thinking_part).collect::<Vec<_>>(),
+                    }),
+                    item,
+                ))
+            }
+            ContentItem::Refusal { content, .. } => {
+                messages.push(request_support::replay_item_extensions(
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    }),
+                    item,
+                ))
+            }
             ContentItem::ToolUse { id, call } => messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": [render_tool_use(id.as_deref(), call)],
             })),
             ContentItem::ToolResult { result } => messages.push(serde_json::json!({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": result.call_id,
-                    "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
-                    "is_error": result.is_error,
-                }],
+                "content": [render_tool_result(result)],
             })),
             ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
                 if payload.is_object() {
@@ -195,7 +204,7 @@ fn render_generation(
 }
 
 fn render_content_part(part: &ContentPart) -> Value {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Reasoning { text, signature } => {
@@ -217,11 +226,13 @@ fn render_content_part(part: &ContentPart) -> Value {
             }
         }
         ContentPart::Json(value) => value.clone(),
-    }
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
+    };
+    request_support::replay_content_extensions(rendered, part)
 }
 
 fn render_thinking_part(part: &ContentPart) -> Value {
-    match part {
+    match part.semantic() {
         ContentPart::Json(value) => value.clone(),
         _ => render_content_part(part),
     }
@@ -239,6 +250,36 @@ fn render_tool_use(id: Option<&str>, call: &crate::ir::ToolCall) -> Value {
     if let Some(status) = &call.status {
         value["status"] = Value::String(status.clone());
     }
+    if let Some(object) = value.as_object_mut() {
+        for (key, value) in call.metadata.iter().chain(&call.function_metadata) {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        request_support::replay_scoped_extensions(
+            object,
+            &call.extensions,
+            &[
+                crate::ir::ExtensionScope::ToolCall,
+                crate::ir::ExtensionScope::ToolFunction,
+            ],
+        );
+    }
+    value
+}
+
+fn render_tool_result(result: &crate::ir::ToolResult) -> Value {
+    let mut value = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": result.call_id,
+        "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
+        "is_error": result.is_error,
+    });
+    if let Some(object) = value.as_object_mut() {
+        request_support::replay_scoped_extensions(
+            object,
+            &result.extensions,
+            &[crate::ir::ExtensionScope::ContentItem],
+        );
+    }
     value
 }
 
@@ -249,6 +290,19 @@ fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
     });
     if let Some(description) = &tool.description {
         value["description"] = Value::String(description.clone());
+    }
+    if let Some(object) = value.as_object_mut() {
+        for (key, value) in tool.metadata.iter().chain(&tool.function_metadata) {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        request_support::replay_scoped_extensions(
+            object,
+            &tool.extensions,
+            &[
+                crate::ir::ExtensionScope::ToolDefinition,
+                crate::ir::ExtensionScope::ToolFunction,
+            ],
+        );
     }
     value
 }
@@ -282,7 +336,7 @@ fn normalize_role(role: &str) -> &str {
 }
 
 fn text_part(part: &ContentPart) -> Option<String> {
-    match part {
+    match part.semantic() {
         ContentPart::Text(text) | ContentPart::Refusal(text) => Some(text.clone()),
         _ => None,
     }
@@ -310,7 +364,7 @@ fn item_has_image(item: &ContentItem) -> bool {
 }
 
 fn part_has_image(part: &ContentPart) -> bool {
-    match part {
+    match part.semantic() {
         ContentPart::Image { .. } => true,
         ContentPart::Json(value) => value
             .get("type")

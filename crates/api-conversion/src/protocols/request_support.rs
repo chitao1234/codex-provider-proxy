@@ -153,7 +153,7 @@ pub fn base_request(body: &Map<String, Value>, source_protocol: &str) -> Request
         stream: body.get("stream").and_then(Value::as_bool),
         generation: parse_generation(body),
         state: parse_state(body, source_protocol),
-        tools: parse_tools(body),
+        tools: parse_tools(body, source_protocol),
         opaque: parse_opaque(body, source_protocol),
         ..RequestIr::default()
     }
@@ -253,7 +253,7 @@ pub fn parse_state(body: &Map<String, Value>, source_protocol: &str) -> Conversa
     }
 }
 
-pub fn parse_tools(body: &Map<String, Value>) -> Vec<ToolDefinition> {
+pub fn parse_tools(body: &Map<String, Value>, source_protocol: &str) -> Vec<ToolDefinition> {
     body.get("tools")
         .and_then(Value::as_array)
         .into_iter()
@@ -287,23 +287,61 @@ pub fn parse_tools(body: &Map<String, Value>) -> Vec<ToolDefinition> {
                 name,
                 description,
                 input_schema,
-                metadata: object.clone().into_iter().collect(),
-                function_metadata: function.cloned().unwrap_or_default().into_iter().collect(),
-                extensions: Vec::new(),
+                metadata: object
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                function_metadata: function
+                    .and_then(|function| function.get("metadata"))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                extensions: object_extensions(
+                    object,
+                    &[
+                        "type",
+                        "name",
+                        "description",
+                        "parameters",
+                        "input_schema",
+                        "function",
+                        "metadata",
+                    ],
+                    ExtensionScope::ToolDefinition,
+                    source_protocol,
+                )
+                .into_iter()
+                .chain(function.into_iter().flat_map(|function| {
+                    object_extensions(
+                        function,
+                        &["name", "description", "parameters", "metadata"],
+                        ExtensionScope::ToolFunction,
+                        source_protocol,
+                    )
+                }))
+                .collect(),
             })
         })
         .collect()
 }
 
-pub fn parse_parts(value: &Value) -> Vec<ContentPart> {
+pub fn parse_parts(value: &Value, source_protocol: &str) -> Vec<ContentPart> {
     match value {
         Value::String(text) => vec![ContentPart::Text(text.clone())],
-        Value::Array(values) => values.iter().flat_map(parse_part).collect(),
-        _ => parse_part(value),
+        Value::Array(values) => values
+            .iter()
+            .flat_map(|value| parse_part(value, source_protocol))
+            .collect(),
+        _ => parse_part(value, source_protocol),
     }
 }
 
-pub fn parse_part(value: &Value) -> Vec<ContentPart> {
+pub fn parse_part(value: &Value, source_protocol: &str) -> Vec<ContentPart> {
     let Some(object) = value.as_object() else {
         return vec![ContentPart::Json(value.clone())];
     };
@@ -311,13 +349,31 @@ pub fn parse_part(value: &Value) -> Vec<ContentPart> {
         Some("text" | "input_text" | "output_text") => object
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| vec![ContentPart::Text(text.to_owned())])
+            .map(|text| {
+                vec![
+                    ContentPart::Text(text.to_owned()).with_extensions(object_extensions(
+                        object,
+                        &["type", "text"],
+                        ExtensionScope::ContentPart,
+                        source_protocol,
+                    )),
+                ]
+            })
             .unwrap_or_default(),
         Some("refusal") => object
             .get("refusal")
             .or_else(|| object.get("text"))
             .and_then(Value::as_str)
-            .map(|text| vec![ContentPart::Refusal(text.to_owned())])
+            .map(|text| {
+                vec![
+                    ContentPart::Refusal(text.to_owned()).with_extensions(object_extensions(
+                        object,
+                        &["type", "refusal", "text"],
+                        ExtensionScope::ContentPart,
+                        source_protocol,
+                    )),
+                ]
+            })
             .unwrap_or_default(),
         Some("thinking" | "reasoning") => vec![ContentPart::Reasoning {
             text: object
@@ -330,13 +386,19 @@ pub fn parse_part(value: &Value) -> Vec<ContentPart> {
                 .get("signature")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        }],
+        }
+        .with_extensions(object_extensions(
+            object,
+            &["type", "thinking", "text", "signature"],
+            ExtensionScope::ContentPart,
+            source_protocol,
+        ))],
         Some("image" | "input_image" | "image_url") => vec![ContentPart::Json(value.clone())],
         _ => vec![ContentPart::Json(value.clone())],
     }
 }
 
-pub fn parse_tool_call(object: &Map<String, Value>) -> ToolCall {
+pub fn parse_tool_call(object: &Map<String, Value>, source_protocol: &str) -> ToolCall {
     let arguments = object
         .get("arguments")
         .or_else(|| object.get("input"))
@@ -361,19 +423,42 @@ pub fn parse_tool_call(object: &Map<String, Value>) -> ToolCall {
             .get("status")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        metadata: object.clone().into_iter().collect(),
-        function_metadata: object
-            .get("function")
+        metadata: object
+            .get("metadata")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .collect(),
-        extensions: Vec::new(),
+        function_metadata: object
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("metadata"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        extensions: object_extensions(
+            object,
+            &[
+                "type",
+                "id",
+                "call_id",
+                "name",
+                "arguments",
+                "input",
+                "status",
+                "function",
+                "metadata",
+            ],
+            ExtensionScope::ToolCall,
+            source_protocol,
+        ),
     }
 }
 
-pub fn parse_tool_result(object: &Map<String, Value>) -> ToolResult {
+pub fn parse_tool_result(object: &Map<String, Value>, source_protocol: &str) -> ToolResult {
     ToolResult {
         call_id: object
             .get("call_id")
@@ -385,12 +470,25 @@ pub fn parse_tool_result(object: &Map<String, Value>) -> ToolResult {
                 .get("output")
                 .or_else(|| object.get("content"))
                 .unwrap_or(&Value::Null),
+            source_protocol,
         ),
         is_error: object
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        extensions: Vec::new(),
+        extensions: object_extensions(
+            object,
+            &[
+                "type",
+                "call_id",
+                "tool_use_id",
+                "output",
+                "content",
+                "is_error",
+            ],
+            ExtensionScope::ContentItem,
+            source_protocol,
+        ),
     }
 }
 
@@ -409,6 +507,51 @@ pub fn extension(
         source_protocol: Some(source_protocol.to_owned()),
         provider: None,
         replay: ReplayPolicy::ReplayAsTargetOpaque,
+    }
+}
+
+pub fn object_extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+    source_protocol: &str,
+) -> Vec<Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| extension(source_protocol, key, value, scope, source_protocol))
+        .collect()
+}
+
+pub fn replay_content_extensions(mut rendered: Value, part: &ContentPart) -> Value {
+    if let Some(object) = rendered.as_object_mut() {
+        replay_scoped_extensions(object, part.extensions(), &[ExtensionScope::ContentPart]);
+    }
+    rendered
+}
+
+pub fn replay_item_extensions(mut rendered: Value, item: &crate::ir::ContentItem) -> Value {
+    if let Some(object) = rendered.as_object_mut() {
+        replay_scoped_extensions(
+            object,
+            item.extensions(),
+            &[ExtensionScope::Message, ExtensionScope::ContentItem],
+        );
+    }
+    rendered
+}
+
+pub fn replay_scoped_extensions(
+    output: &mut Map<String, Value>,
+    extensions: &[Extension],
+    scopes: &[ExtensionScope],
+) {
+    for extension in extensions {
+        if scopes.contains(&extension.scope) && extension.is_replayable_as_opaque() {
+            output
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
     }
 }
 

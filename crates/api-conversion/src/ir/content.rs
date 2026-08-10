@@ -18,7 +18,38 @@ pub enum ContentPart {
         data: Option<String>,
         url: Option<String>,
     },
+    Extended {
+        part: Box<ContentPart>,
+        extensions: Vec<Extension>,
+    },
     Json(Value),
+}
+
+impl ContentPart {
+    pub fn with_extensions(self, extensions: Vec<Extension>) -> Self {
+        if extensions.is_empty() {
+            self
+        } else {
+            Self::Extended {
+                part: Box::new(self),
+                extensions,
+            }
+        }
+    }
+
+    pub fn extensions(&self) -> &[Extension] {
+        match self {
+            Self::Extended { extensions, .. } => extensions,
+            _ => &[],
+        }
+    }
+
+    pub fn semantic(&self) -> &Self {
+        match self {
+            Self::Extended { part, .. } => part.semantic(),
+            part => part,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,4 +89,18 @@ pub enum ContentItem {
         payload: Value,
         extensions: Vec<Extension>,
     },
+}
+
+impl ContentItem {
+    pub fn extensions(&self) -> &[Extension] {
+        match self {
+            Self::Message { extensions, .. }
+            | Self::Refusal { extensions, .. }
+            | Self::Reasoning { extensions, .. }
+            | Self::ServerTool { extensions, .. }
+            | Self::Unknown { extensions, .. } => extensions,
+            Self::ToolUse { call, .. } => &call.extensions,
+            Self::ToolResult { result } => &result.extensions,
+        }
+    }
 }

@@ -5,6 +5,7 @@ use codex_provider_proxy_api_conversion::{
         MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
         ServerToolPolicy, ThinkingParam,
     },
+    ir::ContentItem,
     protocol::Protocol,
     request_adapter::{RequestAdapter, RequestAdapterKind},
 };
@@ -434,4 +435,94 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
         native.report.mapped_server_tools,
         ["web_search", "web_fetch", "code_execution"]
     );
+}
+
+#[test]
+fn nested_request_extensions_survive_protocol_translation() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type":"text","text":"hello","x_part":true}],
+                    "x_message": "message-extra"
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id":"call-1",
+                        "type":"function",
+                        "x_call": "call-extra",
+                        "function": {
+                            "name":"lookup",
+                            "arguments":"{}",
+                            "x_function": "function-extra"
+                        }
+                    }]
+                }
+            ],
+            "tools": [{
+                "type":"function",
+                "x_definition":"definition-extra",
+                "function": {
+                    "name":"lookup",
+                    "description":"Lookup",
+                    "parameters":{"type":"object"},
+                    "x_function_definition":"function-definition-extra"
+                }
+            }]
+        }))
+        .unwrap();
+    let rendered = adapter
+        .render_v2(
+            &request,
+            Protocol::OpenAiResponses,
+            &ModelCapabilities::default(),
+        )
+        .unwrap()
+        .body;
+    assert_eq!(rendered["input"][0]["x_message"], "message-extra");
+    assert_eq!(rendered["input"][0]["content"][0]["x_part"], true);
+    assert_eq!(rendered["input"][1]["x_call"], "call-extra");
+    assert_eq!(rendered["input"][1]["x_function"], "function-extra");
+    assert_eq!(rendered["tools"][0]["x_definition"], "definition-extra");
+    assert_eq!(
+        rendered["tools"][0]["x_function_definition"],
+        "function-definition-extra"
+    );
+    assert_eq!(rendered["input"][0]["role"], "user");
+}
+
+#[test]
+fn chat_tool_messages_map_without_empty_assistant_items() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "done"
+                }
+            ]
+        }))
+        .unwrap();
+
+    assert_eq!(request.transcript.len(), 2);
+    assert!(matches!(request.transcript[0], ContentItem::ToolUse { .. }));
+    assert!(matches!(
+        request.transcript[1],
+        ContentItem::ToolResult { .. }
+    ));
 }

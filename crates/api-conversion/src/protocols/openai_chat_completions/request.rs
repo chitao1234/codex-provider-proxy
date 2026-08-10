@@ -7,6 +7,7 @@ use crate::{
     },
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr, ToolCall},
+    protocols::request_support,
     provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
@@ -51,10 +52,13 @@ pub fn render(
     let mut messages = Vec::new();
     for instruction in &request.instructions {
         if let Some(text) = content_item_text(instruction) {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": [{"type": "text", "text": text}],
-            }));
+            messages.push(request_support::replay_item_extensions(
+                serde_json::json!({
+                    "role": "system",
+                    "content": [{"type": "text", "text": text}],
+                }),
+                instruction,
+            ));
         }
     }
     let mut pending_reasoning = None;
@@ -73,7 +77,10 @@ pub fn render(
                         } else {
                             role
                         };
-                        messages.push(serde_json::json!({"role": role, "content": [{"type": "text", "text": text}]}));
+                        messages.push(request_support::replay_item_extensions(
+                            serde_json::json!({"role": role, "content": [{"type": "text", "text": text}]}),
+                            item,
+                        ));
                     }
                     continue;
                 }
@@ -82,33 +89,35 @@ pub fn render(
                     "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
                 });
                 if role == "assistant" {
-                    if let Some(reasoning) = pending_reasoning.take() {
-                        message["reasoning_content"] = Value::String(reasoning);
-                    }
+                    apply_pending_reasoning(&mut message, &mut pending_reasoning);
                 }
-                messages.push(message);
+                messages.push(request_support::replay_item_extensions(message, item));
             }
             ContentItem::Reasoning { content, .. } => {
-                pending_reasoning = Some(
+                pending_reasoning = Some((
                     content
                         .iter()
                         .filter_map(text_part)
                         .collect::<Vec<_>>()
                         .join("\n"),
-                );
+                    item.extensions().to_vec(),
+                ));
             }
-            ContentItem::Refusal { content, .. } => messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
-            })),
+            ContentItem::Refusal { content, .. } => messages.push(
+                request_support::replay_item_extensions(
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    }),
+                    item,
+                ),
+            ),
             ContentItem::ToolUse { id, call } => {
                 let tool_call = render_tool_call(id.as_deref(), call);
                 if let Some(message) = messages.last_mut().filter(|message| {
                     message.get("role").and_then(Value::as_str) == Some("assistant")
                 }) {
-                    if let Some(reasoning) = pending_reasoning.take() {
-                        message["reasoning_content"] = Value::String(reasoning);
-                    }
+                    apply_pending_reasoning(message, &mut pending_reasoning);
                     if let Some(calls) = message["tool_calls"].as_array_mut() {
                         calls.push(tool_call);
                     } else {
@@ -120,24 +129,27 @@ pub fn render(
                         "content": null,
                         "tool_calls": [tool_call],
                     });
-                    if let Some(reasoning) = pending_reasoning.take() {
-                        message["reasoning_content"] = Value::String(reasoning);
-                    }
+                    apply_pending_reasoning(&mut message, &mut pending_reasoning);
                     messages.push(message);
                 }
             }
-            ContentItem::ToolResult { result } => messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.call_id,
-                "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
-            })),
+            ContentItem::ToolResult { result } => messages.push(
+                request_support::replay_item_extensions(
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": result.call_id,
+                        "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    }),
+                    item,
+                ),
+            ),
             ContentItem::ServerTool { .. } | ContentItem::Unknown { .. } => {}
         }
     }
-    if let Some(reasoning) = pending_reasoning {
-        messages.push(
-            serde_json::json!({"role": "assistant", "content": "", "reasoning_content": reasoning}),
-        );
+    if pending_reasoning.is_some() {
+        let mut message = serde_json::json!({"role": "assistant", "content": ""});
+        apply_pending_reasoning(&mut message, &mut pending_reasoning);
+        messages.push(message);
     }
     output.insert("messages".to_owned(), Value::Array(messages));
     let last_user_text = request.last_user_text();
@@ -324,7 +336,7 @@ fn render_response_format(
 }
 
 fn render_content_part(part: &ContentPart) -> Value {
-    match part {
+    let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Reasoning { text, .. } => serde_json::json!({"type": "text", "text": text}),
@@ -333,19 +345,74 @@ fn render_content_part(part: &ContentPart) -> Value {
             |url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
         ),
         ContentPart::Json(value) => value.clone(),
-    }
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
+    };
+    request_support::replay_content_extensions(rendered, part)
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "id": call.id.as_deref().or(id),
         "type": "function",
         "function": {"name": call.name, "arguments": call.arguments}
-    })
+    });
+    if let Some(object) = value.as_object_mut() {
+        request_support::replay_scoped_extensions(
+            object,
+            &call.extensions,
+            &[crate::ir::ExtensionScope::ToolCall],
+        );
+        if let Some(function) = object.get_mut("function").and_then(Value::as_object_mut) {
+            for (key, value) in call.metadata.iter().chain(&call.function_metadata) {
+                function.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            request_support::replay_scoped_extensions(
+                function,
+                &call.extensions,
+                &[crate::ir::ExtensionScope::ToolFunction],
+            );
+        }
+    }
+    value
 }
 
 fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
-    serde_json::json!({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema.clone().unwrap_or_else(|| serde_json::json!({}))}})
+    let mut value = serde_json::json!({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema.clone().unwrap_or_else(|| serde_json::json!({}))}});
+    if let Some(object) = value.as_object_mut() {
+        request_support::replay_scoped_extensions(
+            object,
+            &tool.extensions,
+            &[crate::ir::ExtensionScope::ToolDefinition],
+        );
+        if let Some(function) = object.get_mut("function").and_then(Value::as_object_mut) {
+            for (key, value) in tool.metadata.iter().chain(&tool.function_metadata) {
+                function.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            request_support::replay_scoped_extensions(
+                function,
+                &tool.extensions,
+                &[crate::ir::ExtensionScope::ToolFunction],
+            );
+        }
+    }
+    value
+}
+
+fn apply_pending_reasoning(
+    message: &mut Value,
+    pending: &mut Option<(String, Vec<crate::ir::Extension>)>,
+) {
+    let Some((reasoning, extensions)) = pending.take() else {
+        return;
+    };
+    message["reasoning_content"] = Value::String(reasoning);
+    if let Some(object) = message.as_object_mut() {
+        request_support::replay_scoped_extensions(
+            object,
+            &extensions,
+            &[crate::ir::ExtensionScope::ContentItem],
+        );
+    }
 }
 
 fn render_mapped_tool(_tool: &crate::ir::ToolDefinition, mapped: &MappedFunctionTool) -> Value {
@@ -360,10 +427,11 @@ fn render_mapped_tool(_tool: &crate::ir::ToolDefinition, mapped: &MappedFunction
 }
 
 fn text_part(part: &ContentPart) -> Option<String> {
-    match part {
+    match part.semantic() {
         ContentPart::Text(text) | ContentPart::Refusal(text) => Some(text.clone()),
         ContentPart::Reasoning { text, .. } => Some(text.clone()),
         ContentPart::Image { .. } | ContentPart::Json(_) => None,
+        ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     }
 }
 
@@ -393,7 +461,7 @@ fn item_has_image(item: &ContentItem) -> bool {
 }
 
 fn part_has_image(part: &ContentPart) -> bool {
-    match part {
+    match part.semantic() {
         ContentPart::Image { .. } => true,
         ContentPart::Json(value) => value
             .get("type")
