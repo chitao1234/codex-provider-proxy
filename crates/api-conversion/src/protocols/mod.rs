@@ -8,11 +8,17 @@ use serde_json::Value;
 use crate::{error::ConversionError, ir::ResponseIr, request_ir::Protocol};
 
 pub fn parse_response(protocol: Protocol, body: &Value) -> Result<ResponseIr, ConversionError> {
-    match protocol {
+    let mut response = match protocol {
         Protocol::OpenAiResponses => openai_responses::response::parse(body),
         Protocol::AnthropicMessages => anthropic_messages::response::parse(body),
         Protocol::OpenAiChatCompletions => openai_chat_completions::response::parse(body),
-    }
+    }?;
+    response
+        .state
+        .source_response_id
+        .clone_from(&response.response_id);
+    response.usage.normalize();
+    Ok(response)
 }
 
 pub fn render_response(

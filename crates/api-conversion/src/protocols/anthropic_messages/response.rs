@@ -115,6 +115,15 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
             cached_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+            cache_write_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64),
+            cache_miss_input_tokens: None,
+            reasoning_tokens: usage
+                .get("output_tokens_details")
+                .and_then(|details| details.get("thinking_tokens"))
+                .and_then(Value::as_u64),
+            extensions: Vec::new(),
         })
         .unwrap_or_default();
     let reason = object
@@ -158,6 +167,8 @@ fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir
     object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
-        .map(|(key, value)| crate::ir::Extension::new("anthropic.messages", key, value.clone()))
+        .map(|(key, value)| {
+            crate::ir::Extension::response_opaque("anthropic.messages", key, value.clone())
+        })
         .collect()
 }

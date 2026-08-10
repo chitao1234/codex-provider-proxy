@@ -2,7 +2,7 @@ use std::fs;
 
 use codex_provider_proxy_api_conversion::{
     dialect::ModelCapabilities,
-    ir::{CanonicalResponseEvent, ContentPart, StopReason},
+    ir::{CanonicalResponseEvent, ContentPart, ResponseAccumulator, ResponseIr, StopReason},
     protocols::{self, anthropic_messages, openai_chat_completions, openai_responses},
     request_adapter::{RequestAdapter, RequestAdapterKind},
     request_ir::Protocol,
@@ -132,44 +132,8 @@ fn phase0_state_and_cache_identity_mapping_is_explicit() {
 
 #[test]
 fn phase0_stream_fixtures_reach_the_same_basic_terminal_shape() {
-    let mut streams = Vec::new();
-
-    let mut chat = openai_chat_completions::stream::Parser::new();
-    let mut chat_events = Vec::new();
-    for line in read_lines("tests/fixtures/phase0/streams/openai_chat_completions.jsonl") {
-        chat.on_chunk(&line, &mut chat_events).unwrap();
-    }
-    streams.push(chat_events);
-
-    let mut messages = anthropic_messages::stream::Parser::new();
-    let mut message_events = Vec::new();
-    for line in read_lines("tests/fixtures/phase0/streams/anthropic_messages.jsonl") {
-        let event: Value = serde_json::from_str(&line).unwrap();
-        messages
-            .on_event(
-                event["event_type"].as_str().unwrap(),
-                &event["data"].to_string(),
-                &mut message_events,
-            )
-            .unwrap();
-    }
-    streams.push(message_events);
-
-    let mut responses = openai_responses::stream::Parser::new();
-    let mut response_events = Vec::new();
-    for line in read_lines("tests/fixtures/phase0/streams/openai_responses.jsonl") {
-        let event: Value = serde_json::from_str(&line).unwrap();
-        responses
-            .on_event(
-                event["event_type"].as_str().unwrap(),
-                &event["data"].to_string(),
-                &mut response_events,
-            )
-            .unwrap();
-    }
-    streams.push(response_events);
-
-    for events in streams {
+    for protocol in response_protocols() {
+        let events = stream_events(protocol);
         assert!(events
             .iter()
             .any(|event| matches!(event, CanonicalResponseEvent::StreamStarted { .. })));
@@ -182,6 +146,75 @@ fn phase0_stream_fixtures_reach_the_same_basic_terminal_shape() {
             }
         )));
     }
+}
+
+#[test]
+fn phase0_complete_and_streaming_fixtures_share_final_semantics() {
+    for (protocol, path) in response_cases() {
+        let complete = protocols::parse_response(protocol, &read_json(path)).unwrap();
+        let streamed = accumulate(stream_events(protocol));
+        assert_eq!(streamed, complete, "{protocol:?}");
+    }
+}
+
+fn stream_events(protocol: Protocol) -> Vec<CanonicalResponseEvent> {
+    match protocol {
+        Protocol::OpenAiChatCompletions => {
+            let mut parser = openai_chat_completions::stream::Parser::new();
+            let mut events = Vec::new();
+            for line in read_lines("tests/fixtures/phase0/streams/openai_chat_completions.jsonl") {
+                parser.on_chunk(&line, &mut events).unwrap();
+            }
+            events
+        }
+        Protocol::AnthropicMessages => {
+            let mut parser = anthropic_messages::stream::Parser::new();
+            parse_typed_stream(
+                &mut |event_type, payload, events| parser.on_event(event_type, payload, events),
+                "tests/fixtures/phase0/streams/anthropic_messages.jsonl",
+            )
+        }
+        Protocol::OpenAiResponses => {
+            let mut parser = openai_responses::stream::Parser::new();
+            parse_typed_stream(
+                &mut |event_type, payload, events| parser.on_event(event_type, payload, events),
+                "tests/fixtures/phase0/streams/openai_responses.jsonl",
+            )
+        }
+    }
+}
+
+fn parse_typed_stream(
+    parser: &mut impl FnMut(
+        &str,
+        &str,
+        &mut Vec<CanonicalResponseEvent>,
+    )
+        -> Result<(), codex_provider_proxy_api_conversion::error::ConversionError>,
+    path: &str,
+) -> Vec<CanonicalResponseEvent> {
+    let mut events = Vec::new();
+    for line in read_lines(path) {
+        let event: Value = serde_json::from_str(&line).unwrap();
+        parser(
+            event["event_type"].as_str().unwrap(),
+            &event["data"].to_string(),
+            &mut events,
+        )
+        .unwrap();
+    }
+    events
+}
+
+fn accumulate(events: Vec<CanonicalResponseEvent>) -> ResponseIr {
+    let mut accumulator = ResponseAccumulator::default();
+    for event in events {
+        accumulator.apply(event);
+    }
+    let snapshot = accumulator.snapshot();
+    assert!(snapshot.terminal);
+    assert!(!snapshot.failed);
+    snapshot.response
 }
 
 fn request_cases() -> [(Protocol, &'static str); 3] {
@@ -215,6 +248,14 @@ fn response_cases() -> [(Protocol, &'static str); 3] {
             Protocol::AnthropicMessages,
             "tests/fixtures/phase0/responses/anthropic_messages.json",
         ),
+    ]
+}
+
+fn response_protocols() -> [Protocol; 3] {
+    [
+        Protocol::OpenAiResponses,
+        Protocol::OpenAiChatCompletions,
+        Protocol::AnthropicMessages,
     ]
 }
 

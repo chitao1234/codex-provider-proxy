@@ -143,16 +143,24 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
         .and_then(Value::as_object)
         .and_then(|usage| usage.get("completion_tokens_details"))
     {
-        response.extensions.push(crate::ir::Extension::new(
-            "openai.chat_completions",
-            "output_tokens_details",
-            details.clone(),
-        ));
+        response
+            .extensions
+            .push(crate::ir::Extension::response_opaque(
+                "openai.chat_completions",
+                "output_tokens_details",
+                details.clone(),
+            ));
     }
     Ok(response)
 }
 
 fn parse_usage(object: &Map<String, Value>) -> Usage {
+    let prompt_details = object
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object);
+    let completion_details = object
+        .get("completion_tokens_details")
+        .and_then(Value::as_object);
     Usage {
         input_tokens: object.get("prompt_tokens").and_then(Value::as_u64),
         output_tokens: object.get("completion_tokens").and_then(Value::as_u64),
@@ -166,13 +174,56 @@ fn parse_usage(object: &Map<String, Value>) -> Usage {
                     .zip(object.get("completion_tokens").and_then(Value::as_u64))
                     .map(|(input, output)| input + output)
             }),
-        cached_input_tokens: object
-            .get("prompt_tokens_details")
-            .and_then(Value::as_object)
+        cached_input_tokens: prompt_details
             .and_then(|details| details.get("cached_tokens"))
             .and_then(Value::as_u64)
-            .or_else(|| object.get("cached_tokens").and_then(Value::as_u64)),
+            .or_else(|| object.get("cached_tokens").and_then(Value::as_u64))
+            .or_else(|| {
+                object
+                    .get("prompt_cache_hit_tokens")
+                    .and_then(Value::as_u64)
+            }),
+        cache_write_input_tokens: prompt_details
+            .and_then(|details| details.get("cache_write_tokens"))
+            .and_then(Value::as_u64),
+        cache_miss_input_tokens: object
+            .get("prompt_cache_miss_tokens")
+            .and_then(Value::as_u64),
+        reasoning_tokens: completion_details
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        extensions: usage_extensions(
+            "openai.chat_completions",
+            object,
+            &[
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+                "cached_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+            ],
+        ),
     }
+}
+
+fn usage_extensions(
+    namespace: &str,
+    object: &Map<String, Value>,
+    structural: &[&str],
+) -> Vec<crate::ir::Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| {
+            let mut extension = crate::ir::Extension::new(namespace, key, value.clone());
+            extension.scope = crate::ir::ExtensionScope::Usage;
+            extension.replay = crate::ir::ReplayPolicy::ReplayIfSupported;
+            extension
+        })
+        .collect()
 }
 
 fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
@@ -180,7 +231,7 @@ fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
-            crate::ir::Extension::new("openai.chat_completions", key, value.clone())
+            crate::ir::Extension::response_opaque("openai.chat_completions", key, value.clone())
         })
         .collect()
 }

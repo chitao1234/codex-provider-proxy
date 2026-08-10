@@ -1,5 +1,7 @@
 use codex_provider_proxy_api_conversion::{
-    ir::ContentItem, protocols::parse_response, request_ir::Protocol,
+    ir::{CanonicalResponseEvent, ContentItem, ResponseAccumulator, Usage},
+    protocols::{anthropic_messages, openai_chat_completions, openai_responses, parse_response},
+    request_ir::Protocol,
 };
 use serde_json::json;
 
@@ -54,4 +56,151 @@ fn chat_usage_sums_when_total_missing() {
     )
     .unwrap();
     assert_eq!(response.usage.total_tokens, Some(15));
+}
+
+#[test]
+fn chat_complete_and_streaming_usage_share_semantics() {
+    let complete = parse_response(
+        Protocol::OpenAiChatCompletions,
+        &json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3},
+                "prompt_cache_miss_tokens": 6,
+                "completion_tokens_details": {"reasoning_tokens": 2}
+            }
+        }),
+    )
+    .unwrap();
+    let mut parser = openai_chat_completions::stream::Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_chunk(
+            &json!({
+                "id": "chat-usage",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3},
+                    "prompt_cache_miss_tokens": 6,
+                    "completion_tokens_details": {"reasoning_tokens": 2}
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    assert_eq!(accumulate_usage(events), complete.usage);
+}
+
+#[test]
+fn messages_complete_and_streaming_usage_share_semantics() {
+    let complete = parse_response(
+        Protocol::AnthropicMessages,
+        &json!({
+            "id": "msg-usage",
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 3,
+                "output_tokens_details": {"thinking_tokens": 2}
+            }
+        }),
+    )
+    .unwrap();
+    let mut parser = anthropic_messages::stream::Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_event(
+            "message_start",
+            &json!({
+                "message": {
+                    "id": "msg-usage",
+                    "usage": {"input_tokens": 10, "cache_read_input_tokens": 4}
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "message_delta",
+            &json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 3,
+                    "output_tokens_details": {"thinking_tokens": 2}
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    assert_eq!(accumulate_usage(events), complete.usage);
+}
+
+#[test]
+fn responses_complete_and_streaming_usage_share_semantics() {
+    let usage = json!({
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3},
+        "output_tokens_details": {"reasoning_tokens": 2}
+    });
+    let complete = parse_response(
+        Protocol::OpenAiResponses,
+        &json!({
+            "id": "resp-usage",
+            "status": "completed",
+            "output": [],
+            "usage": usage
+        }),
+    )
+    .unwrap();
+    let mut parser = openai_responses::stream::Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_event(
+            "response.created",
+            &json!({"response": {"id": "resp-usage", "status": "in_progress"}}).to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "response.completed",
+            &json!({
+                "response": {
+                    "id": "resp-usage",
+                    "status": "completed",
+                    "usage": usage
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    assert_eq!(accumulate_usage(events), complete.usage);
+}
+
+fn accumulate_usage(events: Vec<CanonicalResponseEvent>) -> Usage {
+    let mut accumulator = ResponseAccumulator::default();
+    for event in events {
+        accumulator.apply(event);
+    }
+    let snapshot = accumulator.snapshot();
+    assert!(snapshot.terminal);
+    assert!(!snapshot.failed);
+    snapshot.response.usage
 }

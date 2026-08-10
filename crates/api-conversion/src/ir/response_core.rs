@@ -249,6 +249,27 @@ fn merge_usage(current: &mut Usage, update: &Usage) {
     current.total_tokens = max_option(current.total_tokens, update.total_tokens);
     current.cached_input_tokens =
         max_option(current.cached_input_tokens, update.cached_input_tokens);
+    current.cache_write_input_tokens = max_option(
+        current.cache_write_input_tokens,
+        update.cache_write_input_tokens,
+    );
+    current.cache_miss_input_tokens = max_option(
+        current.cache_miss_input_tokens,
+        update.cache_miss_input_tokens,
+    );
+    current.reasoning_tokens = max_option(current.reasoning_tokens, update.reasoning_tokens);
+    for extension in &update.extensions {
+        if let Some(existing) = current.extensions.iter_mut().find(|existing| {
+            existing.namespace == extension.namespace
+                && existing.key == extension.key
+                && existing.scope == extension.scope
+        }) {
+            *existing = extension.clone();
+        } else {
+            current.extensions.push(extension.clone());
+        }
+    }
+    current.normalize();
 }
 
 fn max_option(current: Option<u64>, update: Option<u64>) -> Option<u64> {

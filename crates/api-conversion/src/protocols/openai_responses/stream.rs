@@ -15,6 +15,7 @@ pub struct Parser {
     finished: bool,
     started: bool,
     item_kinds: std::collections::BTreeMap<String, ItemKind>,
+    item_ids: std::collections::BTreeMap<usize, String>,
 }
 
 impl Parser {
@@ -55,7 +56,9 @@ impl Parser {
             "response.refusal.delta" => self.content_delta(&data, "delta", true, out),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 if let Some(text) = data.get("delta").and_then(serde_json::Value::as_str) {
-                    let item_id = item_id(&data).unwrap_or_else(|| "reasoning".to_owned());
+                    let item_id = self
+                        .event_item_id(&data)
+                        .unwrap_or_else(|| "reasoning".to_owned());
                     self.ensure_item(&item_id, ItemKind::Reasoning, out);
                     out.push(CanonicalResponseEvent::ContentDelta {
                         item_id,
@@ -68,7 +71,7 @@ impl Parser {
             }
             "response.function_call_arguments.delta" => {
                 if let (Some(item_id), Some(arguments)) = (
-                    item_id(&data),
+                    self.event_item_id(&data),
                     data.get("delta").and_then(serde_json::Value::as_str),
                 ) {
                     out.push(CanonicalResponseEvent::ToolArgumentsDelta {
@@ -161,6 +164,9 @@ impl Parser {
             .map(str::to_owned)
             .or_else(|| item_id(data))
             .unwrap_or_else(|| format!("item:{}", self.item_kinds.len()));
+        if let Some(index) = output_index(data) {
+            self.item_ids.insert(index, id.clone());
+        }
         match item.get("type").and_then(serde_json::Value::as_str) {
             Some("reasoning") => self.ensure_item(&id, ItemKind::Reasoning, out),
             Some("message") => self.ensure_item(&id, ItemKind::Message, out),
@@ -239,7 +245,7 @@ impl Parser {
         out: &mut Vec<CanonicalResponseEvent>,
     ) {
         if let Some(text) = data.get(field).and_then(serde_json::Value::as_str) {
-            let item_id = item_id(data).unwrap_or_else(|| {
+            let item_id = self.event_item_id(data).unwrap_or_else(|| {
                 if refusal {
                     "refusal".to_owned()
                 } else {
@@ -279,12 +285,23 @@ impl Parser {
             });
         }
     }
+
+    fn event_item_id(&self, data: &serde_json::Value) -> Option<String> {
+        item_id(data)
+            .or_else(|| output_index(data).and_then(|index| self.item_ids.get(&index).cloned()))
+    }
 }
 
 fn item_id(data: &serde_json::Value) -> Option<String> {
     data.get("item_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+fn output_index(data: &serde_json::Value) -> Option<usize> {
+    data.get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
 }
 
 fn parse_usage(value: &serde_json::Value) -> Usage {
@@ -297,6 +314,16 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
             .get("input_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
             .and_then(serde_json::Value::as_u64),
+        cache_write_input_tokens: value
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cache_write_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        cache_miss_input_tokens: None,
+        reasoning_tokens: value
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        extensions: Vec::new(),
     }
 }
 

@@ -112,7 +112,10 @@ pub fn render_messages_state(
 
 fn replay_state_extensions(request: &RequestIr, output: &mut Map<String, Value>) {
     for extension in &request.state.extensions {
-        if extension.scope == ExtensionScope::State && !is_canonical_state_field(&extension.key) {
+        if extension.scope == ExtensionScope::State
+            && extension.is_replayable_as_opaque()
+            && !is_canonical_state_field(&extension.key)
+        {
             output
                 .entry(extension.key.clone())
                 .or_insert_with(|| extension.value.clone());

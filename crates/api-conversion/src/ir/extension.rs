@@ -47,4 +47,22 @@ impl Extension {
             replay: ReplayPolicy::NeverReplay,
         }
     }
+
+    pub fn response_opaque(
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+        value: Value,
+    ) -> Self {
+        let mut extension = Self::new(namespace, key, value);
+        extension.scope = ExtensionScope::Response;
+        extension.replay = ReplayPolicy::ReplayAsTargetOpaque;
+        extension
+    }
+
+    pub fn is_replayable_as_opaque(&self) -> bool {
+        matches!(
+            self.replay,
+            ReplayPolicy::ReplayAsTargetOpaque | ReplayPolicy::ReplayIfSupported
+        )
+    }
 }

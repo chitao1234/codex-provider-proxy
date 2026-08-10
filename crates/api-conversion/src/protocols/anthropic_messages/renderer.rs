@@ -1,5 +1,5 @@
 use crate::ir::{ContentItem, ContentPart, ResponseIr, StopReason};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 pub fn render(response: &ResponseIr) -> Value {
     let response_id = response.response_id.as_deref().map(|id| {
@@ -22,7 +22,16 @@ pub fn render(response: &ResponseIr) -> Value {
         StopReason::Cancelled => "end_turn".to_owned(),
         StopReason::Unknown(reason) => reason.clone(),
     });
-    let mut rendered = json!({"id": response_id, "type":"message", "role":"assistant", "model":response.model, "content":content, "stop_reason": stop_reason, "usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.output_tokens,"total_tokens":response.usage.total_tokens,"cache_read_input_tokens":response.usage.cached_input_tokens}});
+    let mut rendered = json!({"id": response_id, "type":"message", "role":"assistant", "model":response.model, "content":content, "stop_reason": stop_reason, "usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.output_tokens,"total_tokens":response.usage.total_tokens,"cache_read_input_tokens":response.usage.cached_input_tokens,"cache_creation_input_tokens":response.usage.cache_write_input_tokens,"output_tokens_details":{"thinking_tokens":response.usage.reasoning_tokens}}});
+    if let Some(usage) = rendered.get_mut("usage").and_then(Value::as_object_mut) {
+        for extension in &response.usage.extensions {
+            if extension.is_replayable_as_opaque() {
+                usage
+                    .entry(extension.key.clone())
+                    .or_insert_with(|| extension.value.clone());
+            }
+        }
+    }
     if let Some(details) = response
         .extensions
         .iter()
@@ -36,7 +45,20 @@ pub fn render(response: &ResponseIr) -> Value {
         }
         rendered["usage"]["output_tokens_details"] = output_details;
     }
+    if let Some(object) = rendered.as_object_mut() {
+        replay_extensions(object, response);
+    }
     rendered
+}
+
+fn replay_extensions(output: &mut Map<String, Value>, response: &ResponseIr) {
+    for extension in response.extensions.iter().chain(response.opaque.iter()) {
+        if extension.is_replayable_as_opaque() && extension.key != "output_tokens_details" {
+            output
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
+    }
 }
 
 fn render_content(part: &ContentPart) -> Option<Value> {

@@ -38,13 +38,38 @@ pub fn render(response: &ResponseIr) -> Value {
                 .collect(),
         ),
     );
-    object.insert("usage".into(), json!({"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens, "total_tokens": response.usage.total_tokens, "input_tokens_details": {"cached_tokens": response.usage.cached_input_tokens}}));
+    object.insert("usage".into(), render_usage(&response.usage));
     for extension in response.extensions.iter().chain(response.opaque.iter()) {
-        object
-            .entry(extension.key.clone())
-            .or_insert_with(|| extension.value.clone());
+        if extension.is_replayable_as_opaque() {
+            object
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
     }
     Value::Object(object)
+}
+
+fn render_usage(usage: &crate::ir::Usage) -> Value {
+    let mut rendered = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens,
+            "cache_write_tokens": usage.cache_write_input_tokens,
+        },
+        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
+    });
+    if let Some(object) = rendered.as_object_mut() {
+        for extension in &usage.extensions {
+            if extension.is_replayable_as_opaque() {
+                object
+                    .entry(extension.key.clone())
+                    .or_insert_with(|| extension.value.clone());
+            }
+        }
+    }
+    rendered
 }
 
 fn render_item(index: usize, item: &ContentItem) -> Value {

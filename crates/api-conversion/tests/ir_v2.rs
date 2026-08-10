@@ -61,12 +61,16 @@ fn accumulator_reconciles_tool_arguments_and_monotonic_usage() {
         output_tokens: Some(4),
         total_tokens: Some(14),
         cached_input_tokens: None,
+        ..Usage::default()
     }));
     accumulator.apply(CanonicalResponseEvent::UsageUpdated(Usage {
         input_tokens: Some(8),
         output_tokens: Some(6),
         total_tokens: Some(16),
         cached_input_tokens: Some(2),
+        cache_write_input_tokens: Some(3),
+        reasoning_tokens: Some(5),
+        ..Usage::default()
     }));
 
     let response = accumulator.response();
@@ -81,6 +85,8 @@ fn accumulator_reconciles_tool_arguments_and_monotonic_usage() {
     assert_eq!(response.usage.output_tokens, Some(6));
     assert_eq!(response.usage.total_tokens, Some(16));
     assert_eq!(response.usage.cached_input_tokens, Some(2));
+    assert_eq!(response.usage.cache_write_input_tokens, Some(3));
+    assert_eq!(response.usage.reasoning_tokens, Some(5));
 }
 
 #[test]

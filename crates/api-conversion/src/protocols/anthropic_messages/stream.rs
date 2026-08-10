@@ -299,6 +299,13 @@ impl Parser {
         self.usage.output_tokens = field("output_tokens").or(self.usage.output_tokens);
         self.usage.cached_input_tokens =
             field("cache_read_input_tokens").or(self.usage.cached_input_tokens);
+        self.usage.cache_write_input_tokens =
+            field("cache_creation_input_tokens").or(self.usage.cache_write_input_tokens);
+        self.usage.reasoning_tokens = object
+            .and_then(|usage| usage.get("output_tokens_details"))
+            .and_then(|details| details.get("thinking_tokens"))
+            .and_then(Value::as_u64)
+            .or(self.usage.reasoning_tokens);
         self.usage.total_tokens = self
             .usage
             .input_tokens

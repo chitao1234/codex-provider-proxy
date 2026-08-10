@@ -101,6 +101,10 @@ impl Parser {
                     .zip(usage.completion_tokens)
                     .map(|(input, output)| input + output),
                 cached_input_tokens: usage.cached_tokens,
+                cache_write_input_tokens: usage.cache_write_tokens,
+                cache_miss_input_tokens: usage.prompt_cache_miss_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                extensions: Vec::new(),
             };
             out.push(CanonicalResponseEvent::UsageUpdated(self.usage.clone()));
         }

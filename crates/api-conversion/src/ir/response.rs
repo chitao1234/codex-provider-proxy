@@ -4,12 +4,27 @@ use super::{
     content::ContentItem, extension::Extension, state::ConversationState, stop_reason::StopReason,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub cache_miss_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub extensions: Vec<Extension>,
+}
+
+impl Usage {
+    pub fn normalize(&mut self) {
+        if self.total_tokens.is_none() {
+            self.total_tokens = self
+                .input_tokens
+                .zip(self.output_tokens)
+                .and_then(|(input, output)| input.checked_add(output));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

@@ -102,7 +102,10 @@ fn opaque_root(request: &RequestIr) -> Map<String, Value> {
     request
         .opaque
         .iter()
-        .filter(|extension| extension.scope == crate::ir::ExtensionScope::Request)
+        .filter(|extension| {
+            extension.scope == crate::ir::ExtensionScope::Request
+                && extension.is_replayable_as_opaque()
+        })
         .map(|extension| (extension.key.clone(), extension.value.clone()))
         .collect()
 }

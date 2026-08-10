@@ -1,6 +1,7 @@
 use codex_provider_proxy_api_conversion::{
-    ir::{ContentItem, ContentPart, ResponseIr, StopReason},
-    protocols::render_response,
+    ir::{ContentItem, ContentPart, Extension, ResponseIr, StopReason},
+    protocols::{parse_response, render_response},
+    request_ir::Protocol,
 };
 use serde_json::json;
 
@@ -17,11 +18,7 @@ fn responses_renderer_consumes_v2_without_chat_shape() {
         stop_reason: Some(StopReason::Natural),
         ..ResponseIr::default()
     };
-    let rendered = render_response(
-        codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
-        &response,
-    )
-    .unwrap();
+    let rendered = render_response(Protocol::OpenAiResponses, &response).unwrap();
     assert_eq!(rendered["id"], "resp-1");
     assert_eq!(rendered["output"][0]["type"], "message");
     assert!(rendered.get("choices").is_none());
@@ -45,11 +42,30 @@ fn messages_renderer_preserves_tool_json_input() {
         }],
         ..ResponseIr::default()
     };
-    let rendered = render_response(
-        codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
-        &response,
-    )
-    .unwrap();
+    let rendered = render_response(Protocol::AnthropicMessages, &response).unwrap();
     assert_eq!(rendered["content"][0]["type"], "tool_use");
     assert_eq!(rendered["content"][0]["input"], json!({"q":1}));
+}
+
+#[test]
+fn response_extension_replay_policy_controls_provider_fields() {
+    let parsed = parse_response(
+        Protocol::OpenAiResponses,
+        &json!({
+            "id": "resp-1",
+            "status": "completed",
+            "output": [],
+            "x_provider_trace": "trace-1"
+        }),
+    )
+    .unwrap();
+    let rendered = render_response(Protocol::AnthropicMessages, &parsed).unwrap();
+    assert_eq!(rendered["x_provider_trace"], "trace-1");
+
+    let mut blocked = ResponseIr::default();
+    let mut extension = Extension::new("provider", "x_blocked", json!(true));
+    extension.replay = codex_provider_proxy_api_conversion::ir::ReplayPolicy::NeverReplay;
+    blocked.extensions.push(extension);
+    let rendered = render_response(Protocol::OpenAiResponses, &blocked).unwrap();
+    assert!(rendered.get("x_blocked").is_none());
 }
