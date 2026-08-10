@@ -16,6 +16,7 @@ pub mod error;
 pub mod ir;
 pub mod messages_parser;
 pub mod messages_renderer;
+pub mod protocols;
 pub mod request_adapter;
 pub mod request_ir;
 pub mod response_ir;

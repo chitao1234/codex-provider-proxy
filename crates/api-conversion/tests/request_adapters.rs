@@ -101,3 +101,34 @@ fn responses_adapter_exposes_semantic_v2_request_without_messages_shape() {
         codex_provider_proxy_api_conversion::ir::ContentItem::ToolUse { .. }
     ));
 }
+
+#[test]
+fn responses_v2_renderer_matches_legacy_fixture_shape() {
+    for (protocol, fixture_name) in [
+        (Protocol::OpenAiResponses, "openai_responses"),
+        (Protocol::OpenAiChatCompletions, "openai_chat_completions"),
+        (Protocol::AnthropicMessages, "anthropic_messages"),
+    ] {
+        let adapter = RequestAdapterKind::for_protocol(protocol);
+        let source = fixture(fixture_name);
+        let legacy = adapter
+            .parse(&source)
+            .unwrap()
+            .render_with_report(Protocol::OpenAiResponses, &ModelCapabilities::default())
+            .unwrap()
+            .0;
+        let v2 = adapter.parse_v2(&source).unwrap();
+        let rendered = adapter
+            .render_v2(
+                &v2,
+                Protocol::OpenAiResponses,
+                &ModelCapabilities::default(),
+            )
+            .unwrap()
+            .body;
+
+        assert_eq!(rendered["model"], legacy["model"], "{fixture_name}");
+        assert_eq!(rendered["stream"], legacy["stream"], "{fixture_name}");
+        assert_eq!(rendered["input"], legacy["input"], "{fixture_name}");
+    }
+}

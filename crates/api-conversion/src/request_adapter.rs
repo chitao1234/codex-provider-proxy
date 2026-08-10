@@ -61,6 +61,23 @@ pub trait RequestAdapter {
         let (body, report) = request.render_with_report(target, capabilities)?;
         Ok(RenderedRequest { body, report })
     }
+
+    fn render_v2(
+        &self,
+        request: &crate::ir::RequestIr,
+        target: Protocol,
+        capabilities: &ModelCapabilities,
+    ) -> Result<RenderedRequest, ConversionError> {
+        if target != Protocol::OpenAiResponses {
+            return Err(ConversionError::unsupported(
+                "request.v2.target",
+                "only OpenAiResponses v2 rendering is migrated",
+            ));
+        }
+        let (body, report) =
+            crate::protocols::openai_responses::request::render(request, capabilities)?;
+        Ok(RenderedRequest { body, report })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -148,6 +165,21 @@ impl RequestAdapter for RequestAdapterKind {
             Self::AnthropicMessages(adapter) => {
                 adapter.parse_with_context(body, previous, last_reasoning)
             }
+        }
+    }
+
+    fn render_v2(
+        &self,
+        request: &crate::ir::RequestIr,
+        target: Protocol,
+        capabilities: &ModelCapabilities,
+    ) -> Result<RenderedRequest, ConversionError> {
+        match self {
+            Self::OpenAiResponses(adapter) => adapter.render_v2(request, target, capabilities),
+            Self::OpenAiChatCompletions(adapter) => {
+                adapter.render_v2(request, target, capabilities)
+            }
+            Self::AnthropicMessages(adapter) => adapter.render_v2(request, target, capabilities),
         }
     }
 
