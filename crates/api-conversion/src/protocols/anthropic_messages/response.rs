@@ -38,12 +38,13 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .into(),
-                )],
-                extensions: extensions(
+                )
+                .with_extensions(extensions(
                     block_object,
-                    &["type", "text"],
-                    ExtensionScope::ContentItem,
-                ),
+                    &["type", "text", "id"],
+                    ExtensionScope::ContentPart,
+                ))],
+                extensions: Vec::new(),
             }),
             Some("thinking") => output.push(ContentItem::Reasoning {
                 id: block_object
@@ -60,12 +61,13 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         .get("signature")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                }],
-                extensions: extensions(
+                }
+                .with_extensions(extensions(
                     block_object,
                     &["type", "thinking", "signature", "id"],
-                    ExtensionScope::ContentItem,
-                ),
+                    ExtensionScope::ContentPart,
+                ))],
+                extensions: Vec::new(),
             }),
             Some("redacted_thinking") => output.push(ContentItem::Unknown {
                 id: block_object
@@ -96,16 +98,19 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     )
                     .unwrap_or_default(),
                     status: Some("completed".into()),
-                    metadata: extensions(
-                        block_object,
-                        &["type", "id", "name", "input"],
-                        ExtensionScope::ToolCall,
-                    )
-                    .into_iter()
-                    .map(|e| (e.key, e.value))
-                    .collect(),
+                    metadata: block_object
+                        .get("metadata")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
                     function_metadata: Map::new().into_iter().collect(),
-                    extensions: Vec::new(),
+                    extensions: extensions(
+                        block_object,
+                        &["type", "id", "name", "input", "metadata"],
+                        ExtensionScope::ToolCall,
+                    ),
                 },
             }),
             _ => output.push(ContentItem::Unknown {
@@ -139,7 +144,16 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                 .get("output_tokens_details")
                 .and_then(|details| details.get("thinking_tokens"))
                 .and_then(Value::as_u64),
-            extensions: Vec::new(),
+            extensions: usage_extensions(
+                usage,
+                &[
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "output_tokens_details",
+                ],
+            ),
         })
         .unwrap_or_default();
     let reason = object
@@ -190,6 +204,21 @@ fn extensions(
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
             crate::ir::Extension::scoped_opaque("anthropic.messages", key, value.clone(), scope)
+        })
+        .collect()
+}
+
+fn usage_extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| {
+            crate::ir::Extension::scoped_opaque(
+                "anthropic.messages",
+                key,
+                value.clone(),
+                ExtensionScope::Usage,
+            )
         })
         .collect()
 }

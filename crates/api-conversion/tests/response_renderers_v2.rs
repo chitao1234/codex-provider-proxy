@@ -125,6 +125,61 @@ fn item_and_tool_extensions_replay_at_their_target_scope() {
 }
 
 #[test]
+fn nested_response_content_and_usage_extensions_survive_translation() {
+    let parsed = parse_response(
+        Protocol::OpenAiResponses,
+        &json!({
+            "id": "resp-1",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg-1",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "ok",
+                    "x_part": "part-meta"
+                }]
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "x_usage": "usage-meta"
+            }
+        }),
+    )
+    .unwrap();
+
+    let messages = render_response(Protocol::AnthropicMessages, &parsed).unwrap();
+    assert_eq!(messages["content"][0]["x_part"], "part-meta");
+    assert_eq!(messages["usage"]["x_usage"], "usage-meta");
+
+    let responses = render_response(Protocol::OpenAiResponses, &parsed).unwrap();
+    assert_eq!(responses["output"][0]["content"][0]["x_part"], "part-meta");
+    assert_eq!(responses["usage"]["x_usage"], "usage-meta");
+}
+
+#[test]
+fn messages_content_extensions_survive_responses_translation() {
+    let parsed = parse_response(
+        Protocol::AnthropicMessages,
+        &json!({
+            "id": "msg-1",
+            "model": "m",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok", "x_part": true}],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "x_usage": true}
+        }),
+    )
+    .unwrap();
+
+    let responses = render_response(Protocol::OpenAiResponses, &parsed).unwrap();
+    assert_eq!(responses["output"][0]["content"][0]["x_part"], true);
+    assert_eq!(responses["usage"]["x_usage"], true);
+}
+
+#[test]
 fn messages_renderer_preserves_future_and_tool_result_items() {
     let mut never_replay = Extension::scoped_opaque(
         "provider",

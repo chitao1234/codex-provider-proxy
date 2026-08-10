@@ -51,20 +51,34 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         continue;
                     };
                     match part_object.get("type").and_then(Value::as_str) {
-                        Some("output_text") => content.push(ContentPart::Text(
-                            part_object
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .into(),
-                        )),
-                        Some("refusal") => content.push(ContentPart::Refusal(
-                            part_object
-                                .get("refusal")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .into(),
-                        )),
+                        Some("output_text") => content.push(
+                            ContentPart::Text(
+                                part_object
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .into(),
+                            )
+                            .with_extensions(extensions(
+                                part_object,
+                                &["type", "text", "annotations"],
+                                ExtensionScope::ContentPart,
+                            )),
+                        ),
+                        Some("refusal") => content.push(
+                            ContentPart::Refusal(
+                                part_object
+                                    .get("refusal")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .into(),
+                            )
+                            .with_extensions(extensions(
+                                part_object,
+                                &["type", "refusal"],
+                                ExtensionScope::ContentPart,
+                            )),
+                        ),
                         _ => content.push(ContentPart::Json(part.clone())),
                     }
                 }
@@ -91,10 +105,24 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     .flatten()
                 {
                     if let Some(text) = summary.get("text").and_then(Value::as_str) {
-                        content.push(ContentPart::Reasoning {
-                            text: text.into(),
-                            signature: None,
-                        });
+                        content.push(
+                            ContentPart::Reasoning {
+                                text: text.into(),
+                                signature: None,
+                            }
+                            .with_extensions(
+                                summary
+                                    .as_object()
+                                    .map(|summary| {
+                                        extensions(
+                                            summary,
+                                            &["type", "text"],
+                                            ExtensionScope::ContentPart,
+                                        )
+                                    })
+                                    .unwrap_or_default(),
+                            ),
+                        );
                     } else {
                         content.push(ContentPart::Json(summary.clone()));
                     }
@@ -131,16 +159,27 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         .get("status")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    metadata: extensions(
-                        item_object,
-                        &["type", "id", "status", "call_id", "name", "arguments"],
-                        ExtensionScope::ToolCall,
-                    )
-                    .into_iter()
-                    .map(|e| (e.key, e.value))
-                    .collect(),
+                    metadata: item_object
+                        .get("metadata")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
                     function_metadata: Map::new().into_iter().collect(),
-                    extensions: Vec::new(),
+                    extensions: extensions(
+                        item_object,
+                        &[
+                            "type",
+                            "id",
+                            "status",
+                            "call_id",
+                            "name",
+                            "arguments",
+                            "metadata",
+                        ],
+                        ExtensionScope::ToolCall,
+                    ),
                 },
             }),
             Some("function_call_output") => output.push(ContentItem::ToolResult {
@@ -195,7 +234,16 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                 .and_then(Value::as_object)
                 .and_then(|details| details.get("reasoning_tokens"))
                 .and_then(Value::as_u64),
-            extensions: Vec::new(),
+            extensions: usage_extensions(
+                usage,
+                &[
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "input_tokens_details",
+                    "output_tokens_details",
+                ],
+            ),
         })
         .unwrap_or_default();
     let status = object
@@ -261,6 +309,21 @@ fn extensions(
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
             crate::ir::Extension::scoped_opaque("openai.responses", key, value.clone(), scope)
+        })
+        .collect()
+}
+
+fn usage_extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| {
+            crate::ir::Extension::scoped_opaque(
+                "openai.responses",
+                key,
+                value.clone(),
+                ExtensionScope::Usage,
+            )
         })
         .collect()
 }

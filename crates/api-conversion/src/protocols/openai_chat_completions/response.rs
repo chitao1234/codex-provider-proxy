@@ -92,27 +92,20 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         arguments,
                         status: Some("completed".to_owned()),
                         metadata: tool
-                            .as_object()
-                            .map(|tool| {
-                                extensions(
-                                    tool,
-                                    &["id", "type", "function"],
-                                    ExtensionScope::ToolCall,
-                                )
-                            })
+                            .get("metadata")
+                            .and_then(Value::as_object)
+                            .cloned()
                             .unwrap_or_default()
                             .into_iter()
-                            .map(|extension| (extension.key, extension.value))
                             .collect(),
-                        function_metadata: extensions(
-                            function,
-                            &["name", "arguments"],
-                            ExtensionScope::ToolCall,
-                        )
-                        .into_iter()
-                        .map(|extension| (extension.key, extension.value))
-                        .collect(),
-                        extensions: Vec::new(),
+                        function_metadata: function
+                            .get("metadata")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                        extensions: tool_extensions(tool, function),
                     },
                 });
             }
@@ -255,5 +248,24 @@ fn extensions(
                 scope,
             )
         })
+        .collect()
+}
+
+fn tool_extensions(tool: &Value, function: &Map<String, Value>) -> Vec<crate::ir::Extension> {
+    tool.as_object()
+        .map(|tool| {
+            extensions(
+                tool,
+                &["id", "type", "function", "metadata"],
+                ExtensionScope::ToolCall,
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .chain(extensions(
+            function,
+            &["name", "arguments", "metadata"],
+            ExtensionScope::ToolFunction,
+        ))
         .collect()
 }
