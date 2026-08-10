@@ -857,6 +857,7 @@ pin_project! {
         max_bytes: usize,
         pipeline: ResponsePipeline,
         recorder: Option<ResponseRecorder>,
+        core_response: ResponseAccumulator,
         buffered: BytesMut,
         result: Option<Result<Bytes, std::io::Error>>,
         finished: bool,
@@ -877,6 +878,7 @@ impl<S> NonStreamingConversionStream<S> {
             max_bytes,
             pipeline,
             recorder,
+            core_response: ResponseAccumulator::default(),
             buffered: BytesMut::new(),
             result: None,
             finished: false,
@@ -921,6 +923,11 @@ where
                     let buffered = std::mem::take(this.buffered).freeze();
                     *this.result = Some(
                         convert_non_streaming_response(buffered, *this.pipeline).map(|converted| {
+                            if let Some(response) = converted.response.as_ref() {
+                                for event in response.canonical_events() {
+                                    this.core_response.apply(event);
+                                }
+                            }
                             if let (Some(recorder), Some(response_id), Some(response)) = (
                                 this.recorder.as_ref(),
                                 converted.response_id.as_deref(),
