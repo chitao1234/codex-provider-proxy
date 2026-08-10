@@ -156,6 +156,7 @@ fn empty_item(kind: ItemKind, item_id: &str) -> ContentItem {
                 arguments: String::new(),
                 status: None,
                 metadata: BTreeMap::new(),
+                function_metadata: BTreeMap::new(),
                 extensions: Vec::new(),
             },
         },

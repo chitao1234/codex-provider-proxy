@@ -11,6 +11,7 @@ pub struct ToolDefinition {
     pub description: Option<String>,
     pub input_schema: Option<Value>,
     pub metadata: BTreeMap<String, Value>,
+    pub function_metadata: BTreeMap<String, Value>,
     pub extensions: Vec<Extension>,
 }
 
@@ -21,6 +22,7 @@ pub struct ToolCall {
     pub arguments: String,
     pub status: Option<String>,
     pub metadata: BTreeMap<String, Value>,
+    pub function_metadata: BTreeMap<String, Value>,
     pub extensions: Vec<Extension>,
 }
 

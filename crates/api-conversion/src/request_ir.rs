@@ -485,6 +485,71 @@ impl RequestIr {
         self.model.as_deref()
     }
 
+    pub fn to_v2(&self) -> crate::ir::RequestIr {
+        crate::ir::RequestIr {
+            model: self.model.clone(),
+            stream: self.stream,
+            instructions: self.instructions.iter().map(instruction_to_v2).collect(),
+            transcript: self
+                .transcript
+                .iter()
+                .flat_map(conversation_item_to_v2)
+                .collect(),
+            tools: self.tools.iter().map(tool_definition_to_v2).collect(),
+            tool_choice: self.tool_choice.clone(),
+            generation: crate::ir::GenerationControls {
+                temperature: self.opaque_extensions.get("temperature").cloned(),
+                top_p: self.opaque_extensions.get("top_p").cloned(),
+                max_output_tokens: self.max_output_tokens.clone(),
+                stop: self.generation.stop.clone(),
+                stop_sequences: self.generation.stop_sequences.clone(),
+                reasoning: self.generation.reasoning.clone(),
+                reasoning_effort: self.generation.reasoning_effort.clone(),
+                thinking: self.generation.thinking.clone(),
+                text: self.generation.text.clone(),
+                output_config: self.generation.output_config.clone(),
+                parallel_tool_use: self.generation.parallel_tool_use.clone(),
+                parallel_tool_calls: self.generation.parallel_tool_calls.clone(),
+            },
+            state: crate::ir::ConversationState {
+                logical_conversation_id: conversation_id(&self.context.conversation),
+                conversation: self.context.conversation.clone(),
+                source_response_id: self.context.previous_response_id.clone(),
+                target_response_ids: BTreeMap::new(),
+                identity: crate::ir::Identity {
+                    conversation_id: conversation_id(&self.context.conversation),
+                    user_id: self.context.end_user_id.clone(),
+                    session_id: represented_session_id(&self.context.represented_extensions),
+                    response_id: self.context.previous_response_id.clone(),
+                },
+                cache: crate::ir::CacheIdentity {
+                    key: self.context.cache.key.clone(),
+                    options: self.context.cache.options.clone(),
+                    retention: self.context.cache.retention.clone(),
+                    control: self.context.cache.control.clone(),
+                },
+                safety_identifier: self.context.safety_identifier.clone(),
+                metadata: self.context.metadata.clone(),
+                store: self.context.store.clone(),
+                include: self.context.include.clone(),
+                truncation: self.context.truncation.clone(),
+                extensions: self
+                    .context
+                    .represented_extensions
+                    .iter()
+                    .map(|(key, value)| represented_extension_to_v2(key, value))
+                    .collect(),
+            },
+            extensions: Vec::new(),
+            opaque: self
+                .opaque_extensions
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "temperature" | "top_p"))
+                .map(|(key, value)| opaque_extension_to_v2(key, value))
+                .collect(),
+        }
+    }
+
     fn parse_messages(&mut self, source: &Map<String, Value>) {
         if let Some(system) = source.get("system") {
             self.instructions.push(system.clone());
@@ -1678,6 +1743,261 @@ impl RequestIr {
                 }
             }
         }
+    }
+}
+
+fn instruction_to_v2(instruction: &Value) -> crate::ir::ContentItem {
+    crate::ir::ContentItem::Message {
+        role: "system".to_owned(),
+        content: value_to_content_parts(instruction),
+        extensions: Vec::new(),
+    }
+}
+
+fn conversation_item_to_v2(item: &IrConversationItem) -> Vec<crate::ir::ContentItem> {
+    match item {
+        IrConversationItem::Message(message) => message_to_v2(message),
+        IrConversationItem::Reasoning(value) => vec![crate::ir::ContentItem::Reasoning {
+            id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+            content: vec![crate::ir::ContentPart::Json(value.clone())],
+            extensions: Vec::new(),
+        }],
+        IrConversationItem::Extension { namespace, value } => {
+            vec![crate::ir::ContentItem::Unknown {
+                id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+                kind: namespace.clone(),
+                payload: value.clone(),
+                extensions: vec![crate::ir::Extension {
+                    namespace: namespace.clone(),
+                    key: "item".to_owned(),
+                    value: value.clone(),
+                    scope: crate::ir::ExtensionScope::ContentItem,
+                    source_protocol: None,
+                    provider: None,
+                    replay: crate::ir::ReplayPolicy::ReplayAsSameProtocolItem,
+                }],
+            }]
+        }
+    }
+}
+
+fn message_to_v2(message: &IrMessage) -> Vec<crate::ir::ContentItem> {
+    let message_extensions = message
+        .opaque_extensions
+        .iter()
+        .map(|(key, value)| scoped_extension_to_v2(key, value, crate::ir::ExtensionScope::Message))
+        .collect::<Vec<_>>();
+    let mut items = Vec::new();
+    for content in &message.content {
+        match content {
+            IrContent::Text { text, extensions } => {
+                items.push(crate::ir::ContentItem::Message {
+                    role: message.role.clone(),
+                    content: vec![crate::ir::ContentPart::Text(text.clone())],
+                    extensions: merge_content_extensions(&message_extensions, extensions),
+                });
+            }
+            IrContent::Refusal {
+                refusal,
+                extensions,
+            } => items.push(crate::ir::ContentItem::Refusal {
+                id: message.item_id.clone(),
+                content: vec![crate::ir::ContentPart::Refusal(refusal.clone())],
+                extensions: merge_content_extensions(&message_extensions, extensions),
+            }),
+            IrContent::Thinking {
+                id,
+                text,
+                signature,
+                extensions,
+                ..
+            } => items.push(crate::ir::ContentItem::Reasoning {
+                id: id.clone().or_else(|| message.item_id.clone()),
+                content: vec![crate::ir::ContentPart::Reasoning {
+                    text: text.clone(),
+                    signature: signature.clone(),
+                }],
+                extensions: merge_content_extensions(&message_extensions, extensions),
+            }),
+            IrContent::Image(value) => items.push(crate::ir::ContentItem::Message {
+                role: message.role.clone(),
+                content: vec![crate::ir::ContentPart::Json(value.clone())],
+                extensions: message_extensions.clone(),
+            }),
+            IrContent::ToolUse(call) => items.push(crate::ir::ContentItem::ToolUse {
+                id: call.id.clone().or_else(|| call.call_id.clone()),
+                call: tool_call_to_v2(call),
+            }),
+            IrContent::ToolResult {
+                call_id,
+                content,
+                is_error,
+                extensions,
+            } => items.push(crate::ir::ContentItem::ToolResult {
+                result: crate::ir::ToolResult {
+                    call_id: Some(call_id.clone()),
+                    content: value_to_content_parts(content),
+                    is_error: *is_error,
+                    extensions: merge_content_extensions(&message_extensions, extensions),
+                },
+            }),
+            IrContent::Raw(value) => items.push(crate::ir::ContentItem::Unknown {
+                id: message.item_id.clone(),
+                kind: value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                payload: value.clone(),
+                extensions: message_extensions.clone(),
+            }),
+        }
+    }
+    items.extend(
+        message
+            .tool_calls
+            .iter()
+            .map(|call| crate::ir::ContentItem::ToolUse {
+                id: call.id.clone().or_else(|| call.call_id.clone()),
+                call: tool_call_to_v2(call),
+            }),
+    );
+    if items.is_empty() {
+        items.push(crate::ir::ContentItem::Message {
+            role: message.role.clone(),
+            content: Vec::new(),
+            extensions: message_extensions,
+        });
+    }
+    items
+}
+
+fn merge_content_extensions(
+    message_extensions: &[crate::ir::Extension],
+    extensions: &ContentExtensions,
+) -> Vec<crate::ir::Extension> {
+    let mut merged = message_extensions.to_vec();
+    if let Some(cache_control) = &extensions.cache_control {
+        merged.push(crate::ir::Extension {
+            namespace: "cache".to_owned(),
+            key: "cache_control".to_owned(),
+            value: cache_control.clone(),
+            scope: crate::ir::ExtensionScope::ContentItem,
+            source_protocol: None,
+            provider: None,
+            replay: crate::ir::ReplayPolicy::ReplayIfSupported,
+        });
+    }
+    merged.extend(extensions.opaque.iter().map(|(key, value)| {
+        scoped_extension_to_v2(key, value, crate::ir::ExtensionScope::ContentItem)
+    }));
+    merged
+}
+
+fn tool_call_to_v2(call: &IrToolCall) -> crate::ir::ToolCall {
+    crate::ir::ToolCall {
+        id: call.id.clone().or_else(|| call.call_id.clone()),
+        name: call.name.clone(),
+        arguments: call
+            .arguments
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| call.arguments.to_string()),
+        status: call.status.clone(),
+        metadata: call.opaque_extensions.clone().into_iter().collect(),
+        function_metadata: call.function_extensions.clone().into_iter().collect(),
+        extensions: Vec::new(),
+    }
+}
+
+fn tool_definition_to_v2(tool: &IrTool) -> crate::ir::ToolDefinition {
+    crate::ir::ToolDefinition {
+        kind: tool.kind.clone(),
+        name: tool.name.clone().unwrap_or_else(|| tool.kind.clone()),
+        description: tool.description.clone(),
+        input_schema: tool.parameters.clone().or_else(|| tool.format.clone()),
+        metadata: tool.opaque_extensions.clone().into_iter().collect(),
+        function_metadata: tool.function_extensions.clone().into_iter().collect(),
+        extensions: tool
+            .opaque_definition
+            .iter()
+            .map(|value| crate::ir::Extension {
+                namespace: "protocol".to_owned(),
+                key: "opaque_definition".to_owned(),
+                value: value.clone(),
+                scope: crate::ir::ExtensionScope::ToolDefinition,
+                source_protocol: None,
+                provider: None,
+                replay: crate::ir::ReplayPolicy::ReplayIfSupported,
+            })
+            .collect(),
+    }
+}
+
+fn value_to_content_parts(value: &Value) -> Vec<crate::ir::ContentPart> {
+    match value {
+        Value::String(text) => vec![crate::ir::ContentPart::Text(text.clone())],
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| crate::ir::ContentPart::Text(text.to_owned()))
+                    .unwrap_or_else(|| crate::ir::ContentPart::Json(value.clone()))
+            })
+            .collect(),
+        _ => vec![crate::ir::ContentPart::Json(value.clone())],
+    }
+}
+
+fn conversation_id(conversation: &Option<Value>) -> Option<String> {
+    conversation.as_ref().and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+    })
+}
+
+fn represented_session_id(extensions: &BTreeMap<String, Value>) -> Option<String> {
+    extensions.iter().find_map(|(key, value)| {
+        key.to_ascii_lowercase()
+            .ends_with("session_id")
+            .then(|| value.as_str().map(str::to_owned))
+            .flatten()
+    })
+}
+
+fn represented_extension_to_v2(key: &str, value: &Value) -> crate::ir::Extension {
+    crate::ir::Extension {
+        namespace: "state".to_owned(),
+        key: key.to_owned(),
+        value: value.clone(),
+        scope: crate::ir::ExtensionScope::State,
+        source_protocol: None,
+        provider: None,
+        replay: crate::ir::ReplayPolicy::ReplayIfSupported,
+    }
+}
+
+fn opaque_extension_to_v2(key: &str, value: &Value) -> crate::ir::Extension {
+    scoped_extension_to_v2(key, value, crate::ir::ExtensionScope::Request)
+}
+
+fn scoped_extension_to_v2(
+    key: &str,
+    value: &Value,
+    scope: crate::ir::ExtensionScope,
+) -> crate::ir::Extension {
+    crate::ir::Extension {
+        namespace: "wire".to_owned(),
+        key: key.to_owned(),
+        value: value.clone(),
+        scope,
+        source_protocol: None,
+        provider: None,
+        replay: crate::ir::ReplayPolicy::ReplayAsTargetOpaque,
     }
 }
 

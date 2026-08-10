@@ -44,6 +44,7 @@ fn accumulator_reconciles_tool_arguments_and_monotonic_usage() {
             arguments: String::new(),
             status: Some("in_progress".to_owned()),
             metadata: Default::default(),
+            function_metadata: Default::default(),
             extensions: Vec::new(),
         },
     });

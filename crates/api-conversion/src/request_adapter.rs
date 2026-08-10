@@ -25,6 +25,10 @@ pub trait RequestAdapter {
         RequestIr::parse(self.protocol(), body)
     }
 
+    fn parse_v2(&self, body: &Value) -> Result<crate::ir::RequestIr, ConversionError> {
+        self.parse(body).map(|request| request.to_v2())
+    }
+
     fn parse_with_context(
         &self,
         body: &Value,
@@ -36,6 +40,16 @@ pub trait RequestAdapter {
         } else {
             self.parse(body)
         }
+    }
+
+    fn parse_v2_with_context(
+        &self,
+        body: &Value,
+        previous: Option<&RequestIr>,
+        last_reasoning: Option<&str>,
+    ) -> Result<crate::ir::RequestIr, ConversionError> {
+        self.parse_with_context(body, previous, last_reasoning)
+            .map(|request| request.to_v2())
     }
 
     fn render(
@@ -110,6 +124,14 @@ impl RequestAdapter for RequestAdapterKind {
         }
     }
 
+    fn parse_v2(&self, body: &Value) -> Result<crate::ir::RequestIr, ConversionError> {
+        match self {
+            Self::OpenAiResponses(adapter) => adapter.parse_v2(body),
+            Self::OpenAiChatCompletions(adapter) => adapter.parse_v2(body),
+            Self::AnthropicMessages(adapter) => adapter.parse_v2(body),
+        }
+    }
+
     fn parse_with_context(
         &self,
         body: &Value,
@@ -125,6 +147,25 @@ impl RequestAdapter for RequestAdapterKind {
             }
             Self::AnthropicMessages(adapter) => {
                 adapter.parse_with_context(body, previous, last_reasoning)
+            }
+        }
+    }
+
+    fn parse_v2_with_context(
+        &self,
+        body: &Value,
+        previous: Option<&RequestIr>,
+        last_reasoning: Option<&str>,
+    ) -> Result<crate::ir::RequestIr, ConversionError> {
+        match self {
+            Self::OpenAiResponses(adapter) => {
+                adapter.parse_v2_with_context(body, previous, last_reasoning)
+            }
+            Self::OpenAiChatCompletions(adapter) => {
+                adapter.parse_v2_with_context(body, previous, last_reasoning)
+            }
+            Self::AnthropicMessages(adapter) => {
+                adapter.parse_v2_with_context(body, previous, last_reasoning)
             }
         }
     }

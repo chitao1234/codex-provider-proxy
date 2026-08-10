@@ -10,10 +10,14 @@ pub struct GenerationControls {
     pub top_p: Option<Value>,
     pub max_output_tokens: Option<Value>,
     pub stop: Option<Value>,
+    pub stop_sequences: Option<Value>,
     pub reasoning: Option<Value>,
+    pub reasoning_effort: Option<Value>,
     pub thinking: Option<Value>,
-    pub response_format: Option<Value>,
-    pub parallel_tools: Option<Value>,
+    pub text: Option<Value>,
+    pub output_config: Option<Value>,
+    pub parallel_tool_use: Option<Value>,
+    pub parallel_tool_calls: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

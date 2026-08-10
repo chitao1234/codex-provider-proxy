@@ -65,3 +65,39 @@ fn adapter_dispatch_preserves_responses_continuation_context() {
     assert_eq!(rendered.body["previous_response_id"], "resp-1");
     assert_eq!(rendered.body["prompt_cache_key"], "cache-1");
 }
+
+#[test]
+fn responses_adapter_exposes_semantic_v2_request_without_messages_shape() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{\"q\":\"rust\"}"}
+            ],
+            "prompt_cache_key": "cache-1",
+            "x_client_extension": {"keep": true}
+        }))
+        .unwrap();
+
+    assert_eq!(request.model.as_deref(), Some("m"));
+    assert_eq!(request.transcript.len(), 3);
+    assert_eq!(request.state.cache.key.as_deref(), Some("cache-1"));
+    assert!(request.opaque.iter().any(|extension| {
+        extension.key == "x_client_extension" && extension.value["keep"] == true
+    }));
+    assert!(matches!(
+        request.transcript[0],
+        codex_provider_proxy_api_conversion::ir::ContentItem::Message { .. }
+    ));
+    assert!(matches!(
+        request.transcript[1],
+        codex_provider_proxy_api_conversion::ir::ContentItem::Reasoning { .. }
+    ));
+    assert!(matches!(
+        request.transcript[2],
+        codex_provider_proxy_api_conversion::ir::ContentItem::ToolUse { .. }
+    ));
+}
