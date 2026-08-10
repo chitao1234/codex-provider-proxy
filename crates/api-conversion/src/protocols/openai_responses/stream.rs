@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     error::ConversionError,
@@ -169,8 +169,14 @@ impl Parser {
             self.item_ids.insert(index, id.clone());
         }
         match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("reasoning") => self.ensure_item(&id, Some(id.clone()), ItemKind::Reasoning, out),
-            Some("message") => self.ensure_item(&id, Some(id.clone()), ItemKind::Message, out),
+            Some("reasoning") => {
+                self.ensure_item(&id, Some(id.clone()), ItemKind::Reasoning, out);
+                emit_item_extensions(&id, item, ItemKind::Reasoning, out);
+            }
+            Some("message") => {
+                self.ensure_item(&id, Some(id.clone()), ItemKind::Message, out);
+                emit_item_extensions(&id, item, ItemKind::Message, out);
+            }
             Some("function_call" | "custom_tool_call") => {
                 self.item_kinds.insert(id.clone(), ItemKind::ToolCall);
                 out.push(CanonicalResponseEvent::ToolCallStarted {
@@ -191,9 +197,15 @@ impl Parser {
                             .get("status")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned),
-                        metadata: Default::default(),
+                        metadata: item
+                            .get("metadata")
+                            .and_then(serde_json::Value::as_object)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
                         function_metadata: Default::default(),
-                        extensions: Vec::new(),
+                        extensions: item_extensions(item, ItemKind::ToolCall),
                     },
                 });
             }
@@ -225,7 +237,13 @@ impl Parser {
                 payload: item.clone(),
             });
         }
-        if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+        if let Some(kind) = self.item_kinds.get(id).copied() {
+            emit_item_extensions(id, item, kind, out);
+        }
+        if matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("function_call" | "custom_tool_call")
+        ) {
             if let Some(arguments) = item
                 .get("arguments")
                 .and_then(serde_json::Value::as_str)
@@ -329,8 +347,82 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
             .get("output_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64),
-        extensions: Vec::new(),
+        extensions: value
+            .as_object()
+            .map(|usage| {
+                scoped_extensions(
+                    usage,
+                    &[
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "input_tokens_details",
+                        "output_tokens_details",
+                    ],
+                    ExtensionScope::Usage,
+                )
+            })
+            .unwrap_or_default(),
     }
+}
+
+fn emit_item_extensions(
+    item_id: &str,
+    item: &Value,
+    kind: ItemKind,
+    out: &mut Vec<CanonicalResponseEvent>,
+) {
+    let metadata = item_extensions(item, kind);
+    if !metadata.is_empty() {
+        out.push(CanonicalResponseEvent::ItemMetadataUpdated {
+            item_id: item_id.to_owned(),
+            metadata,
+        });
+    }
+}
+
+fn item_extensions(item: &Value, kind: ItemKind) -> Vec<Extension> {
+    let Some(object) = item.as_object() else {
+        return Vec::new();
+    };
+    let (structural, scope): (&[&str], ExtensionScope) = match kind {
+        ItemKind::Message => (
+            &["type", "id", "status", "role", "content"],
+            ExtensionScope::Message,
+        ),
+        ItemKind::Reasoning => (
+            &["type", "id", "status", "summary"],
+            ExtensionScope::ContentItem,
+        ),
+        ItemKind::ToolCall => (
+            &[
+                "type",
+                "id",
+                "status",
+                "call_id",
+                "name",
+                "arguments",
+                "metadata",
+            ],
+            ExtensionScope::ToolCall,
+        ),
+        ItemKind::Refusal | ItemKind::ToolResult | ItemKind::ServerTool | ItemKind::Unknown => {
+            return Vec::new()
+        }
+    };
+    scoped_extensions(object, structural, scope)
+}
+
+fn scoped_extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| Extension::scoped_opaque("openai.responses", key, value.clone(), scope))
+        .collect()
 }
 
 fn protocol_extension(kind: &str, value: serde_json::Value) -> CanonicalResponseEvent {

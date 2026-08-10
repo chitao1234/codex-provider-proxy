@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use codex_provider_proxy_api_conversion::{
     ir::{
-        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
-        ResponseAccumulator, StopReason, ToolCall, Usage,
+        CanonicalResponseEvent, ContentItem, ContentPart, Extension, ExtensionScope, ItemKind,
+        ReplayPolicy, ResponseAccumulator, StopReason, ToolCall, Usage,
     },
-    protocols::openai_responses::stream::Renderer,
+    protocols::openai_responses::stream::{Parser, Renderer},
     sse,
 };
 use serde_json::{json, Value};
@@ -161,6 +161,89 @@ fn responses_stream_error_never_fabricates_success() {
     assert_eq!(events_of_type(&events, "error").len(), 1);
     assert!(events_of_type(&events, "response.completed").is_empty());
     assert!(events_of_type(&events, "response.done").is_empty());
+}
+
+#[test]
+fn responses_stream_parser_preserves_item_and_usage_extensions() {
+    let mut parser = Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_event(
+            "response.created",
+            &json!({"response":{"id":"resp-1","status":"in_progress"}}).to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "response.output_item.added",
+            &json!({
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                    "x_item": "early"
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "response.output_item.done",
+            &json!({
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [],
+                    "x_item": "late"
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "response.completed",
+            &json!({
+                "response": {
+                    "id": "resp-1",
+                    "status": "completed",
+                    "usage": {"input_tokens":1,"output_tokens":2,"x_usage":true}
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+
+    let mut accumulator = ResponseAccumulator::default();
+    for event in events {
+        accumulator.apply(event);
+    }
+    let snapshot = accumulator.snapshot();
+    let ContentItem::Message { extensions, .. } = &snapshot.response.output[0] else {
+        panic!("expected message item");
+    };
+    let item_extension = extensions
+        .iter()
+        .find(|extension| extension.key == "x_item")
+        .unwrap();
+    assert_eq!(item_extension.value, json!("late"));
+    assert!(snapshot
+        .response
+        .usage
+        .extensions
+        .iter()
+        .any(|extension| extension.key == "x_usage" && extension.value == json!(true)));
 }
 
 fn decode_events(chunks: &[bytes::Bytes]) -> Vec<Value> {

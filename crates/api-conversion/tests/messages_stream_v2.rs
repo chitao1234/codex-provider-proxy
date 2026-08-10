@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use codex_provider_proxy_api_conversion::{
     ir::{
-        CanonicalResponseEvent, ContentPart, ItemKind, ResponseAccumulator, StopReason, ToolCall,
-        Usage,
+        CanonicalResponseEvent, ContentItem, ContentPart, ExtensionScope, ItemKind,
+        ResponseAccumulator, StopReason, ToolCall, Usage,
     },
-    protocols::anthropic_messages::stream::Renderer,
+    protocols::anthropic_messages::stream::{Parser, Renderer},
 };
 use serde_json::json;
 
@@ -134,4 +134,96 @@ fn messages_stream_renderer_preserves_unknown_stop_reason() {
     )
     .unwrap();
     assert!(rendered.contains("\"stop_reason\":\"future_stop\""));
+}
+
+#[test]
+fn messages_stream_parser_preserves_tool_and_usage_extensions() {
+    let mut parser = Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_event(
+            "message_start",
+            &json!({
+                "message": {
+                    "id": "msg-1",
+                    "model": "m",
+                    "usage": {"input_tokens":1,"x_start":"start-meta"}
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "content_block_start",
+            &json!({
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "lookup",
+                    "input": {},
+                    "x_tool": "tool-meta"
+                }
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "content_block_delta",
+            &json!({
+                "index": 0,
+                "delta": {"type":"input_json_delta","partial_json":"{}"}
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "content_block_stop",
+            &json!({"index":0}).to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "message_delta",
+            &json!({
+                "delta": {"stop_reason":"tool_use"},
+                "usage": {"output_tokens":1,"x_usage":"usage-meta"}
+            })
+            .to_string(),
+            &mut events,
+        )
+        .unwrap();
+
+    let mut accumulator = ResponseAccumulator::default();
+    for event in events {
+        accumulator.apply(event);
+    }
+    let snapshot = accumulator.snapshot();
+    let ContentItem::ToolUse { call, .. } = &snapshot.response.output[0] else {
+        panic!("expected tool call");
+    };
+    assert!(call.extensions.iter().any(|extension| {
+        extension.scope == ExtensionScope::ToolCall
+            && extension.key == "x_tool"
+            && extension.value == json!("tool-meta")
+    }));
+    assert!(snapshot
+        .response
+        .usage
+        .extensions
+        .iter()
+        .any(|extension| extension.key == "x_start"));
+    assert!(snapshot
+        .response
+        .usage
+        .extensions
+        .iter()
+        .any(|extension| { extension.key == "x_usage" && extension.value == json!("usage-meta") }));
 }

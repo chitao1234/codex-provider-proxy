@@ -164,12 +164,22 @@ impl Parser {
                     arguments: String::new(),
                     status: Some("in_progress".to_owned()),
                     metadata: block
-                        .map(|block| opaque_fields(block, &["type", "id", "name", "input"]))
+                        .and_then(|block| block.get("metadata"))
+                        .and_then(Value::as_object)
+                        .cloned()
                         .unwrap_or_default()
                         .into_iter()
                         .collect(),
                     function_metadata: BTreeMap::new(),
-                    extensions: Vec::new(),
+                    extensions: block
+                        .map(|block| {
+                            scoped_extensions(
+                                block,
+                                &["type", "id", "name", "input", "metadata"],
+                                ExtensionScope::ToolCall,
+                            )
+                        })
+                        .unwrap_or_default(),
                 };
                 out.push(CanonicalResponseEvent::ToolCallStarted {
                     item_id: item_id.clone(),
@@ -318,6 +328,22 @@ impl Parser {
             .input_tokens
             .zip(self.usage.output_tokens)
             .map(|(input, output)| input + output);
+        if let Some(usage) = object {
+            merge_extensions(
+                &mut self.usage.extensions,
+                scoped_extensions(
+                    usage,
+                    &[
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                        "output_tokens_details",
+                    ],
+                    ExtensionScope::Usage,
+                ),
+            );
+        }
         out.push(CanonicalResponseEvent::UsageUpdated(self.usage.clone()));
     }
 }
@@ -338,12 +364,32 @@ fn map_stop_reason(reason: &str) -> StopReason {
     }
 }
 
-fn opaque_fields(object: &Map<String, Value>, structural: &[&str]) -> Map<String, Value> {
+fn scoped_extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<Extension> {
     object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| {
+            Extension::scoped_opaque("anthropic.messages", key, value.clone(), scope)
+        })
         .collect()
+}
+
+fn merge_extensions(current: &mut Vec<Extension>, updates: Vec<Extension>) {
+    for extension in updates {
+        if let Some(existing) = current.iter_mut().find(|existing| {
+            existing.namespace == extension.namespace
+                && existing.key == extension.key
+                && existing.scope == extension.scope
+        }) {
+            *existing = extension;
+        } else {
+            current.push(extension);
+        }
+    }
 }
 
 fn protocol_extension(kind: &str, value: Value) -> CanonicalResponseEvent {

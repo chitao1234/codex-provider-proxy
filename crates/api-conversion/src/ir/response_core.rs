@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::{
     content::ContentItem,
+    extension::Extension,
     response::{ResponseIr, Usage},
     state::ConversationState,
     streaming::{CanonicalResponseEvent, CoreUpdate, ItemKind, ResponseSnapshot},
@@ -67,9 +68,9 @@ impl ResponseAccumulator {
             }
             CanonicalResponseEvent::ItemMetadataUpdated { item_id, metadata } => {
                 if let Some(item) = self.item_mut(item_id) {
-                    item_extensions_mut(item).extend(metadata.clone());
+                    merge_extensions(item_extensions_mut(item), metadata);
                 } else {
-                    self.response.extensions.extend(metadata.clone());
+                    merge_extensions(&mut self.response.extensions, metadata);
                 }
             }
             CanonicalResponseEvent::ContentDelta { item_id, content } => {
@@ -310,6 +311,20 @@ fn merge_usage(current: &mut Usage, update: &Usage) {
         }
     }
     current.normalize();
+}
+
+fn merge_extensions(current: &mut Vec<Extension>, updates: &[Extension]) {
+    for extension in updates {
+        if let Some(existing) = current.iter_mut().find(|existing| {
+            existing.namespace == extension.namespace
+                && existing.key == extension.key
+                && existing.scope == extension.scope
+        }) {
+            *existing = extension.clone();
+        } else {
+            current.push(extension.clone());
+        }
+    }
 }
 
 fn max_option(current: Option<u64>, update: Option<u64>) -> Option<u64> {
