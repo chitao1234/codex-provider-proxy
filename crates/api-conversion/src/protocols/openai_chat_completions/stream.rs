@@ -164,6 +164,7 @@ impl Parser {
                 self.message_started = true;
                 out.push(CanonicalResponseEvent::ItemStarted {
                     item_id: "message".into(),
+                    provider_id: None,
                     item: ItemKind::Message,
                 });
             }
@@ -177,6 +178,7 @@ impl Parser {
                 self.reasoning_started = true;
                 out.push(CanonicalResponseEvent::ItemStarted {
                     item_id: "reasoning".into(),
+                    provider_id: None,
                     item: ItemKind::Reasoning,
                 });
             }
@@ -193,6 +195,7 @@ impl Parser {
                 self.refusal_started = true;
                 out.push(CanonicalResponseEvent::ItemStarted {
                     item_id: "refusal".into(),
+                    provider_id: None,
                     item: ItemKind::Refusal,
                 });
             }
@@ -229,6 +232,7 @@ impl Parser {
             if state.id.is_some() && state.name.is_some() && state.emitted == 0 {
                 out.push(CanonicalResponseEvent::ToolCallStarted {
                     item_id: format!("tool:{index}"),
+                    provider_id: None,
                     call: ToolCall {
                         id: state.id.clone(),
                         name: state.name.clone().unwrap_or_default(),

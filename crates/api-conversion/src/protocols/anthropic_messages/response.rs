@@ -27,6 +27,10 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
         };
         match block_object.get("type").and_then(Value::as_str) {
             Some("text") => output.push(ContentItem::Message {
+                id: block_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 role: "assistant".into(),
                 content: vec![ContentPart::Text(
                     block_object

@@ -24,6 +24,7 @@ pub enum ContentPart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContentItem {
     Message {
+        id: Option<String>,
         role: String,
         content: Vec<ContentPart>,
         extensions: Vec<Extension>,

@@ -14,6 +14,7 @@ fn responses_renderer_consumes_v2_without_chat_shape() {
         response_id: Some("resp-1".into()),
         model: Some("m".into()),
         output: vec![ContentItem::Message {
+            id: Some("msg-1".into()),
             role: "assistant".into(),
             content: vec![ContentPart::Text("ok".into())],
             extensions: vec![],

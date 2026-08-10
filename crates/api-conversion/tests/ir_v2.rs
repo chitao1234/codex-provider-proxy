@@ -34,10 +34,12 @@ fn accumulator_reconciles_tool_arguments_and_monotonic_usage() {
     let mut accumulator = ResponseAccumulator::default();
     accumulator.apply(CanonicalResponseEvent::ItemStarted {
         item_id: "call-1".to_owned(),
+        provider_id: Some("call-1".to_owned()),
         item: ItemKind::ToolCall,
     });
     accumulator.apply(CanonicalResponseEvent::ToolCallStarted {
         item_id: "call-1".to_owned(),
+        provider_id: Some("call-1".to_owned()),
         call: ToolCall {
             id: Some("call-1".to_owned()),
             name: "lookup".to_owned(),
@@ -125,6 +127,7 @@ fn content_delta_preserves_non_text_content() {
     let mut accumulator = ResponseAccumulator::default();
     accumulator.apply(CanonicalResponseEvent::ItemStarted {
         item_id: "message-1".to_owned(),
+        provider_id: Some("message-1".to_owned()),
         item: ItemKind::Message,
     });
     accumulator.apply(CanonicalResponseEvent::ContentDelta {

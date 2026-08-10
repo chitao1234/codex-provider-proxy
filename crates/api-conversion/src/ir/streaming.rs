@@ -11,6 +11,7 @@ pub enum CanonicalResponseEvent {
     },
     ItemStarted {
         item_id: String,
+        provider_id: Option<String>,
         item: ItemKind,
     },
     OpaqueItemStarted {
@@ -28,6 +29,7 @@ pub enum CanonicalResponseEvent {
     },
     ToolCallStarted {
         item_id: String,
+        provider_id: Option<String>,
         call: ToolCall,
     },
     ToolArgumentsDelta {

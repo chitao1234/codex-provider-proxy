@@ -69,6 +69,10 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     }
                 }
                 output.push(ContentItem::Message {
+                    id: item_object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     role,
                     content,
                     extensions: extensions(

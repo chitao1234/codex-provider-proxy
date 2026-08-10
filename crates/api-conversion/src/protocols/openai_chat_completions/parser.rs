@@ -29,6 +29,7 @@ fn parse_message(value: &Value) -> Vec<ContentItem> {
         .unwrap_or("user")
         .to_owned();
     let mut items = vec![ContentItem::Message {
+        id: object.get("id").and_then(Value::as_str).map(str::to_owned),
         role,
         content: parse_parts(object.get("content").unwrap_or(&Value::Null)),
         extensions: Vec::new(),

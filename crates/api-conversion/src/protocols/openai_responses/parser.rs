@@ -13,6 +13,7 @@ pub fn parse(body: &Value) -> Result<RequestIr, ConversionError> {
         .get("instructions")
         .map(|value| {
             vec![ContentItem::Message {
+                id: None,
                 role: "system".to_owned(),
                 content: parse_parts(value),
                 extensions: Vec::new(),
@@ -28,6 +29,7 @@ pub fn parse(body: &Value) -> Result<RequestIr, ConversionError> {
 fn parse_input(input: &Value) -> Vec<ContentItem> {
     if let Some(text) = input.as_str() {
         return vec![ContentItem::Message {
+            id: None,
             role: "user".to_owned(),
             content: vec![ContentPart::Text(text.to_owned())],
             extensions: Vec::new(),
@@ -52,6 +54,7 @@ fn parse_item(value: &Value) -> Vec<ContentItem> {
     };
     match object.get("type").and_then(Value::as_str) {
         Some("message") => vec![ContentItem::Message {
+            id: object.get("id").and_then(Value::as_str).map(str::to_owned),
             role: object
                 .get("role")
                 .and_then(Value::as_str)

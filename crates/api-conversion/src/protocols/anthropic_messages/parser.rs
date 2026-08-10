@@ -13,6 +13,7 @@ pub fn parse(body: &Value) -> Result<RequestIr, ConversionError> {
         .get("system")
         .map(|value| {
             vec![ContentItem::Message {
+                id: None,
                 role: "system".to_owned(),
                 content: parse_parts(value),
                 extensions: Vec::new(),
@@ -52,6 +53,7 @@ fn parse_message(value: &Value) -> Vec<ContentItem> {
                 extensions: Vec::new(),
             },
             part => ContentItem::Message {
+                id: None,
                 role: role.clone(),
                 content: vec![part],
                 extensions: Vec::new(),

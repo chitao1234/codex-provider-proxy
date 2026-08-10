@@ -40,6 +40,7 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
         }
         if !content.is_empty() {
             output.push(ContentItem::Message {
+                id: None,
                 role,
                 content,
                 extensions: extensions(

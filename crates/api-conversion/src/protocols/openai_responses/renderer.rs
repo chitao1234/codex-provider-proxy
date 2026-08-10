@@ -49,7 +49,7 @@ pub fn render(response: &ResponseIr) -> Value {
     Value::Object(object)
 }
 
-fn render_usage(usage: &crate::ir::Usage) -> Value {
+pub(crate) fn render_usage(usage: &crate::ir::Usage) -> Value {
     let mut rendered = json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -72,10 +72,12 @@ fn render_usage(usage: &crate::ir::Usage) -> Value {
     rendered
 }
 
-fn render_item(index: usize, item: &ContentItem) -> Value {
+pub(crate) fn render_item(index: usize, item: &ContentItem) -> Value {
     let mut rendered = match item {
-        ContentItem::Message { role, content, .. } => {
-            json!({"id": format!("msg_{index}"), "type": "message", "status": "completed", "role": role, "content": content.iter().filter_map(render_content).collect::<Vec<_>>() })
+        ContentItem::Message {
+            id, role, content, ..
+        } => {
+            json!({"id": id.clone().unwrap_or_else(|| format!("msg_{index}")), "type": "message", "status": "completed", "role": role, "content": content.iter().filter_map(render_content).collect::<Vec<_>>() })
         }
         ContentItem::Reasoning { id, content, .. } => {
             json!({"id": id.clone().unwrap_or_else(|| format!("rs_{index}")), "type": "reasoning", "status": "completed", "summary": content.iter().filter_map(|part| match part { ContentPart::Reasoning { text, .. } => Some(json!({"type":"summary_text","text":text})), ContentPart::Text(text) => Some(json!({"type":"summary_text","text":text})), _ => None }).collect::<Vec<_>>() })
@@ -97,9 +99,9 @@ fn render_item(index: usize, item: &ContentItem) -> Value {
         } => {
             let mut value = payload.clone();
             if let Some(object) = value.as_object_mut() {
-                object
-                    .entry("id")
-                    .or_insert_with(|| id.clone().map_or(Value::Null, Value::String));
+                object.entry("id").or_insert_with(|| {
+                    Value::String(id.clone().unwrap_or_else(|| format!("item_{index}")))
+                });
                 object
                     .entry("type")
                     .or_insert_with(|| Value::String(kind.clone()));

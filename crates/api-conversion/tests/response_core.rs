@@ -12,6 +12,7 @@ fn shared_core_accumulates_stream_semantics() {
         },
         CanonicalResponseEvent::ItemStarted {
             item_id: "message".to_owned(),
+            provider_id: None,
             item: ItemKind::Message,
         },
         CanonicalResponseEvent::ContentDelta {
@@ -20,6 +21,7 @@ fn shared_core_accumulates_stream_semantics() {
         },
         CanonicalResponseEvent::ToolCallStarted {
             item_id: "tool-0".to_owned(),
+            provider_id: None,
             call: ToolCall {
                 id: Some("call-1".to_owned()),
                 name: "lookup".to_owned(),
@@ -48,4 +50,26 @@ fn shared_core_accumulates_stream_semantics() {
     assert_eq!(snapshot.response.response_id.as_deref(), Some("resp-1"));
     assert_eq!(snapshot.response.output.len(), 2);
     assert_eq!(snapshot.response.stop_reason, Some(StopReason::ToolUse));
+}
+
+#[test]
+fn provider_item_id_can_arrive_after_content() {
+    let mut accumulator = ResponseAccumulator::default();
+    accumulator.apply(CanonicalResponseEvent::ContentDelta {
+        item_id: "message".to_owned(),
+        content: ContentPart::Text("hello".to_owned()),
+    });
+    accumulator.apply(CanonicalResponseEvent::ItemStarted {
+        item_id: "message".to_owned(),
+        provider_id: Some("msg-provider".to_owned()),
+        item: ItemKind::Message,
+    });
+
+    assert!(matches!(
+        accumulator.response().output.first(),
+        Some(codex_provider_proxy_api_conversion::ir::ContentItem::Message {
+            id: Some(id),
+            ..
+        }) if id == "msg-provider"
+    ));
 }

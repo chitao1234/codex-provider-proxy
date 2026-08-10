@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     error::ConversionError,
     ir::{
-        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
-        StopReason, ToolCall, Usage,
+        CanonicalResponseEvent, ContentPart, CoreUpdate, Extension, ExtensionScope, ItemKind,
+        ReplayPolicy, StopReason, ToolCall, Usage,
     },
     sse,
 };
@@ -56,10 +56,11 @@ impl Parser {
             "response.refusal.delta" => self.content_delta(&data, "delta", true, out),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 if let Some(text) = data.get("delta").and_then(serde_json::Value::as_str) {
-                    let item_id = self
-                        .event_item_id(&data)
+                    let provider_id = self.event_item_id(&data);
+                    let item_id = provider_id
+                        .clone()
                         .unwrap_or_else(|| "reasoning".to_owned());
-                    self.ensure_item(&item_id, ItemKind::Reasoning, out);
+                    self.ensure_item(&item_id, provider_id, ItemKind::Reasoning, out);
                     out.push(CanonicalResponseEvent::ContentDelta {
                         item_id,
                         content: ContentPart::Reasoning {
@@ -168,12 +169,13 @@ impl Parser {
             self.item_ids.insert(index, id.clone());
         }
         match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("reasoning") => self.ensure_item(&id, ItemKind::Reasoning, out),
-            Some("message") => self.ensure_item(&id, ItemKind::Message, out),
+            Some("reasoning") => self.ensure_item(&id, Some(id.clone()), ItemKind::Reasoning, out),
+            Some("message") => self.ensure_item(&id, Some(id.clone()), ItemKind::Message, out),
             Some("function_call" | "custom_tool_call") => {
                 self.item_kinds.insert(id.clone(), ItemKind::ToolCall);
                 out.push(CanonicalResponseEvent::ToolCallStarted {
-                    item_id: id,
+                    item_id: id.clone(),
+                    provider_id: Some(id),
                     call: ToolCall {
                         id: item
                             .get("call_id")
@@ -245,7 +247,8 @@ impl Parser {
         out: &mut Vec<CanonicalResponseEvent>,
     ) {
         if let Some(text) = data.get(field).and_then(serde_json::Value::as_str) {
-            let item_id = self.event_item_id(data).unwrap_or_else(|| {
+            let provider_id = self.event_item_id(data);
+            let item_id = provider_id.clone().unwrap_or_else(|| {
                 if refusal {
                     "refusal".to_owned()
                 } else {
@@ -254,6 +257,7 @@ impl Parser {
             });
             self.ensure_item(
                 &item_id,
+                provider_id,
                 if refusal {
                     ItemKind::Refusal
                 } else {
@@ -275,12 +279,14 @@ impl Parser {
     fn ensure_item(
         &mut self,
         item_id: &str,
+        provider_id: Option<String>,
         kind: ItemKind,
         out: &mut Vec<CanonicalResponseEvent>,
     ) {
         if self.item_kinds.insert(item_id.to_owned(), kind).is_none() {
             out.push(CanonicalResponseEvent::ItemStarted {
                 item_id: item_id.to_owned(),
+                provider_id,
                 item: kind,
             });
         }
@@ -339,12 +345,18 @@ fn protocol_extension(kind: &str, value: serde_json::Value) -> CanonicalResponse
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RenderedItem {
+    index: usize,
+    completed: bool,
+}
+
 #[derive(Default)]
 pub struct Renderer {
     response_id: Option<String>,
     model: Option<String>,
     next_index: usize,
-    items: std::collections::BTreeMap<String, usize>,
+    items: std::collections::BTreeMap<String, RenderedItem>,
     finished: bool,
 }
 
@@ -355,10 +367,11 @@ impl Renderer {
     pub fn response_id(&self) -> Option<&str> {
         self.response_id.as_deref()
     }
-    pub fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
+    pub fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
         if self.finished {
             return;
         }
+        let event = &update.event;
         match event {
             CanonicalResponseEvent::StreamStarted { response_id, model } => {
                 self.response_id = response_id.as_deref().map(synth_response_id);
@@ -375,62 +388,65 @@ impl Renderer {
                     out,
                 );
             }
-            CanonicalResponseEvent::ItemStarted { item_id, item } => {
-                if self.items.contains_key(item_id) {
-                    return;
-                }
-                let index = self.next_index;
-                self.next_index += 1;
-                self.items.insert(item_id.clone(), index);
-                let (kind, payload) = match item {
-                    ItemKind::Reasoning => (
-                        "reasoning",
-                        json!({"id":item_id,"type":"reasoning","status":"in_progress","summary":[]}),
-                    ),
-                    ItemKind::ToolCall => (
-                        "function_call",
-                        json!({"id":item_id,"type":"function_call","status":"in_progress","call_id":item_id,"name":"","arguments":""}),
-                    ),
-                    ItemKind::Refusal | ItemKind::Message => (
-                        "message",
-                        json!({"id":item_id,"type":"message","status":"in_progress","role":"assistant","content":[]}),
-                    ),
-                    _ => (
-                        "unknown",
-                        json!({"id":item_id,"type":"unknown","status":"in_progress"}),
-                    ),
-                };
-                self.emit("response.output_item.added", json!({"type":"response.output_item.added","output_index":index,"item":payload}), out);
-                let _ = kind;
+            CanonicalResponseEvent::ItemStarted { item_id, item, .. } => {
+                let _ = item;
+                self.add_item(item_id, update, out);
             }
-            CanonicalResponseEvent::OpaqueItemStarted { .. } => {}
+            CanonicalResponseEvent::OpaqueItemStarted { item_id, .. } => {
+                self.add_item(item_id, update, out);
+            }
             CanonicalResponseEvent::ContentDelta { item_id, content } => {
-                let Some(index) = self.items.get(item_id).copied() else {
+                let Some(index) = self.items.get(item_id).map(|item| item.index) else {
                     return;
                 };
-                match content { ContentPart::Text(delta) => self.emit("response.output_text.delta", json!({"type":"response.output_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":delta}), out), ContentPart::Refusal(delta) => self.emit("response.refusal.delta", json!({"type":"response.refusal.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":delta}), out), ContentPart::Reasoning { text, .. } => self.emit("response.reasoning_text.delta", json!({"type":"response.reasoning_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":text}), out), _ => {} }
-            }
-            CanonicalResponseEvent::ToolCallStarted { item_id, call } => {
-                self.on_event(
-                    &CanonicalResponseEvent::ItemStarted {
-                        item_id: item_id.clone(),
-                        item: ItemKind::ToolCall,
-                    },
-                    out,
-                );
-                if let Some(index) = self.items.get(item_id).copied() {
-                    self.emit("response.function_call_arguments.delta", json!({"type":"response.function_call_arguments.delta","item_id":item_id,"output_index":index,"delta":""}), out);
-                    let _ = call;
+                match content {
+                    ContentPart::Text(delta) => self.emit(
+                        "response.output_text.delta",
+                        json!({"type":"response.output_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":delta}),
+                        out,
+                    ),
+                    ContentPart::Refusal(delta) => self.emit(
+                        "response.refusal.delta",
+                        json!({"type":"response.refusal.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":delta}),
+                        out,
+                    ),
+                    ContentPart::Reasoning { text, .. } => self.emit(
+                        "response.reasoning_text.delta",
+                        json!({"type":"response.reasoning_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":text}),
+                        out,
+                    ),
+                    ContentPart::Image { .. } | ContentPart::Json(_) => {}
                 }
+            }
+            CanonicalResponseEvent::ToolCallStarted { item_id, .. } => {
+                self.add_item(item_id, update, out);
             }
             CanonicalResponseEvent::ToolArgumentsDelta { item_id, arguments } => {
-                if let Some(index) = self.items.get(item_id).copied() {
+                if let Some(index) = self.items.get(item_id).map(|item| item.index) {
                     self.emit("response.function_call_arguments.delta", json!({"type":"response.function_call_arguments.delta","item_id":item_id,"output_index":index,"delta":arguments}), out);
                 }
             }
-            CanonicalResponseEvent::ResponseCompleted { stop_reason, .. } => {
+            CanonicalResponseEvent::ItemCompleted { item_id } => {
+                self.complete_item(item_id, update, out);
+            }
+            CanonicalResponseEvent::ResponseCompleted {
+                stop_reason,
+                original_reason,
+            } => {
+                self.complete_all(update, out);
                 self.finished = true;
-                self.emit("response.completed", json!({"type":"response.completed","response":{"id":self.response_id,"object":"response","model":self.model,"status":"completed","output":[],"stop_reason":stop_reason_name(stop_reason)}}), out);
+                let mut response = super::renderer::render(&update.snapshot);
+                if let Some(object) = response.as_object_mut() {
+                    object.insert(
+                        "stop_reason".to_owned(),
+                        Value::String(render_stop_reason(stop_reason, original_reason.as_deref())),
+                    );
+                }
+                self.emit(
+                    "response.completed",
+                    json!({"type":"response.completed","response":response}),
+                    out,
+                );
                 self.emit("response.done", json!({"type":"response.done"}), out);
             }
             CanonicalResponseEvent::StreamError { message, code } => {
@@ -443,11 +459,67 @@ impl Renderer {
             }
             CanonicalResponseEvent::UsageUpdated(_)
             | CanonicalResponseEvent::ItemMetadataUpdated { .. }
-            | CanonicalResponseEvent::ItemCompleted { .. }
             | CanonicalResponseEvent::ProtocolExtension(_) => {}
         }
     }
+
     pub fn finish(&mut self, _out: &mut Vec<Bytes>) {}
+
+    fn add_item(&mut self, item_id: &str, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        if self.items.contains_key(item_id) {
+            return;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.items.insert(
+            item_id.to_owned(),
+            RenderedItem {
+                index,
+                completed: false,
+            },
+        );
+        let Some(item) = update.snapshot.output.get(index) else {
+            return;
+        };
+        let payload = render_stream_item(index, item_id, item, "in_progress");
+        self.emit(
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","output_index":index,"item":payload}),
+            out,
+        );
+    }
+
+    fn complete_item(&mut self, item_id: &str, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        let Some(rendered) = self.items.get_mut(item_id) else {
+            return;
+        };
+        if rendered.completed {
+            return;
+        }
+        rendered.completed = true;
+        let index = rendered.index;
+        let Some(item) = update.snapshot.output.get(index) else {
+            return;
+        };
+        let payload = render_stream_item(index, item_id, item, "completed");
+        self.emit(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":index,"item":payload}),
+            out,
+        );
+    }
+
+    fn complete_all(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        let pending = self
+            .items
+            .iter()
+            .filter_map(|(item_id, item)| (!item.completed).then_some(item_id.clone()))
+            .collect::<Vec<_>>();
+        for item_id in pending {
+            self.complete_item(&item_id, update, out);
+        }
+    }
+
     fn emit(&self, kind: &str, data: serde_json::Value, out: &mut Vec<Bytes>) {
         out.push(sse::encode_sse_event(kind, &data));
     }
@@ -459,12 +531,33 @@ fn synth_response_id(upstream_id: &str) -> String {
         format!("resp_{upstream_id}")
     }
 }
-fn stop_reason_name(reason: &StopReason) -> &'static str {
+fn render_stream_item(
+    index: usize,
+    item_id: &str,
+    item: &crate::ir::ContentItem,
+    status: &str,
+) -> Value {
+    let mut payload = super::renderer::render_item(index, item);
+    if !payload.is_object() {
+        payload = json!({"id":item_id,"type":"unknown","payload":payload});
+    }
+    if let Some(object) = payload.as_object_mut() {
+        if object.get("id").is_none_or(Value::is_null) {
+            object.insert("id".to_owned(), Value::String(item_id.to_owned()));
+        }
+        object.insert("status".to_owned(), Value::String(status.to_owned()));
+    }
+    payload
+}
+
+fn render_stop_reason(reason: &StopReason, original_reason: Option<&str>) -> String {
     match reason {
-        StopReason::Natural => "stop",
-        StopReason::ToolUse => "tool_calls",
-        StopReason::MaxTokens => "length",
-        StopReason::ContentFilter => "content_filter",
-        _ => "other",
+        StopReason::Natural => "stop".to_owned(),
+        StopReason::ToolUse => "tool_calls".to_owned(),
+        StopReason::MaxTokens => "length".to_owned(),
+        StopReason::ContentFilter => "content_filter".to_owned(),
+        StopReason::Cancelled => "cancelled".to_owned(),
+        StopReason::Error => "error".to_owned(),
+        StopReason::Unknown(reason) => original_reason.unwrap_or(reason).to_owned(),
     }
 }

@@ -1,8 +1,8 @@
 use crate::{
     error::ConversionError,
     ir::{
-        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
-        StopReason, ToolCall, Usage,
+        CanonicalResponseEvent, ContentPart, CoreUpdate, Extension, ExtensionScope, ItemKind,
+        ReplayPolicy, StopReason, ToolCall, Usage,
     },
     sse,
 };
@@ -119,10 +119,15 @@ impl Parser {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{block_type}:{index}"));
+        let provider_id = block
+            .and_then(|block| block.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let kind = match block_type {
             "text" => {
                 out.push(CanonicalResponseEvent::ItemStarted {
                     item_id: item_id.clone(),
+                    provider_id: provider_id.clone(),
                     item: ItemKind::Message,
                 });
                 if let Some(text) = block
@@ -140,6 +145,7 @@ impl Parser {
             "thinking" => {
                 out.push(CanonicalResponseEvent::ItemStarted {
                     item_id: item_id.clone(),
+                    provider_id,
                     item: ItemKind::Reasoning,
                 });
                 BlockKind::Reasoning
@@ -167,6 +173,7 @@ impl Parser {
                 };
                 out.push(CanonicalResponseEvent::ToolCallStarted {
                     item_id: item_id.clone(),
+                    provider_id: provider_id.clone(),
                     call,
                 });
                 BlockKind::Tool
@@ -351,35 +358,268 @@ fn protocol_extension(kind: &str, value: Value) -> CanonicalResponseEvent {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RenderedBlock {
+    index: usize,
+    open: bool,
+}
+
 #[derive(Default)]
 pub struct Renderer {
     started: bool,
     finished: bool,
     message_id: Option<String>,
+    model: Option<String>,
+    next_index: usize,
+    blocks: BTreeMap<String, RenderedBlock>,
+    usage: Usage,
 }
+
 impl Renderer {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
+
+    pub fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
         if self.finished {
             return;
         }
+        let event = &update.event;
         match event {
-  CanonicalResponseEvent::StreamStarted { response_id, model } => { self.started=true; self.message_id = response_id.as_deref().map(synth_message_id); self.emit("message_start", json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"usage":{}}}), out); }
-  CanonicalResponseEvent::ItemStarted { item_id, item } => { let (index, block)=match item { ItemKind::Reasoning=>(0,json!({"type":"thinking","thinking":"","signature":null})), ItemKind::ToolCall=>(0,json!({"type":"tool_use","id":item_id,"name":"","input":{}})), _=>(0,json!({"type":"text","text":""})) }; self.emit("content_block_start", json!({"type":"content_block_start","index":index,"content_block":block}), out); }
-  CanonicalResponseEvent::OpaqueItemStarted { .. } => {}
-  CanonicalResponseEvent::ContentDelta { content, .. } => { let (kind,delta)=match content { ContentPart::Reasoning{text,..}=>("thinking_delta",json!({"type":"thinking_delta","thinking":text})), ContentPart::Text(text)=>("text_delta",json!({"type":"text_delta","text":text})), ContentPart::Refusal(text)=>("text_delta",json!({"type":"text_delta","text":text})), _=>return }; self.emit("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":delta}), out); let _=kind; }
-  CanonicalResponseEvent::ToolArgumentsDelta { arguments, .. } => self.emit("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":arguments}}), out),
-  CanonicalResponseEvent::ResponseCompleted { stop_reason, .. } => { self.finished=true; self.emit("message_delta", json!({"type":"message_delta","delta":{"stop_reason":anthropic_reason(stop_reason)},"usage":{}}), out); self.emit("message_stop", json!({"type":"message_stop"}), out); }
-  CanonicalResponseEvent::StreamError { message, .. } => { self.finished=true; self.emit("error", json!({"type":"error","error":{"type":"api_error","message":message}}), out); }
-  CanonicalResponseEvent::UsageUpdated(_) | CanonicalResponseEvent::ItemMetadataUpdated { .. } | CanonicalResponseEvent::ItemCompleted { .. } | CanonicalResponseEvent::ToolCallStarted { .. } | CanonicalResponseEvent::ProtocolExtension(_) => {}
- }
+            CanonicalResponseEvent::StreamStarted { response_id, model } => {
+                self.message_id = response_id.as_deref().map(synth_message_id);
+                self.model.clone_from(model);
+            }
+            CanonicalResponseEvent::ItemStarted { item_id, item, .. } => {
+                if *item != ItemKind::ToolCall {
+                    self.start_block(item_id, empty_block(*item, item_id), out);
+                }
+            }
+            CanonicalResponseEvent::OpaqueItemStarted {
+                item_id,
+                kind,
+                payload,
+            } => {
+                self.start_block(item_id, opaque_block(item_id, kind, payload), out);
+            }
+            CanonicalResponseEvent::ContentDelta { item_id, content } => {
+                let index = self.ensure_block(item_id, content_block(content), out);
+                let Some(delta) = content_delta(content) else {
+                    return;
+                };
+                self.emit(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":index,"delta":delta}),
+                    out,
+                );
+            }
+            CanonicalResponseEvent::ToolCallStarted { item_id, call, .. } => {
+                let mut block = json!({
+                    "type":"tool_use",
+                    "id":call.id.as_deref().unwrap_or(item_id),
+                    "name":call.name,
+                    "input":{},
+                });
+                if let Some(object) = block.as_object_mut() {
+                    for (key, value) in call.metadata.iter().chain(&call.function_metadata) {
+                        object.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+                let index = self.ensure_block(item_id, block, out);
+                if !call.arguments.is_empty() {
+                    self.emit_tool_arguments(index, &call.arguments, out);
+                }
+            }
+            CanonicalResponseEvent::ToolArgumentsDelta { item_id, arguments } => {
+                let index = self.ensure_block(
+                    item_id,
+                    json!({"type":"tool_use","id":item_id,"name":"","input":{}}),
+                    out,
+                );
+                self.emit_tool_arguments(index, arguments, out);
+            }
+            CanonicalResponseEvent::UsageUpdated(_) => self.usage = update.snapshot.usage.clone(),
+            CanonicalResponseEvent::ItemCompleted { item_id } => self.close_block(item_id, out),
+            CanonicalResponseEvent::ResponseCompleted {
+                stop_reason,
+                original_reason,
+            } => {
+                self.ensure_started(out);
+                self.close_all(out);
+                self.finished = true;
+                self.emit(
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":anthropic_reason(stop_reason, original_reason.as_deref())},
+                        "usage":render_usage(&self.usage),
+                    }),
+                    out,
+                );
+                self.emit("message_stop", json!({"type":"message_stop"}), out);
+            }
+            CanonicalResponseEvent::StreamError { message, code } => {
+                self.finished = true;
+                self.emit(
+                    "error",
+                    json!({"type":"error","error":{"type":code.as_deref().unwrap_or("api_error"),"message":message}}),
+                    out,
+                );
+            }
+            CanonicalResponseEvent::ItemMetadataUpdated { .. }
+            | CanonicalResponseEvent::ProtocolExtension(_) => {}
+        }
     }
+
     pub fn finish(&mut self, _: &mut Vec<Bytes>) {}
-    fn emit(&self, kind: &str, data: serde_json::Value, out: &mut Vec<Bytes>) {
+
+    fn ensure_started(&mut self, out: &mut Vec<Bytes>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.emit(
+            "message_start",
+            json!({
+                "type":"message_start",
+                "message":{
+                    "id":self.message_id,
+                    "type":"message",
+                    "role":"assistant",
+                    "model":self.model,
+                    "content":[],
+                    "stop_reason":null,
+                    "usage":render_usage(&self.usage),
+                }
+            }),
+            out,
+        );
+    }
+
+    fn ensure_block(&mut self, item_id: &str, block: Value, out: &mut Vec<Bytes>) -> usize {
+        self.blocks
+            .get(item_id)
+            .map(|block| block.index)
+            .unwrap_or_else(|| self.start_block(item_id, block, out))
+    }
+
+    fn start_block(&mut self, item_id: &str, block: Value, out: &mut Vec<Bytes>) -> usize {
+        self.ensure_started(out);
+        if let Some(rendered) = self.blocks.get(item_id) {
+            return rendered.index;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.blocks
+            .insert(item_id.to_owned(), RenderedBlock { index, open: true });
+        self.emit(
+            "content_block_start",
+            json!({"type":"content_block_start","index":index,"content_block":block}),
+            out,
+        );
+        index
+    }
+
+    fn close_block(&mut self, item_id: &str, out: &mut Vec<Bytes>) {
+        let Some(rendered) = self.blocks.get_mut(item_id) else {
+            return;
+        };
+        if !rendered.open {
+            return;
+        }
+        rendered.open = false;
+        let index = rendered.index;
+        self.emit(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+            out,
+        );
+    }
+
+    fn close_all(&mut self, out: &mut Vec<Bytes>) {
+        let open = self
+            .blocks
+            .iter()
+            .filter_map(|(item_id, block)| block.open.then_some(item_id.clone()))
+            .collect::<Vec<_>>();
+        for item_id in open {
+            self.close_block(&item_id, out);
+        }
+    }
+
+    fn emit_tool_arguments(&self, index: usize, arguments: &str, out: &mut Vec<Bytes>) {
+        self.emit(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":arguments}}),
+            out,
+        );
+    }
+
+    fn emit(&self, kind: &str, data: Value, out: &mut Vec<Bytes>) {
         out.push(sse::encode_sse_event(kind, &data));
     }
+}
+
+fn empty_block(kind: ItemKind, item_id: &str) -> Value {
+    match kind {
+        ItemKind::Reasoning => json!({"type":"thinking","thinking":"","signature":null}),
+        ItemKind::Message | ItemKind::Refusal => json!({"type":"text","text":""}),
+        ItemKind::ToolCall => json!({"type":"tool_use","id":item_id,"name":"","input":{}}),
+        ItemKind::ToolResult | ItemKind::ServerTool | ItemKind::Unknown => {
+            json!({"type":"unknown","id":item_id})
+        }
+    }
+}
+
+fn opaque_block(item_id: &str, kind: &str, payload: &Value) -> Value {
+    let mut block = payload.clone();
+    if !block.is_object() {
+        block = json!({"payload":block});
+    }
+    if let Some(object) = block.as_object_mut() {
+        object
+            .entry("type")
+            .or_insert_with(|| Value::String(kind.to_owned()));
+        object
+            .entry("id")
+            .or_insert_with(|| Value::String(item_id.to_owned()));
+    }
+    block
+}
+
+fn content_block(content: &ContentPart) -> Value {
+    match content {
+        ContentPart::Reasoning { .. } => {
+            json!({"type":"thinking","thinking":"","signature":null})
+        }
+        ContentPart::Text(_) | ContentPart::Refusal(_) => json!({"type":"text","text":""}),
+        ContentPart::Json(value) => value.clone(),
+        ContentPart::Image { .. } => json!({"type":"unknown"}),
+    }
+}
+
+fn content_delta(content: &ContentPart) -> Option<Value> {
+    match content {
+        ContentPart::Reasoning { text, signature } if text.is_empty() => signature
+            .as_ref()
+            .map(|signature| json!({"type":"signature_delta","signature":signature})),
+        ContentPart::Reasoning { text, .. } => {
+            Some(json!({"type":"thinking_delta","thinking":text}))
+        }
+        ContentPart::Text(text) | ContentPart::Refusal(text) => {
+            Some(json!({"type":"text_delta","text":text}))
+        }
+        ContentPart::Json(_) | ContentPart::Image { .. } => None,
+    }
+}
+
+fn render_usage(usage: &Usage) -> Value {
+    json!({
+        "input_tokens":usage.input_tokens,
+        "output_tokens":usage.output_tokens,
+        "cache_read_input_tokens":usage.cached_input_tokens,
+        "cache_creation_input_tokens":usage.cache_write_input_tokens,
+    })
 }
 fn synth_message_id(upstream_id: &str) -> String {
     if upstream_id.starts_with("msg_") {
@@ -388,10 +628,14 @@ fn synth_message_id(upstream_id: &str) -> String {
         format!("msg_{upstream_id}")
     }
 }
-fn anthropic_reason(reason: &StopReason) -> &'static str {
+fn anthropic_reason(reason: &StopReason, original_reason: Option<&str>) -> String {
     match reason {
-        StopReason::ToolUse => "tool_use",
-        StopReason::MaxTokens => "max_tokens",
-        _ => "end_turn",
+        StopReason::Natural => "end_turn".to_owned(),
+        StopReason::ToolUse => "tool_use".to_owned(),
+        StopReason::MaxTokens => "max_tokens".to_owned(),
+        StopReason::ContentFilter => "refusal".to_owned(),
+        StopReason::Cancelled => "cancelled".to_owned(),
+        StopReason::Error => "error".to_owned(),
+        StopReason::Unknown(reason) => original_reason.unwrap_or(reason).to_owned(),
     }
 }

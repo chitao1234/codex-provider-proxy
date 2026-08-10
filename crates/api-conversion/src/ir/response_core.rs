@@ -38,13 +38,12 @@ impl ResponseAccumulator {
                     .source_response_id
                     .clone_from(response_id);
             }
-            CanonicalResponseEvent::ItemStarted { item_id, item } => {
-                if !self.item_indexes.contains_key(item_id) {
-                    let index = self.response.output.len();
-                    self.item_indexes.insert(item_id.clone(), index);
-                    self.item_kinds.insert(item_id.clone(), *item);
-                    self.response.output.push(empty_item(*item, item_id));
-                }
+            CanonicalResponseEvent::ItemStarted {
+                item_id,
+                provider_id,
+                item,
+            } => {
+                self.ensure_item_with_provider_id(item_id, *item, provider_id.as_deref());
             }
             CanonicalResponseEvent::OpaqueItemStarted {
                 item_id,
@@ -56,7 +55,10 @@ impl ResponseAccumulator {
                     self.item_indexes.insert(item_id.clone(), index);
                     self.item_kinds.insert(item_id.clone(), ItemKind::Unknown);
                     self.response.output.push(ContentItem::Unknown {
-                        id: Some(item_id.clone()),
+                        id: payload
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
                         kind: kind.clone(),
                         payload: payload.clone(),
                         extensions: Vec::new(),
@@ -76,8 +78,16 @@ impl ResponseAccumulator {
                     append_content(item, content.clone());
                 }
             }
-            CanonicalResponseEvent::ToolCallStarted { item_id, call } => {
-                self.ensure_item(item_id, ItemKind::ToolCall);
+            CanonicalResponseEvent::ToolCallStarted {
+                item_id,
+                provider_id,
+                call,
+            } => {
+                self.ensure_item_with_provider_id(
+                    item_id,
+                    ItemKind::ToolCall,
+                    provider_id.as_deref(),
+                );
                 if let Some(ContentItem::ToolUse { call: current, .. }) = self.item_mut(item_id) {
                     *current = call.clone();
                 }
@@ -152,11 +162,24 @@ impl ResponseAccumulator {
     }
 
     fn ensure_item(&mut self, item_id: &str, kind: ItemKind) {
-        if !self.item_indexes.contains_key(item_id) {
+        self.ensure_item_with_provider_id(item_id, kind, None);
+    }
+
+    fn ensure_item_with_provider_id(
+        &mut self,
+        item_id: &str,
+        kind: ItemKind,
+        provider_id: Option<&str>,
+    ) {
+        if self.item_indexes.contains_key(item_id) {
+            if let (Some(provider_id), Some(item)) = (provider_id, self.item_mut(item_id)) {
+                set_item_provider_id(item, provider_id);
+            }
+        } else {
             let index = self.response.output.len();
             self.item_indexes.insert(item_id.to_owned(), index);
             self.item_kinds.insert(item_id.to_owned(), kind);
-            self.response.output.push(empty_item(kind, item_id));
+            self.response.output.push(empty_item(kind, provider_id));
         }
     }
 
@@ -167,17 +190,33 @@ impl ResponseAccumulator {
     }
 }
 
-fn empty_item(kind: ItemKind, item_id: &str) -> ContentItem {
+fn set_item_provider_id(item: &mut ContentItem, provider_id: &str) {
+    match item {
+        ContentItem::Message { id, .. }
+        | ContentItem::Refusal { id, .. }
+        | ContentItem::Reasoning { id, .. }
+        | ContentItem::ServerTool { id, .. }
+        | ContentItem::Unknown { id, .. }
+        | ContentItem::ToolUse { id, .. } => {
+            if id.is_none() {
+                *id = Some(provider_id.to_owned());
+            }
+        }
+        ContentItem::ToolResult { .. } => {}
+    }
+}
+
+fn empty_item(kind: ItemKind, provider_id: Option<&str>) -> ContentItem {
     match kind {
         ItemKind::Reasoning => ContentItem::Reasoning {
-            id: Some(item_id.to_owned()),
+            id: provider_id.map(str::to_owned),
             content: Vec::new(),
             extensions: Vec::new(),
         },
         ItemKind::ToolCall => ContentItem::ToolUse {
-            id: Some(item_id.to_owned()),
+            id: provider_id.map(str::to_owned),
             call: ToolCall {
-                id: Some(item_id.to_owned()),
+                id: provider_id.map(str::to_owned),
                 name: String::new(),
                 arguments: String::new(),
                 status: None,
@@ -187,32 +226,33 @@ fn empty_item(kind: ItemKind, item_id: &str) -> ContentItem {
             },
         },
         ItemKind::ServerTool => ContentItem::ServerTool {
-            id: Some(item_id.to_owned()),
+            id: provider_id.map(str::to_owned),
             kind: String::new(),
             payload: serde_json::Value::Null,
             extensions: Vec::new(),
         },
         ItemKind::ToolResult => ContentItem::ToolResult {
             result: super::tools::ToolResult {
-                call_id: Some(item_id.to_owned()),
+                call_id: provider_id.map(str::to_owned),
                 content: Vec::new(),
                 is_error: false,
                 extensions: Vec::new(),
             },
         },
         ItemKind::Unknown => ContentItem::Unknown {
-            id: Some(item_id.to_owned()),
+            id: provider_id.map(str::to_owned),
             kind: String::new(),
             payload: serde_json::Value::Null,
             extensions: Vec::new(),
         },
         ItemKind::Message => ContentItem::Message {
+            id: provider_id.map(str::to_owned),
             role: "assistant".to_owned(),
             content: Vec::new(),
             extensions: Vec::new(),
         },
         ItemKind::Refusal => ContentItem::Refusal {
-            id: Some(item_id.to_owned()),
+            id: provider_id.map(str::to_owned),
             content: Vec::new(),
             extensions: Vec::new(),
         },

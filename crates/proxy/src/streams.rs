@@ -13,7 +13,9 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::error::ConversionError;
-use codex_provider_proxy_api_conversion::ir::{CanonicalResponseEvent, ResponseAccumulator};
+use codex_provider_proxy_api_conversion::ir::{
+    CanonicalResponseEvent, CoreUpdate, ResponseAccumulator,
+};
 use codex_provider_proxy_api_conversion::sse;
 use futures_util::Stream;
 use pin_project_lite::pin_project;
@@ -31,9 +33,9 @@ pub trait CanonicalParser {
     fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>);
 }
 
-/// A protocol-local SSE renderer consuming protocol-neutral response events.
+/// A protocol-local SSE renderer consuming shared-core semantic updates.
 pub trait CanonicalRenderer {
-    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>);
+    fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>);
     fn finish(&mut self, out: &mut Vec<Bytes>);
     fn response_id(&self) -> Option<&str> {
         None
@@ -94,8 +96,8 @@ impl CanonicalParser
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer
 {
-    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
-        self.on_event(event, out);
+    fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        self.on_update(update, out);
     }
 
     fn finish(&mut self, out: &mut Vec<Bytes>) {
@@ -106,8 +108,8 @@ impl CanonicalRenderer
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer
 {
-    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
-        self.on_event(event, out);
+    fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        self.on_update(update, out);
     }
 
     fn finish(&mut self, out: &mut Vec<Bytes>) {
@@ -244,8 +246,8 @@ where
                             break;
                         }
                         for event in semantic_events {
-                            this.response.apply(event.clone());
-                            this.renderer.on_event(&event, &mut rendered);
+                            let update = this.response.apply(event);
+                            this.renderer.on_update(&update, &mut rendered);
                         }
                     }
                     if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
@@ -280,8 +282,8 @@ where
                     this.parser.finish(&mut semantic_events);
                     let mut rendered = Vec::new();
                     for event in semantic_events {
-                        this.response.apply(event.clone());
-                        this.renderer.on_event(&event, &mut rendered);
+                        let update = this.response.apply(event);
+                        this.renderer.on_update(&update, &mut rendered);
                     }
                     this.renderer.finish(&mut rendered);
                     let snapshot = this.response.snapshot();
@@ -484,7 +486,7 @@ mod tests {
     struct NullRenderer;
 
     impl CanonicalRenderer for NullRenderer {
-        fn on_event(&mut self, _event: &CanonicalResponseEvent, _out: &mut Vec<Bytes>) {}
+        fn on_update(&mut self, _update: &CoreUpdate, _out: &mut Vec<Bytes>) {}
 
         fn finish(&mut self, _out: &mut Vec<Bytes>) {}
     }
@@ -513,7 +515,7 @@ mod tests {
     struct ByteRenderer;
 
     impl CanonicalRenderer for ByteRenderer {
-        fn on_event(&mut self, _event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
+        fn on_update(&mut self, _update: &CoreUpdate, out: &mut Vec<Bytes>) {
             out.push(Bytes::from_static(b"converted"));
         }
 
