@@ -1,7 +1,7 @@
 //! Generic parser→renderer stream wiring.
 //!
-//! A `ParserRendererStream` pipes an upstream SSE stream through an upstream parser
-//! (producing semantic `StreamEvent`s) into a downstream renderer (producing
+//! A `CanonicalParserRendererStream` pipes an upstream SSE stream through a protocol-local parser
+//! (producing `CanonicalResponseEvent`s) into a protocol-local renderer (producing
 //! downstream SSE bytes). The upstream protocol and downstream protocol are chosen
 //! independently, so N parsers × M renderers compose without N×M converters.
 
@@ -15,12 +15,8 @@ use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::{CanonicalResponseEvent, ResponseAccumulator};
 use codex_provider_proxy_api_conversion::sse;
-#[cfg(test)]
-use codex_provider_proxy_api_conversion::stream::{StreamEvent, StreamingResponseIr};
 use futures_util::Stream;
 use pin_project_lite::pin_project;
-#[cfg(test)]
-use serde_json::Value;
 
 use crate::api_conversion::ResponseRecorder;
 
@@ -123,26 +119,6 @@ impl CanonicalRenderer
     }
 }
 
-#[cfg(test)]
-fn decode_json_event(event_bytes: &[u8]) -> std::io::Result<Option<(&str, Value)>> {
-    let event = sse::decode_event(event_bytes).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("upstream SSE event is not valid UTF-8: {err}"),
-        )
-    })?;
-    let Some(payload) = event.data else {
-        return Ok(None);
-    };
-    let data = serde_json::from_str(&payload).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("upstream SSE data is not valid JSON: {err}"),
-        )
-    })?;
-    Ok(Some((event.event_type.unwrap_or(""), data)))
-}
-
 fn pending_has_data(pending: &[u8]) -> std::io::Result<bool> {
     if pending.is_empty() {
         return Ok(false);
@@ -155,25 +131,6 @@ fn pending_has_data(pending: &[u8]) -> std::io::Result<bool> {
                 format!("upstream SSE ended with invalid UTF-8: {err}"),
             )
         })
-}
-
-/// An upstream SSE parser producing semantic events.
-#[cfg(test)]
-pub trait Parser {
-    fn on_event(
-        &mut self,
-        event_type: &str,
-        data: &Value,
-        out: &mut Vec<StreamEvent>,
-    ) -> Result<(), ConversionError>;
-    fn finish(&mut self, out: &mut Vec<StreamEvent>);
-}
-
-/// A downstream SSE renderer consuming semantic events.
-#[cfg(test)]
-pub trait Renderer {
-    fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>);
-    fn finish(&mut self, out: &mut Vec<Bytes>);
 }
 
 pin_project! {
@@ -327,218 +284,13 @@ where
                         this.renderer.on_event(&event, &mut rendered);
                     }
                     this.renderer.finish(&mut rendered);
+                    let snapshot = this.response.snapshot();
+                    let incomplete = snapshot.response.response_id.is_some() && !snapshot.terminal;
                     if let (Some(recorder), Some(response_id)) =
                         (this.recorder.as_ref(), this.renderer.response_id())
                     {
                         recorder.record_semantic(response_id, this.response.response());
                     }
-                    if rendered.is_empty() {
-                        return Poll::Ready(None);
-                    }
-                    this.out_events.extend(rendered);
-                    return Poll::Ready(Some(Ok(this
-                        .out_events
-                        .pop_front()
-                        .expect("events were just pushed"))));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-impl Parser for codex_provider_proxy_api_conversion::messages_parser::MessagesParser {
-    fn on_event(
-        &mut self,
-        event_type: &str,
-        data: &Value,
-        out: &mut Vec<StreamEvent>,
-    ) -> Result<(), ConversionError> {
-        self.on_event(event_type, data, out)
-    }
-
-    fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        self.finish(out);
-    }
-}
-
-#[cfg(test)]
-impl Parser for codex_provider_proxy_api_conversion::responses_parser::ResponsesParser {
-    fn on_event(
-        &mut self,
-        event_type: &str,
-        data: &Value,
-        out: &mut Vec<StreamEvent>,
-    ) -> Result<(), ConversionError> {
-        self.on_event(event_type, data, out)
-    }
-
-    fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        self.finish(out);
-    }
-}
-
-#[cfg(test)]
-impl Renderer for codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer {
-    fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>) {
-        self.on_event(event, out);
-    }
-
-    fn finish(&mut self, out: &mut Vec<Bytes>) {
-        self.finish(out);
-    }
-}
-
-#[cfg(test)]
-impl Renderer for codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer {
-    fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>) {
-        self.on_event(event, out);
-    }
-
-    fn finish(&mut self, out: &mut Vec<Bytes>) {
-        self.finish(out);
-    }
-}
-
-#[cfg(test)]
-pin_project! {
-    pub struct ParserRendererStream<S, P, R> {
-        #[pin]
-        inner: S,
-        parser: P,
-        renderer: R,
-        response: StreamingResponseIr,
-        pending: BytesMut,
-        out_events: VecDeque<Bytes>,
-        pending_error: Option<std::io::Error>,
-        finished: bool,
-    }
-}
-
-#[cfg(test)]
-impl<S, P, R> ParserRendererStream<S, P, R> {
-    pub fn new(inner: S, parser: P, renderer: R) -> Self {
-        Self {
-            inner,
-            parser,
-            renderer,
-            response: StreamingResponseIr::default(),
-            pending: BytesMut::new(),
-            out_events: VecDeque::new(),
-            pending_error: None,
-            finished: false,
-        }
-    }
-}
-
-#[cfg(test)]
-impl<S, P, R> Stream for ParserRendererStream<S, P, R>
-where
-    S: Stream<Item = Result<Bytes, std::io::Error>>,
-    P: Parser,
-    R: Renderer,
-{
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        if let Some(event) = this.out_events.pop_front() {
-            return Poll::Ready(Some(Ok(event)));
-        }
-        if let Some(error) = this.pending_error.take() {
-            return Poll::Ready(Some(Err(error)));
-        }
-        if *this.finished {
-            return Poll::Ready(None);
-        }
-        let mut events = Vec::new();
-        let mut rendered = Vec::new();
-        loop {
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    this.pending.extend_from_slice(&chunk);
-                    while let Some(boundary_end) =
-                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
-                    {
-                        if boundary_end > sse::MAX_EVENT_BYTES {
-                            *this.finished = true;
-                            let error = oversized_sse_event_error();
-                            if rendered.is_empty() {
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                            *this.pending_error = Some(error);
-                            break;
-                        }
-                        let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        let parsed = match decode_json_event(&event_bytes) {
-                            Ok(parsed) => parsed,
-                            Err(err) => {
-                                *this.finished = true;
-                                if rendered.is_empty() {
-                                    return Poll::Ready(Some(Err(err)));
-                                }
-                                *this.pending_error = Some(err);
-                                break;
-                            }
-                        };
-                        if let Some((event_type, parsed)) = parsed {
-                            if let Err(err) = this.parser.on_event(event_type, &parsed, &mut events)
-                            {
-                                *this.finished = true;
-                                let err = std::io::Error::new(std::io::ErrorKind::InvalidData, err);
-                                if rendered.is_empty() {
-                                    return Poll::Ready(Some(Err(err)));
-                                }
-                                *this.pending_error = Some(err);
-                                break;
-                            }
-                            for event in events.drain(..) {
-                                this.response.on_event(&event);
-                                this.renderer.on_event(&event, &mut rendered);
-                            }
-                        }
-                    }
-                    if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
-                        *this.finished = true;
-                        let error = oversized_sse_event_error();
-                        if rendered.is_empty() {
-                            return Poll::Ready(Some(Err(error)));
-                        }
-                        *this.pending_error = Some(error);
-                    }
-                    if !rendered.is_empty() {
-                        this.out_events.extend(std::mem::take(&mut rendered));
-                        return Poll::Ready(Some(Ok(this
-                            .out_events
-                            .pop_front()
-                            .expect("events were just pushed"))));
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    *this.finished = true;
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(None) => {
-                    *this.finished = true;
-                    match pending_has_data(this.pending.as_ref()) {
-                        Ok(false) => {}
-                        Ok(true) => {
-                            return Poll::Ready(Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "upstream SSE ended during a data event",
-                            ))));
-                        }
-                        Err(err) => return Poll::Ready(Some(Err(err))),
-                    }
-                    let mut final_events = Vec::new();
-                    this.parser.finish(&mut final_events);
-                    for event in &final_events {
-                        this.response.on_event(event);
-                        this.renderer.on_event(event, &mut rendered);
-                    }
-                    this.renderer.finish(&mut rendered);
-                    let incomplete = this.response.has_started() && !this.response.is_terminal();
                     if incomplete {
                         let error = std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -694,11 +446,12 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use codex_provider_proxy_api_conversion::{
-        ir::RequestIr,
+        ir::{CanonicalResponseEvent, RequestIr},
         request_adapter::{RequestAdapter, RequestAdapterKind},
         request_ir::Protocol,
     };
     use futures_util::{stream, StreamExt};
+    use serde_json::Value;
 
     use super::*;
 
@@ -712,51 +465,55 @@ mod tests {
         values: Rc<RefCell<Vec<Value>>>,
     }
 
-    impl Parser for ProbeParser {
+    impl CanonicalParser for ProbeParser {
         fn on_event(
             &mut self,
             _event_type: &str,
-            data: &Value,
-            _out: &mut Vec<StreamEvent>,
+            payload: &str,
+            _out: &mut Vec<CanonicalResponseEvent>,
         ) -> Result<(), ConversionError> {
+            let data: Value = serde_json::from_str(payload)
+                .map_err(|_| ConversionError::invalid("invalid probe JSON"))?;
             self.values.borrow_mut().push(data.clone());
             Ok(())
         }
 
-        fn finish(&mut self, _out: &mut Vec<StreamEvent>) {}
+        fn finish(&mut self, _out: &mut Vec<CanonicalResponseEvent>) {}
     }
 
     struct NullRenderer;
 
-    impl Renderer for NullRenderer {
-        fn on_event(&mut self, _event: &StreamEvent, _out: &mut Vec<Bytes>) {}
+    impl CanonicalRenderer for NullRenderer {
+        fn on_event(&mut self, _event: &CanonicalResponseEvent, _out: &mut Vec<Bytes>) {}
 
         fn finish(&mut self, _out: &mut Vec<Bytes>) {}
     }
 
     struct StartParser;
 
-    impl Parser for StartParser {
+    impl CanonicalParser for StartParser {
         fn on_event(
             &mut self,
             _event_type: &str,
-            _data: &Value,
-            out: &mut Vec<StreamEvent>,
+            payload: &str,
+            out: &mut Vec<CanonicalResponseEvent>,
         ) -> Result<(), ConversionError> {
-            out.push(StreamEvent::Start {
-                id: "response_1".to_owned(),
-                model: "model".to_owned(),
+            serde_json::from_str::<Value>(payload)
+                .map_err(|_| ConversionError::invalid("invalid start JSON"))?;
+            out.push(CanonicalResponseEvent::StreamStarted {
+                response_id: Some("response_1".to_owned()),
+                model: Some("model".to_owned()),
             });
             Ok(())
         }
 
-        fn finish(&mut self, _out: &mut Vec<StreamEvent>) {}
+        fn finish(&mut self, _out: &mut Vec<CanonicalResponseEvent>) {}
     }
 
     struct ByteRenderer;
 
-    impl Renderer for ByteRenderer {
-        fn on_event(&mut self, _event: &StreamEvent, out: &mut Vec<Bytes>) {
+    impl CanonicalRenderer for ByteRenderer {
+        fn on_event(&mut self, _event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
             out.push(Bytes::from_static(b"converted"));
         }
 
@@ -768,7 +525,7 @@ mod tests {
         let values = Rc::new(RefCell::new(Vec::new()));
         let body = Bytes::from_static(b"event: test\ndata: {\ndata: \"answer\": 42\ndata: }\n\n");
         let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
-        let mut converted = ParserRendererStream::new(
+        let mut converted = CanonicalParserRendererStream::new(
             inner,
             ProbeParser {
                 values: values.clone(),
@@ -793,7 +550,7 @@ mod tests {
             ),
         ] {
             let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
-            let mut converted = ParserRendererStream::new(
+            let mut converted = CanonicalParserRendererStream::new(
                 inner,
                 ProbeParser {
                     values: Rc::new(RefCell::new(Vec::new())),
@@ -820,7 +577,8 @@ mod tests {
             ),
         ] {
             let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
-            let mut converted = ParserRendererStream::new(inner, StartParser, ByteRenderer);
+            let mut converted =
+                CanonicalParserRendererStream::new(inner, StartParser, ByteRenderer);
 
             assert_eq!(converted.next().await.unwrap().unwrap(), "converted");
             let error = converted.next().await.unwrap().unwrap_err();
@@ -833,7 +591,7 @@ mod tests {
     async fn parser_renderer_rejects_oversized_unterminated_event() {
         let body = Bytes::from(vec![b'x'; sse::MAX_EVENT_BYTES + 1]);
         let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
-        let mut converted = ParserRendererStream::new(
+        let mut converted = CanonicalParserRendererStream::new(
             inner,
             ProbeParser {
                 values: Rc::new(RefCell::new(Vec::new())),
