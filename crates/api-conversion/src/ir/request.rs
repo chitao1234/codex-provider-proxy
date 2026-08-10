@@ -82,7 +82,6 @@ pub struct RequestIr {
     pub tool_choice: Option<Value>,
     pub generation: GenerationControls,
     pub state: ConversationState,
-    pub extensions: Vec<Extension>,
     pub opaque: Vec<Extension>,
 }
 
@@ -116,6 +115,5 @@ impl RequestIr {
                 .source_response_id
                 .clone_from(&response.response_id);
         }
-        self.extensions.extend(response.extensions.clone());
     }
 }
