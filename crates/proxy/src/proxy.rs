@@ -527,9 +527,7 @@ async fn handle_proxy_inner(
                     codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses => {
                         Box::pin(crate::streams::RecordingPassthroughStream::new(
                             resp_stream,
-                            codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
-                                response_pipeline.source,
-                            ),
+                            response_pipeline.stream_parser(),
                             final_attempt.response_recorder.clone(),
                         )) as BoxRespStream
                     }
@@ -539,12 +537,9 @@ async fn handle_proxy_inner(
                     }
                 },
                 crate::api_conversion::StreamPolicy::Translate => {
-                    let parser = codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
-                            response_pipeline.source,
-                        );
-                    let renderer = codex_provider_proxy_api_conversion::protocols::StreamRendererKind::for_protocol(
-                            target,
-                        )
+                    let parser = response_pipeline.stream_parser();
+                    let renderer = response_pipeline
+                        .stream_renderer()
                         .expect("downstream protocol must support streaming response rendering");
                     Box::pin(
                         crate::streams::CanonicalParserRendererStream::with_recorder(

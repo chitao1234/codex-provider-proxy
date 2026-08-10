@@ -100,6 +100,28 @@ impl ConversionPlan {
     }
 }
 
+impl ResponsePipeline {
+    pub fn parser(self) -> crate::protocols::ResponseParserKind {
+        crate::protocols::ResponseParserKind::for_protocol(self.source)
+    }
+
+    pub fn renderer(
+        self,
+    ) -> Result<crate::protocols::ResponseRendererKind, crate::error::ConversionError> {
+        crate::protocols::ResponseRendererKind::for_protocol(self.target)
+    }
+
+    pub fn stream_parser(self) -> crate::protocols::StreamParserKind {
+        crate::protocols::StreamParserKind::for_protocol(self.source)
+    }
+
+    pub fn stream_renderer(
+        self,
+    ) -> Result<crate::protocols::StreamRendererKind, crate::error::ConversionError> {
+        crate::protocols::StreamRendererKind::for_protocol(self.target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

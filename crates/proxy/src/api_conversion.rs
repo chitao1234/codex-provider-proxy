@@ -429,14 +429,14 @@ fn convert_non_streaming_response(
             "upstream response is not valid JSON",
         )
     })?;
-    let semantic_response =
-        codex_provider_proxy_api_conversion::protocols::parse_response(pipeline.source, &json)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let converted = codex_provider_proxy_api_conversion::protocols::render_response(
-        pipeline.target,
-        &semantic_response,
-    )
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let semantic_response = pipeline
+        .parser()
+        .parse(&json)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let converted = pipeline
+        .renderer()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+        .render(&semantic_response);
     let response_id = converted
         .get("id")
         .and_then(Value::as_str)

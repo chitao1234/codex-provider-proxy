@@ -12,6 +12,57 @@ use crate::{
     protocol::Protocol,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseParserKind {
+    OpenAiResponses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+impl ResponseParserKind {
+    pub fn for_protocol(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::OpenAiResponses => Self::OpenAiResponses,
+            Protocol::OpenAiChatCompletions => Self::OpenAiChatCompletions,
+            Protocol::AnthropicMessages => Self::AnthropicMessages,
+        }
+    }
+
+    pub fn parse(self, body: &Value) -> Result<ResponseIr, ConversionError> {
+        match self {
+            Self::OpenAiResponses => openai_responses::response::parse(body),
+            Self::OpenAiChatCompletions => openai_chat_completions::response::parse(body),
+            Self::AnthropicMessages => anthropic_messages::response::parse(body),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseRendererKind {
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+impl ResponseRendererKind {
+    pub fn for_protocol(protocol: Protocol) -> Result<Self, ConversionError> {
+        match protocol {
+            Protocol::OpenAiResponses => Ok(Self::OpenAiResponses),
+            Protocol::AnthropicMessages => Ok(Self::AnthropicMessages),
+            Protocol::OpenAiChatCompletions => Err(ConversionError::unsupported(
+                "response",
+                "Chat Completions is not a downstream response format",
+            )),
+        }
+    }
+
+    pub fn render(self, response: &ResponseIr) -> Value {
+        match self {
+            Self::OpenAiResponses => openai_responses::renderer::render(response),
+            Self::AnthropicMessages => anthropic_messages::renderer::render(response),
+        }
+    }
+}
+
 pub enum StreamParserKind {
     OpenAiResponses(openai_responses::stream::Parser),
     OpenAiChatCompletions(openai_chat_completions::stream::Parser),
@@ -89,11 +140,7 @@ impl StreamRendererKind {
 }
 
 pub fn parse_response(protocol: Protocol, body: &Value) -> Result<ResponseIr, ConversionError> {
-    let mut response = match protocol {
-        Protocol::OpenAiResponses => openai_responses::response::parse(body),
-        Protocol::AnthropicMessages => anthropic_messages::response::parse(body),
-        Protocol::OpenAiChatCompletions => openai_chat_completions::response::parse(body),
-    }?;
+    let mut response = ResponseParserKind::for_protocol(protocol).parse(body)?;
     response
         .state
         .source_response_id
@@ -106,12 +153,5 @@ pub fn render_response(
     protocol: Protocol,
     response: &ResponseIr,
 ) -> Result<Value, ConversionError> {
-    match protocol {
-        Protocol::OpenAiResponses => Ok(openai_responses::renderer::render(response)),
-        Protocol::AnthropicMessages => Ok(anthropic_messages::renderer::render(response)),
-        Protocol::OpenAiChatCompletions => Err(ConversionError::unsupported(
-            "response",
-            "Chat Completions is not a downstream response format",
-        )),
-    }
+    Ok(ResponseRendererKind::for_protocol(protocol)?.render(response))
 }
