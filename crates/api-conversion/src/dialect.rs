@@ -318,14 +318,6 @@ impl ModelCapabilities {
     }
 }
 
-/// Whether a provider converts downstream Anthropic Messages requests to its upstream API.
-pub fn converts_messages_to_upstream(
-    upstream_api: UpstreamApi,
-    accepted: &[DownstreamApi],
-) -> bool {
-    upstream_api != UpstreamApi::Passthrough && accepted.contains(&DownstreamApi::AnthropicMessages)
-}
-
 /// What a request conversion did, for logging.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestConversionReport {
@@ -393,21 +385,5 @@ mod tests {
         assert!(other.image_input);
         let unknown = ModelCapabilities::resolve("unknown-model", None, &overrides);
         assert!(!unknown.image_input);
-    }
-
-    #[test]
-    fn converts_messages_to_upstream_requires_both_sides() {
-        assert!(converts_messages_to_upstream(
-            UpstreamApi::OpenAiChatCompletions,
-            &[DownstreamApi::AnthropicMessages]
-        ));
-        assert!(!converts_messages_to_upstream(
-            UpstreamApi::Passthrough,
-            &[DownstreamApi::AnthropicMessages]
-        ));
-        assert!(!converts_messages_to_upstream(
-            UpstreamApi::OpenAiChatCompletions,
-            &[]
-        ));
     }
 }
