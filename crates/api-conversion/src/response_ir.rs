@@ -123,6 +123,32 @@ struct ResponseUsage {
     opaque_extensions: Map<String, Value>,
 }
 
+fn response_extension(key: &str, value: Value) -> Extension {
+    Extension {
+        namespace: "response".to_owned(),
+        key: key.to_owned(),
+        value,
+        scope: ExtensionScope::Response,
+        source_protocol: None,
+        provider: None,
+        replay: ReplayPolicy::NeverReplay,
+    }
+}
+
+fn extension_events(map: &Map<String, Value>, scope: ExtensionScope) -> Vec<Extension> {
+    map.iter()
+        .map(|(key, value)| Extension {
+            namespace: "response".to_owned(),
+            key: key.clone(),
+            value: value.clone(),
+            scope,
+            source_protocol: None,
+            provider: None,
+            replay: ReplayPolicy::NeverReplay,
+        })
+        .collect()
+}
+
 impl ResponseIr {
     pub fn parse(source: Protocol, body: &Value) -> Result<Self, ConversionError> {
         match source {
@@ -180,14 +206,23 @@ impl ResponseIr {
             model: (!self.model.is_empty()).then(|| self.model.clone()),
         }];
         for (index, item) in self.items.iter().enumerate() {
-            let item_id = format!("item:{index}");
+            let fallback_id = format!("item:{index}");
             match item {
                 ResponseItem::Reasoning {
-                    text, signature, ..
+                    id,
+                    text,
+                    signature,
+                    opaque_extensions,
+                    ..
                 } => {
+                    let item_id = id.clone().unwrap_or(fallback_id);
                     events.push(CanonicalResponseEvent::ItemStarted {
                         item_id: item_id.clone(),
                         item: ItemKind::Reasoning,
+                    });
+                    events.push(CanonicalResponseEvent::ItemMetadataUpdated {
+                        item_id: item_id.clone(),
+                        metadata: extension_events(opaque_extensions, ExtensionScope::ContentItem),
                     });
                     events.push(CanonicalResponseEvent::ContentDelta {
                         item_id,
@@ -197,10 +232,20 @@ impl ResponseIr {
                         },
                     });
                 }
-                ResponseItem::Message { content, .. } => {
+                ResponseItem::Message {
+                    id,
+                    content,
+                    opaque_extensions,
+                    ..
+                } => {
+                    let item_id = id.clone().unwrap_or(fallback_id);
                     events.push(CanonicalResponseEvent::ItemStarted {
                         item_id: item_id.clone(),
                         item: ItemKind::Message,
+                    });
+                    events.push(CanonicalResponseEvent::ItemMetadataUpdated {
+                        item_id: item_id.clone(),
+                        metadata: extension_events(opaque_extensions, ExtensionScope::Message),
                     });
                     for part in content {
                         match part {
@@ -208,24 +253,40 @@ impl ResponseIr {
                                 events.push(CanonicalResponseEvent::ContentDelta {
                                     item_id: item_id.clone(),
                                     content: ContentPart::Text(text.text.clone()),
-                                })
+                                });
+                                events.push(CanonicalResponseEvent::ItemMetadataUpdated {
+                                    item_id: item_id.clone(),
+                                    metadata: extension_events(
+                                        &text.opaque_extensions,
+                                        ExtensionScope::ContentItem,
+                                    ),
+                                });
+                                if !text.annotations.is_empty() {
+                                    events.push(CanonicalResponseEvent::ProtocolExtension(
+                                        response_extension(
+                                            "annotations",
+                                            Value::Array(text.annotations.clone()),
+                                        ),
+                                    ));
+                                }
                             }
                             ResponseContent::Refusal(refusal) => {
                                 events.push(CanonicalResponseEvent::ContentDelta {
                                     item_id: item_id.clone(),
                                     content: ContentPart::Refusal(refusal.refusal.clone()),
-                                })
+                                });
+                                events.push(CanonicalResponseEvent::ItemMetadataUpdated {
+                                    item_id: item_id.clone(),
+                                    metadata: extension_events(
+                                        &refusal.opaque_extensions,
+                                        ExtensionScope::ContentItem,
+                                    ),
+                                });
                             }
                             ResponseContent::Opaque(value) => {
-                                events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
-                                    namespace: "response".to_owned(),
-                                    key: "content".to_owned(),
-                                    value: value.clone(),
-                                    scope: ExtensionScope::Response,
-                                    source_protocol: None,
-                                    provider: None,
-                                    replay: ReplayPolicy::NeverReplay,
-                                }))
+                                events.push(CanonicalResponseEvent::ProtocolExtension(
+                                    response_extension("content", value.clone()),
+                                ))
                             }
                         }
                     }
@@ -235,34 +296,41 @@ impl ResponseIr {
                     call_id,
                     name,
                     arguments,
-                    ..
+                    status,
+                    opaque_extensions,
+                    function_extensions,
                 } => {
-                    let item_id = item_id.clone();
+                    let item_id = id.clone().unwrap_or(fallback_id);
                     events.push(CanonicalResponseEvent::ToolCallStarted {
-                        item_id,
+                        item_id: item_id.clone(),
                         call: ToolCall {
                             id: id.clone().or_else(|| Some(call_id.clone())),
                             name: name.clone(),
                             arguments: arguments.to_string(),
-                            status: Some("completed".to_owned()),
-                            metadata: BTreeMap::new(),
-                            function_metadata: BTreeMap::new(),
+                            status: status.clone(),
+                            metadata: opaque_extensions.clone().into_iter().collect(),
+                            function_metadata: function_extensions.clone().into_iter().collect(),
                             extensions: Vec::new(),
                         },
                     });
                 }
                 ResponseItem::Opaque(value) => {
-                    events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
-                        namespace: "response".to_owned(),
-                        key: "item".to_owned(),
-                        value: value.clone(),
-                        scope: ExtensionScope::Response,
-                        source_protocol: None,
-                        provider: None,
-                        replay: ReplayPolicy::NeverReplay,
-                    }))
+                    events.push(CanonicalResponseEvent::ProtocolExtension(
+                        response_extension("item", value.clone()),
+                    ))
                 }
             }
+        }
+        for (namespace, value) in &self.protocol_extensions {
+            events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
+                namespace: namespace.clone(),
+                key: "response".to_owned(),
+                value: value.clone(),
+                scope: ExtensionScope::Response,
+                source_protocol: None,
+                provider: None,
+                replay: ReplayPolicy::NeverReplay,
+            }));
         }
         events.push(CanonicalResponseEvent::UsageUpdated(Usage {
             input_tokens: self.usage.input_tokens,
