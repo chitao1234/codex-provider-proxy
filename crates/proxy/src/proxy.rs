@@ -68,6 +68,7 @@ struct PreparedUpstreamAttempt {
     provider_name: String,
     url: Url,
     headers: HeaderMap,
+    conversion_plan: Option<crate::api_conversion::ConversionPlan>,
     /// Transcript recorder for Responses downstream requests, set when the request
     /// was converted from `/v1/responses`; records the response when its stream ends.
     response_recorder: Option<crate::api_conversion::ResponseRecorder>,
@@ -113,6 +114,7 @@ struct ResolveUpstreamAttemptArgs<'a> {
     pid: Option<u32>,
     peer: SocketAddr,
     request_id: u64,
+    method: &'a http::Method,
     forwarded_path: &'a str,
     incoming_query: Option<&'a str>,
     base_headers: &'a HeaderMap,
@@ -260,6 +262,7 @@ async fn handle_proxy_inner(
         pid,
         peer,
         request_id,
+        method: &parts.method,
         forwarded_path,
         incoming_query: parts.uri.query(),
         base_headers: &base_headers,
@@ -348,14 +351,7 @@ async fn handle_proxy_inner(
         };
     let status = resp.status();
     let downstream_status = downstream_response_status(&cfg, status);
-    let conversion_plan = cfg
-        .providers
-        .get(&final_attempt.provider_name)
-        .and_then(|provider| {
-            crate::api_conversion::resolve_conversion_plan(provider, &parts.method, forwarded_path)
-                .ok()
-                .flatten()
-        });
+    let conversion_plan = final_attempt.conversion_plan;
     let conversion_applies = conversion_plan.is_some();
     let resp_headers = resp.headers().clone();
 
@@ -782,12 +778,25 @@ async fn resolve_provider_for_pid(
 
 fn prepare_upstream_attempt(
     route: ResolvedProviderRoute,
+    method: &http::Method,
     forwarded_path: &str,
     incoming_query: Option<&str>,
     base_headers: &HeaderMap,
 ) -> Result<PreparedUpstreamAttempt> {
-    let upstream_path =
-        crate::api_conversion::conversion_upstream_path(&route.provider, forwarded_path);
+    let conversion_plan =
+        crate::api_conversion::resolve_conversion_plan(&route.provider, method, forwarded_path)
+            .map_err(|unsupported| {
+                anyhow::anyhow!(
+                    "unsupported conversion from {:?} to {:?}",
+                    unsupported.downstream,
+                    unsupported.upstream
+                )
+            })?;
+    let upstream_path = crate::api_conversion::conversion_upstream_path(
+        &route.provider,
+        forwarded_path,
+        conversion_plan.is_some(),
+    );
     let url = build_outgoing_url(&route.provider, &upstream_path, incoming_query)?;
     let mut headers = base_headers.clone();
     let auth_header = http::HeaderName::from_bytes(route.provider.auth_header_name.as_bytes())
@@ -805,6 +814,7 @@ fn prepare_upstream_attempt(
         provider_name: route.provider_name,
         url,
         headers,
+        conversion_plan,
         response_recorder: None,
     })
 }
@@ -823,6 +833,7 @@ async fn resolve_upstream_attempt(
     .await?;
     prepare_upstream_attempt(
         route,
+        args.method,
         args.forwarded_path,
         args.incoming_query,
         args.base_headers,
@@ -859,12 +870,7 @@ async fn send_upstream_request(
     } = request;
     if !transparent_retries_enabled(cfg, &method) {
         let mut initial_attempt = initial_attempt;
-        let conversion_may_apply = crate::api_conversion::request_conversion_enabled(
-            cfg,
-            &method,
-            &initial_attempt.provider_name,
-            &forwarded_path,
-        );
+        let conversion_may_apply = initial_attempt.conversion_plan.is_some();
         let needs_buffering = request_rewrites_may_apply(
             cfg,
             &RequestRewriteContext {
@@ -1441,42 +1447,24 @@ fn prepare_request_body_for_attempt(
         request_id,
         attempt_number,
     );
-    maybe_convert_request_body(
-        state,
-        cfg,
-        method,
-        forwarded_path,
-        attempt,
-        body,
-        request_id,
-        attempt_number,
-    )
+    maybe_convert_request_body(state, cfg, attempt, body, request_id, attempt_number)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn maybe_convert_request_body(
     state: &ProxyState,
     cfg: &crate::config::Config,
-    method: &http::Method,
-    forwarded_path: &str,
     attempt: &mut PreparedUpstreamAttempt,
     body: Bytes,
     request_id: u64,
     attempt_number: u32,
 ) -> std::result::Result<Bytes, std::io::Error> {
-    if !crate::api_conversion::request_conversion_enabled(
-        cfg,
-        method,
-        &attempt.provider_name,
-        forwarded_path,
-    ) {
+    let Some(plan) = attempt.conversion_plan else {
         return Ok(body);
-    }
-    let is_responses = matches!(
-        crate::api_conversion::downstream_api_for_path(forwarded_path),
-        Some(crate::api_conversion::DownstreamApi::OpenAiResponses)
-    );
-    let previous_state = if is_responses {
+    };
+    let records_responses_state = plan.continuation
+        == codex_provider_proxy_api_conversion::plan::ContinuationPolicy::ResponsesState;
+    let previous_state = if records_responses_state {
         resolve_previous_response_state(state, &attempt.provider_name, &body)
             .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?
     } else {
@@ -1485,7 +1473,7 @@ fn maybe_convert_request_body(
     let last_reasoning = previous_state
         .as_ref()
         .and_then(|previous| previous.last_reasoning.as_deref());
-    let request_ir = if is_responses {
+    let request_ir = if records_responses_state {
         let value: Value = serde_json::from_slice(&body).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1493,7 +1481,7 @@ fn maybe_convert_request_body(
             )
         })?;
         Some(
-            codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses
+            plan.request_parser
                 .parse_with_context(
                     &value,
                     previous_state.as_ref().map(|previous| &previous.request_ir),
@@ -1504,16 +1492,16 @@ fn maybe_convert_request_body(
     } else {
         None
     };
-    let converted = crate::api_conversion::convert_request_body(
+    let converted = crate::api_conversion::convert_request_body_with_plan(
         cfg,
         &attempt.provider_name,
-        forwarded_path,
+        plan,
         body,
         previous_state.as_ref().map(|previous| &previous.request_ir),
         last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
-    if is_responses {
+    if records_responses_state {
         // Hold the transcript recorder for the response side of this attempt so the
         // synthesized response can be continued with previous_response_id.
         if let Some(request_ir) = request_ir {
@@ -2459,6 +2447,7 @@ async fn resolve_retry_attempt_context(
         pid: args.pid,
         peer: args.peer,
         request_id: args.request_id,
+        method: &args.request.method,
         forwarded_path: &args.request.forwarded_path,
         incoming_query: args.request.incoming_query.as_deref(),
         base_headers: &args.request.base_headers,
@@ -2618,13 +2607,7 @@ where
             &current_attempt,
             &args.request.method,
             attempt_request_body_for_log,
-            cfg.logging.log_conversion_pairs
-                && crate::api_conversion::request_conversion_enabled(
-                    &cfg,
-                    &args.request.method,
-                    &current_attempt.provider_name,
-                    &args.request.forwarded_path,
-                ),
+            cfg.logging.log_conversion_pairs && current_attempt.conversion_plan.is_some(),
         )
         .await;
         let (req_body, _) = if cfg.logging.log_conversion_pairs {
@@ -4019,6 +4002,7 @@ mod tests {
             pid,
             peer,
             request_id,
+            method: &http::Method::POST,
             forwarded_path: "/",
             incoming_query: None,
             base_headers: &HeaderMap::new(),
@@ -5517,19 +5501,25 @@ mod tests {
     }
 
     #[test]
-    fn provider_converts_messages_requires_both_config() {
+    fn conversion_plan_requires_both_protocol_configs() {
         let provider = converting_provider(Url::parse("https://example.com/").unwrap());
-        assert!(crate::api_conversion::provider_converts_path(
+        assert!(crate::api_conversion::resolve_conversion_plan(
             &provider,
+            &Method::POST,
             "/v1/messages"
-        ));
+        )
+        .unwrap()
+        .is_some());
         let passthrough = Provider {
             upstream_api: codex_provider_proxy_api_conversion::dialect::UpstreamApi::Passthrough,
             ..provider.clone()
         };
-        assert!(!crate::api_conversion::provider_converts_path(
+        assert!(crate::api_conversion::resolve_conversion_plan(
             &passthrough,
+            &Method::POST,
             "/v1/messages"
-        ));
+        )
+        .unwrap()
+        .is_none());
     }
 }

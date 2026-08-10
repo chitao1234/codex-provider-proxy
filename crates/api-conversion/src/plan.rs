@@ -7,10 +7,6 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPipeline {
-    pub source: Protocol,
-    pub target: Protocol,
-    pub parser: RequestParserKind,
-    pub renderer: RequestRendererKind,
     pub normalizer: Option<RequestNormalizerKind>,
 }
 
@@ -49,6 +45,8 @@ pub struct ConversionPlan {
     pub upstream: UpstreamApi,
     pub source: Protocol,
     pub target: Protocol,
+    pub request_parser: RequestParserKind,
+    pub request_renderer: RequestRendererKind,
     pub request: RequestAction,
     pub response: ResponsePipeline,
     pub continuation: ContinuationPolicy,
@@ -67,19 +65,15 @@ impl ConversionPlan {
         let request = if source == target && normalizer.is_none() {
             RequestAction::Passthrough
         } else {
-            RequestAction::Transform(RequestPipeline {
-                source,
-                target,
-                parser: RequestParserKind::for_protocol(source),
-                renderer: RequestRendererKind::for_protocol(target),
-                normalizer,
-            })
+            RequestAction::Transform(RequestPipeline { normalizer })
         };
         Self {
             downstream,
             upstream,
             source,
             target,
+            request_parser: RequestParserKind::for_protocol(source),
+            request_renderer: RequestRendererKind::for_protocol(target),
             request,
             response: ResponsePipeline {
                 source: target,
@@ -140,13 +134,7 @@ mod tests {
         assert_eq!(plan.target, Protocol::AnthropicMessages);
         assert_eq!(
             plan.request,
-            RequestAction::Transform(RequestPipeline {
-                source: Protocol::OpenAiResponses,
-                target: Protocol::AnthropicMessages,
-                parser: RequestParserKind::OpenAiResponses,
-                renderer: RequestRendererKind::AnthropicMessages,
-                normalizer: None,
-            })
+            RequestAction::Transform(RequestPipeline { normalizer: None })
         );
         assert_eq!(
             plan.response,

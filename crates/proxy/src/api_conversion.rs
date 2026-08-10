@@ -98,21 +98,14 @@ fn upstream_protocol(upstream: UpstreamApi) -> Option<Protocol> {
     }
 }
 
-/// Whether this provider converts the downstream dialect for the given path.
-pub fn provider_converts_path(provider: &Provider, path: &str) -> bool {
-    resolve_conversion_plan(provider, &Method::POST, path)
-        .ok()
-        .flatten()
-        .is_some()
-}
-
 /// The upstream path to use for a provider/forwarded-path pair: the provider's upstream
 /// protocol endpoint when conversion applies, otherwise the forwarded path unchanged.
 pub fn conversion_upstream_path<'a>(
     provider: &Provider,
     forwarded_path: &'a str,
+    conversion_applies: bool,
 ) -> std::borrow::Cow<'a, str> {
-    if !provider_converts_path(provider, forwarded_path) {
+    if !conversion_applies {
         return std::borrow::Cow::Borrowed(forwarded_path);
     }
     if let Some(path) = &provider.upstream_path {
@@ -126,27 +119,16 @@ pub fn conversion_upstream_path<'a>(
     }
 }
 
-/// Whether the request side of a prepared attempt must be converted.
-pub fn request_conversion_enabled(
-    cfg: &Config,
-    method: &Method,
-    provider_name: &str,
-    forwarded_path: &str,
-) -> bool {
-    cfg.providers.get(provider_name).is_some_and(|provider| {
-        resolve_conversion_plan(provider, method, forwarded_path).is_ok_and(|plan| plan.is_some())
-    })
-}
-
-/// Convert a (model-mapped) downstream request body into Chat Completions form using the
-/// provider's per-model capabilities, dispatching on the downstream dialect.
+/// Resolve a test request plan and convert the body through the same plan-driven path as proxy
+/// attempts.
 ///
 /// `previous_request` carries the protocol-neutral transcript stored for `previous_response_id`
 /// when the downstream request continues a Responses conversation. `last_reasoning`
 /// carries the most recent upstream reasoning, reattached when the client echoes an
 /// empty reasoning item (Codex sends `{"summary": []}`) — required by MiMo/DeepSeek
 /// on tool-call turns, else 400.
-pub fn convert_request_body(
+#[cfg(test)]
+fn convert_request_body(
     cfg: &Config,
     provider_name: &str,
     path: &str,
@@ -161,11 +143,29 @@ pub fn convert_request_body(
     let plan = resolve_conversion_plan(provider, &Method::POST, path)
         .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
         .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
-    let source = downstream_protocol(plan.downstream);
-    let same_protocol = match plan.request {
-        RequestAction::Passthrough => true,
-        RequestAction::Transform(pipeline) => pipeline.target == source,
-    };
+    convert_request_body_with_plan(
+        cfg,
+        provider_name,
+        plan,
+        body,
+        previous_request,
+        last_reasoning,
+    )
+}
+
+pub fn convert_request_body_with_plan(
+    cfg: &Config,
+    provider_name: &str,
+    plan: ConversionPlan,
+    body: Bytes,
+    previous_request: Option<&codex_provider_proxy_api_conversion::ir::RequestIr>,
+    last_reasoning: Option<&str>,
+) -> Result<Bytes, RequestConversionRejected> {
+    let provider = cfg
+        .providers
+        .get(provider_name)
+        .expect("request conversion requires a resolved provider");
+    let same_protocol = plan.source == plan.target;
     let json: Value = match serde_json::from_slice(&body) {
         Ok(json) => json,
         Err(_) if same_protocol => return Ok(body),
@@ -196,31 +196,33 @@ pub fn convert_request_body(
     let (converted, report) = match plan.request {
         RequestAction::Passthrough => return Ok(body),
         RequestAction::Transform(pipeline) => {
-            if source == pipeline.target
+            if same_protocol
                 && pipeline.normalizer == Some(RequestNormalizerKind::ArkResponses)
                 && !caps.ark_style
             {
                 return Ok(body);
             }
             let request = match plan.continuation {
-                ContinuationPolicy::None => pipeline.parser.parse(&json),
+                ContinuationPolicy::None => plan.request_parser.parse(&json),
                 ContinuationPolicy::ResponsesState => {
-                    pipeline
-                        .parser
+                    plan.request_parser
                         .parse_with_context(&json, previous_request, last_reasoning)
                 }
             }
             .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            let rendered_request = pipeline.renderer.render(&request, &caps).map_err(|err| {
-                RequestConversionRejected::from_conversion_error(err, plan.downstream)
-            })?;
+            let rendered_request =
+                plan.request_renderer
+                    .render(&request, &caps)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?;
             let rendered = rendered_request.body;
             let report = rendered_request.report;
             let rendered = if let Some(normalizer) = pipeline.normalizer {
                 normalizer
-                    .normalize(&request, &caps, pipeline.target, rendered)
+                    .normalize(&request, &caps, plan.target, rendered)
                     .map_err(|err| {
                         RequestConversionRejected::from_conversion_error(err, plan.downstream)
                     })?
@@ -606,13 +608,7 @@ mod tests {
                 UpstreamApi::OpenAiChatCompletions,
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
-                RequestAction::Transform(RequestPipeline {
-                    source: Protocol::AnthropicMessages,
-                    target: Protocol::OpenAiChatCompletions,
-                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::AnthropicMessages,
-                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiChatCompletions,
-                    normalizer: None,
-                }),
+                RequestAction::Transform(RequestPipeline { normalizer: None }),
                 ResponsePipeline {
                     source: Protocol::OpenAiChatCompletions,
                     target: Protocol::AnthropicMessages,
@@ -622,13 +618,7 @@ mod tests {
                 UpstreamApi::OpenAiChatCompletions,
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
-                RequestAction::Transform(RequestPipeline {
-                    source: Protocol::OpenAiResponses,
-                    target: Protocol::OpenAiChatCompletions,
-                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses,
-                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiChatCompletions,
-                    normalizer: None,
-                }),
+                RequestAction::Transform(RequestPipeline { normalizer: None }),
                 ResponsePipeline {
                     source: Protocol::OpenAiChatCompletions,
                     target: Protocol::OpenAiResponses,
@@ -649,10 +639,6 @@ mod tests {
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
-                    source: Protocol::OpenAiResponses,
-                    target: Protocol::OpenAiResponses,
-                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses,
-                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiResponses,
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
                 }),
                 ResponsePipeline {
