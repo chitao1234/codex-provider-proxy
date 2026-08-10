@@ -4,10 +4,10 @@ use crate::ir::{ContentItem, ContentPart, ResponseIr};
 
 pub fn render(response: &ResponseIr) -> Value {
     let response_id = response.response_id.as_deref().map(|id| {
-        if id.starts_with("msg_") {
-            format!("resp_{id}")
-        } else {
+        if id.starts_with("resp_") {
             id.to_owned()
+        } else {
+            format!("resp_{id}")
         }
     });
     let mut object = Map::new();

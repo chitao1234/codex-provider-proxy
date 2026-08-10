@@ -138,6 +138,17 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
         object,
         &["id", "object", "created", "model", "choices", "usage"],
     );
+    if let Some(details) = object
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(|usage| usage.get("completion_tokens_details"))
+    {
+        response.extensions.push(crate::ir::Extension::new(
+            "openai.chat_completions",
+            "output_tokens_details",
+            details.clone(),
+        ));
+    }
     Ok(response)
 }
 
@@ -145,7 +156,16 @@ fn parse_usage(object: &Map<String, Value>) -> Usage {
     Usage {
         input_tokens: object.get("prompt_tokens").and_then(Value::as_u64),
         output_tokens: object.get("completion_tokens").and_then(Value::as_u64),
-        total_tokens: object.get("total_tokens").and_then(Value::as_u64),
+        total_tokens: object
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                object
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .zip(object.get("completion_tokens").and_then(Value::as_u64))
+                    .map(|(input, output)| input + output)
+            }),
         cached_input_tokens: object
             .get("prompt_tokens_details")
             .and_then(Value::as_object)

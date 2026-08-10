@@ -45,3 +45,13 @@ fn messages_parser_preserves_thinking_and_tool_use() {
     );
     assert_eq!(response.output.len(), 2);
 }
+
+#[test]
+fn chat_usage_sums_when_total_missing() {
+    let response = parse_response(
+        Protocol::OpenAiChatCompletions,
+        &json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+    )
+    .unwrap();
+    assert_eq!(response.usage.total_tokens, Some(15));
+}
