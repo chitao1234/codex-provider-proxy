@@ -53,8 +53,19 @@ impl Extension {
         key: impl Into<String>,
         value: Value,
     ) -> Self {
-        let mut extension = Self::new(namespace, key, value);
-        extension.scope = ExtensionScope::Response;
+        Self::scoped_opaque(namespace, key, value, ExtensionScope::Response)
+    }
+
+    pub fn scoped_opaque(
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+        value: Value,
+        scope: ExtensionScope,
+    ) -> Self {
+        let namespace = namespace.into();
+        let mut extension = Self::new(namespace.clone(), key, value);
+        extension.scope = scope;
+        extension.source_protocol = Some(namespace);
         extension.replay = ReplayPolicy::ReplayAsTargetOpaque;
         extension
     }
@@ -64,5 +75,9 @@ impl Extension {
             self.replay,
             ReplayPolicy::ReplayAsTargetOpaque | ReplayPolicy::ReplayIfSupported
         )
+    }
+
+    pub fn is_replayable_in(&self, scope: ExtensionScope) -> bool {
+        self.scope == scope && self.is_replayable_as_opaque()
     }
 }

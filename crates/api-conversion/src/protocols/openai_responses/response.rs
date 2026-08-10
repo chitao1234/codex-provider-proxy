@@ -2,7 +2,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::ConversionError,
-    ir::{ContentItem, ContentPart, ResponseIr, StopReason, ToolCall, ToolResult, Usage},
+    ir::{
+        ContentItem, ContentPart, ExtensionScope, ResponseIr, StopReason, ToolCall, ToolResult,
+        Usage,
+    },
 };
 
 pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
@@ -71,6 +74,7 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     extensions: extensions(
                         item_object,
                         &["type", "id", "status", "role", "content"],
+                        ExtensionScope::Message,
                     ),
                 });
             }
@@ -94,7 +98,11 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                 output.push(ContentItem::Reasoning {
                     id,
                     content,
-                    extensions: extensions(item_object, &["type", "id", "status", "summary"]),
+                    extensions: extensions(
+                        item_object,
+                        &["type", "id", "status", "summary"],
+                        ExtensionScope::ContentItem,
+                    ),
                 });
             }
             Some("function_call" | "custom_tool_call") => output.push(ContentItem::ToolUse {
@@ -122,6 +130,7 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     metadata: extensions(
                         item_object,
                         &["type", "id", "status", "call_id", "name", "arguments"],
+                        ExtensionScope::ToolCall,
                     )
                     .into_iter()
                     .map(|e| (e.key, e.value))
@@ -140,7 +149,11 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         item_object.get("output").cloned().unwrap_or(Value::Null),
                     )],
                     is_error: false,
-                    extensions: extensions(item_object, &["type", "call_id", "output"]),
+                    extensions: extensions(
+                        item_object,
+                        &["type", "call_id", "output"],
+                        ExtensionScope::ContentItem,
+                    ),
                 },
             }),
             _ => output.push(ContentItem::Unknown {
@@ -228,17 +241,22 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                 "error",
                 "incomplete_details",
             ],
+            ExtensionScope::Response,
         ),
         ..ResponseIr::default()
     })
 }
 
-fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
+fn extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<crate::ir::Extension> {
     object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
-            crate::ir::Extension::response_opaque("openai.responses", key, value.clone())
+            crate::ir::Extension::scoped_opaque("openai.responses", key, value.clone(), scope)
         })
         .collect()
 }

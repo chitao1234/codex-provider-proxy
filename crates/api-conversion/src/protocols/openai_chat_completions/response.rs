@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::ConversionError,
-    ir::{ContentItem, ContentPart, ResponseIr, StopReason, ToolCall, Usage},
+    ir::{ContentItem, ContentPart, ExtensionScope, ResponseIr, StopReason, ToolCall, Usage},
 };
 
 pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
@@ -51,6 +51,7 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         "tool_calls",
                         "refusal",
                     ],
+                    ExtensionScope::Message,
                 ),
             });
         }
@@ -91,15 +92,25 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         status: Some("completed".to_owned()),
                         metadata: tool
                             .as_object()
-                            .map(|tool| extensions(tool, &["id", "type", "function"]))
+                            .map(|tool| {
+                                extensions(
+                                    tool,
+                                    &["id", "type", "function"],
+                                    ExtensionScope::ToolCall,
+                                )
+                            })
                             .unwrap_or_default()
                             .into_iter()
                             .map(|extension| (extension.key, extension.value))
                             .collect(),
-                        function_metadata: extensions(function, &["name", "arguments"])
-                            .into_iter()
-                            .map(|extension| (extension.key, extension.value))
-                            .collect(),
+                        function_metadata: extensions(
+                            function,
+                            &["name", "arguments"],
+                            ExtensionScope::ToolCall,
+                        )
+                        .into_iter()
+                        .map(|extension| (extension.key, extension.value))
+                        .collect(),
                         extensions: Vec::new(),
                     },
                 });
@@ -137,6 +148,7 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
     response.extensions = extensions(
         object,
         &["id", "object", "created", "model", "choices", "usage"],
+        ExtensionScope::Response,
     );
     if let Some(details) = object
         .get("usage")
@@ -226,12 +238,21 @@ fn usage_extensions(
         .collect()
 }
 
-fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
+fn extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<crate::ir::Extension> {
     object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
-            crate::ir::Extension::response_opaque("openai.chat_completions", key, value.clone())
+            crate::ir::Extension::scoped_opaque(
+                "openai.chat_completions",
+                key,
+                value.clone(),
+                scope,
+            )
         })
         .collect()
 }

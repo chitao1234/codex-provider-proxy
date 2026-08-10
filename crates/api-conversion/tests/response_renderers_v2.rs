@@ -1,5 +1,8 @@
 use codex_provider_proxy_api_conversion::{
-    ir::{ContentItem, ContentPart, Extension, ResponseIr, StopReason},
+    ir::{
+        ContentItem, ContentPart, Extension, ExtensionScope, ReplayPolicy, ResponseIr, StopReason,
+        ToolResult,
+    },
     protocols::{parse_response, render_response},
     request_ir::Protocol,
 };
@@ -68,4 +71,90 @@ fn response_extension_replay_policy_controls_provider_fields() {
     blocked.extensions.push(extension);
     let rendered = render_response(Protocol::OpenAiResponses, &blocked).unwrap();
     assert!(rendered.get("x_blocked").is_none());
+
+    let mut wrong_scope = ResponseIr::default();
+    wrong_scope.extensions.push(Extension::scoped_opaque(
+        "provider",
+        "x_item_only",
+        json!(true),
+        ExtensionScope::ContentItem,
+    ));
+    let rendered = render_response(Protocol::OpenAiResponses, &wrong_scope).unwrap();
+    assert!(rendered.get("x_item_only").is_none());
+}
+
+#[test]
+fn item_and_tool_extensions_replay_at_their_target_scope() {
+    let parsed = parse_response(
+        Protocol::OpenAiChatCompletions,
+        &json!({
+            "id": "chat-1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "x_message": "message-meta",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "x_tool": "tool-meta",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{}",
+                            "x_function": "function-meta"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    )
+    .unwrap();
+
+    let responses = render_response(Protocol::OpenAiResponses, &parsed).unwrap();
+    assert_eq!(responses["output"][0]["x_message"], "message-meta");
+    assert!(responses.get("x_message").is_none());
+    assert_eq!(responses["output"][1]["x_tool"], "tool-meta");
+    assert_eq!(responses["output"][1]["x_function"], "function-meta");
+
+    let messages = render_response(Protocol::AnthropicMessages, &parsed).unwrap();
+    assert_eq!(messages["x_message"], "message-meta");
+    assert_eq!(messages["content"][1]["x_tool"], "tool-meta");
+    assert_eq!(messages["content"][1]["x_function"], "function-meta");
+}
+
+#[test]
+fn messages_renderer_preserves_future_and_tool_result_items() {
+    let mut never_replay = Extension::scoped_opaque(
+        "provider",
+        "x_blocked",
+        json!(true),
+        ExtensionScope::ContentItem,
+    );
+    never_replay.replay = ReplayPolicy::NeverReplay;
+    let response = ResponseIr {
+        output: vec![
+            ContentItem::Unknown {
+                id: Some("future-1".into()),
+                kind: "future_item".into(),
+                payload: json!({"type":"future_item","vendor":{"a":1}}),
+                extensions: vec![never_replay],
+            },
+            ContentItem::ToolResult {
+                result: ToolResult {
+                    call_id: Some("call-1".into()),
+                    content: vec![ContentPart::Text("done".into())],
+                    is_error: false,
+                    extensions: vec![],
+                },
+            },
+        ],
+        ..ResponseIr::default()
+    };
+    let rendered = render_response(Protocol::AnthropicMessages, &response).unwrap();
+    assert_eq!(rendered["content"][0]["type"], "future_item");
+    assert_eq!(rendered["content"][0]["vendor"]["a"], 1);
+    assert!(rendered["content"][0].get("x_blocked").is_none());
+    assert_eq!(rendered["content"][1]["type"], "tool_result");
+    assert_eq!(rendered["content"][1]["tool_use_id"], "call-1");
 }

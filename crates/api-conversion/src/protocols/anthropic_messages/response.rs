@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::ConversionError,
-    ir::{ContentItem, ContentPart, ResponseIr, StopReason, ToolCall, Usage},
+    ir::{ContentItem, ContentPart, ExtensionScope, ResponseIr, StopReason, ToolCall, Usage},
 };
 
 pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
@@ -35,7 +35,11 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         .unwrap_or_default()
                         .into(),
                 )],
-                extensions: extensions(block_object, &["type", "text"]),
+                extensions: extensions(
+                    block_object,
+                    &["type", "text"],
+                    ExtensionScope::ContentItem,
+                ),
             }),
             Some("thinking") => output.push(ContentItem::Reasoning {
                 id: block_object
@@ -53,7 +57,11 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                 }],
-                extensions: extensions(block_object, &["type", "thinking", "signature", "id"]),
+                extensions: extensions(
+                    block_object,
+                    &["type", "thinking", "signature", "id"],
+                    ExtensionScope::ContentItem,
+                ),
             }),
             Some("redacted_thinking") => output.push(ContentItem::Unknown {
                 id: block_object
@@ -84,10 +92,14 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                     )
                     .unwrap_or_default(),
                     status: Some("completed".into()),
-                    metadata: extensions(block_object, &["type", "id", "name", "input"])
-                        .into_iter()
-                        .map(|e| (e.key, e.value))
-                        .collect(),
+                    metadata: extensions(
+                        block_object,
+                        &["type", "id", "name", "input"],
+                        ExtensionScope::ToolCall,
+                    )
+                    .into_iter()
+                    .map(|e| (e.key, e.value))
+                    .collect(),
                     function_metadata: Map::new().into_iter().collect(),
                     extensions: Vec::new(),
                 },
@@ -158,17 +170,22 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
                 "stop_sequence",
                 "usage",
             ],
+            ExtensionScope::Response,
         ),
         ..ResponseIr::default()
     })
 }
 
-fn extensions(object: &Map<String, Value>, structural: &[&str]) -> Vec<crate::ir::Extension> {
+fn extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<crate::ir::Extension> {
     object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| {
-            crate::ir::Extension::response_opaque("anthropic.messages", key, value.clone())
+            crate::ir::Extension::scoped_opaque("anthropic.messages", key, value.clone(), scope)
         })
         .collect()
 }

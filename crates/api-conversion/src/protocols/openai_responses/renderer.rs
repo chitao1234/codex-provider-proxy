@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use crate::ir::{ContentItem, ContentPart, ResponseIr};
+use crate::ir::{ContentItem, ContentPart, Extension, ExtensionScope, ResponseIr};
 
 pub fn render(response: &ResponseIr) -> Value {
     let response_id = response.response_id.as_deref().map(|id| {
@@ -40,7 +40,7 @@ pub fn render(response: &ResponseIr) -> Value {
     );
     object.insert("usage".into(), render_usage(&response.usage));
     for extension in response.extensions.iter().chain(response.opaque.iter()) {
-        if extension.is_replayable_as_opaque() {
+        if extension.is_replayable_in(ExtensionScope::Response) {
             object
                 .entry(extension.key.clone())
                 .or_insert_with(|| extension.value.clone());
@@ -62,7 +62,7 @@ fn render_usage(usage: &crate::ir::Usage) -> Value {
     });
     if let Some(object) = rendered.as_object_mut() {
         for extension in &usage.extensions {
-            if extension.is_replayable_as_opaque() {
+            if extension.is_replayable_in(ExtensionScope::Usage) {
                 object
                     .entry(extension.key.clone())
                     .or_insert_with(|| extension.value.clone());
@@ -73,7 +73,7 @@ fn render_usage(usage: &crate::ir::Usage) -> Value {
 }
 
 fn render_item(index: usize, item: &ContentItem) -> Value {
-    match item {
+    let mut rendered = match item {
         ContentItem::Message { role, content, .. } => {
             json!({"id": format!("msg_{index}"), "type": "message", "status": "completed", "role": role, "content": content.iter().filter_map(render_content).collect::<Vec<_>>() })
         }
@@ -106,6 +106,52 @@ fn render_item(index: usize, item: &ContentItem) -> Value {
             }
             value
         }
+    };
+    if let Some(object) = rendered.as_object_mut() {
+        replay_item_extensions(object, item);
+    }
+    rendered
+}
+
+fn replay_item_extensions(output: &mut Map<String, Value>, item: &ContentItem) {
+    match item {
+        ContentItem::Message { extensions, .. } => {
+            replay_scoped(output, extensions, ExtensionScope::Message);
+            replay_scoped(output, extensions, ExtensionScope::ContentItem);
+        }
+        ContentItem::Refusal { extensions, .. }
+        | ContentItem::Reasoning { extensions, .. }
+        | ContentItem::ServerTool { extensions, .. }
+        | ContentItem::Unknown { extensions, .. } => {
+            replay_scoped(output, extensions, ExtensionScope::ContentItem)
+        }
+        ContentItem::ToolUse { call, .. } => {
+            replay_map(output, &call.metadata);
+            replay_map(output, &call.function_metadata);
+            replay_scoped(output, &call.extensions, ExtensionScope::ToolCall);
+        }
+        ContentItem::ToolResult { result } => {
+            replay_scoped(output, &result.extensions, ExtensionScope::ContentItem)
+        }
+    }
+}
+
+fn replay_scoped(output: &mut Map<String, Value>, extensions: &[Extension], scope: ExtensionScope) {
+    for extension in extensions {
+        if extension.is_replayable_in(scope) {
+            output
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
+    }
+}
+
+fn replay_map(
+    output: &mut Map<String, Value>,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) {
+    for (key, value) in extensions {
+        output.entry(key.clone()).or_insert_with(|| value.clone());
     }
 }
 
