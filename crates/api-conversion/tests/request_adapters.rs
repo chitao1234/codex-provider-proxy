@@ -157,3 +157,35 @@ fn messages_v2_renderer_preserves_identity_and_message_semantics() {
     assert_eq!(rendered["messages"], legacy["messages"]);
     assert_eq!(rendered["metadata"], legacy["metadata"]);
 }
+
+#[test]
+fn chat_v2_renderer_matches_cross_protocol_fixture_shape() {
+    for (protocol, fixture_name) in [
+        (Protocol::OpenAiResponses, "openai_responses"),
+        (Protocol::AnthropicMessages, "anthropic_messages"),
+    ] {
+        let adapter = RequestAdapterKind::for_protocol(protocol);
+        let source = fixture(fixture_name);
+        let legacy = adapter
+            .parse(&source)
+            .unwrap()
+            .render_with_report(
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap()
+            .0;
+        let v2 = adapter.parse_v2(&source).unwrap();
+        let rendered = adapter
+            .render_v2(
+                &v2,
+                Protocol::OpenAiChatCompletions,
+                &ModelCapabilities::default(),
+            )
+            .unwrap()
+            .body;
+
+        assert_eq!(rendered["model"], legacy["model"], "{fixture_name}");
+        assert_eq!(rendered["messages"], legacy["messages"], "{fixture_name}");
+    }
+}

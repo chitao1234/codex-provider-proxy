@@ -76,10 +76,7 @@ pub trait RequestAdapter {
                 crate::protocols::anthropic_messages::request::render(request, capabilities)?
             }
             Protocol::OpenAiChatCompletions => {
-                return Err(ConversionError::unsupported(
-                    "request.v2.target",
-                    "OpenAiChatCompletions v2 rendering is not migrated",
-                ))
+                crate::protocols::openai_chat_completions::request::render(request, capabilities)?
             }
         };
         Ok(RenderedRequest { body, report })
