@@ -16,7 +16,6 @@ use axum::{
     Router,
 };
 use bytes::{Bytes, BytesMut};
-use codex_provider_proxy_api_conversion::request_adapter::RequestAdapter;
 use futures_util::{Stream, TryStreamExt};
 use pin_project_lite::pin_project;
 use serde_json::Value;
@@ -1499,15 +1498,13 @@ fn maybe_convert_request_body(
             )
         })?;
         Some(
-            codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
-                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
-            )
-            .parse_v2_with_context(
-                &value,
-                previous_state.as_ref().map(|previous| &previous.request_ir),
-                last_reasoning,
-            )
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+            codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses
+                .parse_with_context(
+                    &value,
+                    previous_state.as_ref().map(|previous| &previous.request_ir),
+                    last_reasoning,
+                )
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
         )
     } else {
         None
@@ -2941,7 +2938,6 @@ mod tests {
         Router,
     };
     use bytes::BytesMut;
-    use codex_provider_proxy_api_conversion::request_adapter::RequestAdapter;
     use futures_util::{stream, StreamExt};
     use pid_resolver::platform::default_pid_resolver;
     use serde_json::json;
@@ -5041,16 +5037,13 @@ mod tests {
         assert_eq!(body.as_ref(), upstream_body.as_bytes());
         let recorded = response_states.get("resp_1").unwrap();
         let rendered =
-            codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
-                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
-            )
-            .render_v2(
-                &recorded.request_ir,
-                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
-                &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
-            )
-            .unwrap()
-            .body;
+            codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiResponses
+                .render(
+                    &recorded.request_ir,
+                    &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
+                )
+                .unwrap()
+                .body;
         assert!(rendered["input"]
             .as_array()
             .unwrap()

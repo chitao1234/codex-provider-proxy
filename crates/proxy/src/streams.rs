@@ -479,8 +479,7 @@ mod tests {
 
     use codex_provider_proxy_api_conversion::{
         ir::{CanonicalResponseEvent, RequestIr},
-        protocol::Protocol,
-        request_adapter::{RequestAdapter, RequestAdapterKind},
+        request::RequestParserKind,
     };
     use futures_util::{stream, StreamExt};
     use serde_json::Value;
@@ -488,8 +487,8 @@ mod tests {
     use super::*;
 
     fn responses_request() -> RequestIr {
-        RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
-            .parse_v2(&serde_json::json!({"model":"model", "input":"hi"}))
+        RequestParserKind::OpenAiResponses
+            .parse(&serde_json::json!({"model":"model", "input":"hi"}))
             .unwrap()
     }
 

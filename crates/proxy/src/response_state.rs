@@ -136,15 +136,12 @@ pub(crate) fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_provider_proxy_api_conversion::{
-        protocol::Protocol,
-        request_adapter::{RequestAdapter, RequestAdapterKind},
-    };
+    use codex_provider_proxy_api_conversion::request::RequestParserKind;
     use serde_json::json;
 
     fn request(body: serde_json::Value) -> RequestIr {
-        RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions)
-            .parse_v2(&body)
+        RequestParserKind::OpenAiChatCompletions
+            .parse(&body)
             .unwrap()
     }
 

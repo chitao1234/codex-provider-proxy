@@ -2,12 +2,15 @@ use crate::{
     dialect::{DownstreamApi, UpstreamApi},
     protocol::Protocol,
     provider_normalizer::RequestNormalizerKind,
+    request::{RequestParserKind, RequestRendererKind},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPipeline {
     pub source: Protocol,
     pub target: Protocol,
+    pub parser: RequestParserKind,
+    pub renderer: RequestRendererKind,
     pub normalizer: Option<RequestNormalizerKind>,
 }
 
@@ -67,6 +70,8 @@ impl ConversionPlan {
             RequestAction::Transform(RequestPipeline {
                 source,
                 target,
+                parser: RequestParserKind::for_protocol(source),
+                renderer: RequestRendererKind::for_protocol(target),
                 normalizer,
             })
         };
@@ -116,6 +121,8 @@ mod tests {
             RequestAction::Transform(RequestPipeline {
                 source: Protocol::OpenAiResponses,
                 target: Protocol::AnthropicMessages,
+                parser: RequestParserKind::OpenAiResponses,
+                renderer: RequestRendererKind::AnthropicMessages,
                 normalizer: None,
             })
         );

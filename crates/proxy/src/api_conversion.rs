@@ -22,7 +22,6 @@ pub use codex_provider_proxy_api_conversion::plan::{
 };
 use codex_provider_proxy_api_conversion::protocol::Protocol;
 use codex_provider_proxy_api_conversion::provider_normalizer::RequestNormalizerKind;
-use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;
@@ -203,21 +202,20 @@ pub fn convert_request_body(
             {
                 return Ok(body);
             }
-            let adapter = RequestAdapterKind::for_protocol(source);
             let request = match plan.continuation {
-                ContinuationPolicy::None => adapter.parse_v2(&json),
+                ContinuationPolicy::None => pipeline.parser.parse(&json),
                 ContinuationPolicy::ResponsesState => {
-                    adapter.parse_v2_with_context(&json, previous_request, last_reasoning)
+                    pipeline
+                        .parser
+                        .parse_with_context(&json, previous_request, last_reasoning)
                 }
             }
             .map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            let rendered_request = adapter
-                .render_v2(&request, pipeline.target, &caps)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?;
+            let rendered_request = pipeline.renderer.render(&request, &caps).map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
             let rendered = rendered_request.body;
             let report = rendered_request.report;
             let rendered = if let Some(normalizer) = pipeline.normalizer {
@@ -588,6 +586,7 @@ pub fn strip_converted_response_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use codex_provider_proxy_api_conversion::plan::{ExtensionPolicy, RequestPipeline};
+    use codex_provider_proxy_api_conversion::request::{RequestParserKind, RequestRendererKind};
     use futures_util::{stream, StreamExt};
 
     use super::*;
@@ -610,6 +609,8 @@ mod tests {
                 RequestAction::Transform(RequestPipeline {
                     source: Protocol::AnthropicMessages,
                     target: Protocol::OpenAiChatCompletions,
+                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::AnthropicMessages,
+                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
@@ -624,6 +625,8 @@ mod tests {
                 RequestAction::Transform(RequestPipeline {
                     source: Protocol::OpenAiResponses,
                     target: Protocol::OpenAiChatCompletions,
+                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses,
+                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
@@ -648,6 +651,8 @@ mod tests {
                 RequestAction::Transform(RequestPipeline {
                     source: Protocol::OpenAiResponses,
                     target: Protocol::OpenAiResponses,
+                    parser: codex_provider_proxy_api_conversion::request::RequestParserKind::OpenAiResponses,
+                    renderer: codex_provider_proxy_api_conversion::request::RequestRendererKind::OpenAiResponses,
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
                 }),
                 ResponsePipeline {
@@ -1071,8 +1076,8 @@ accept_downstream_apis = ["openai_responses"]
 
         for (source, body, expected_id) in cases {
             let store = crate::response_state::ResponseStateStore::new(4);
-            let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
-                .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
+            let request_ir = RequestParserKind::OpenAiResponses
+                .parse(&serde_json::json!({"model":"m", "input":"hi"}))
                 .unwrap();
             let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
             let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from(
@@ -1093,12 +1098,8 @@ accept_downstream_apis = ["openai_responses"]
 
             let state = store.get(expected_id).expect("response state recorded");
             assert_eq!(state.last_reasoning.as_deref(), Some("thought"));
-            let rendered = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
-                .render_v2(
-                    &state.request_ir,
-                    Protocol::OpenAiChatCompletions,
-                    &ModelCapabilities::default(),
-                )
+            let rendered = RequestRendererKind::OpenAiChatCompletions
+                .render(&state.request_ir, &ModelCapabilities::default())
                 .unwrap()
                 .body;
             let messages = rendered["messages"].as_array().unwrap();
@@ -1115,8 +1116,8 @@ accept_downstream_apis = ["openai_responses"]
             ("failed", serde_json::json!({"message":"boom"})),
         ] {
             let store = crate::response_state::ResponseStateStore::new(4);
-            let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
-                .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
+            let request_ir = RequestParserKind::OpenAiResponses
+                .parse(&serde_json::json!({"model":"m", "input":"hi"}))
                 .unwrap();
             let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
             let body = serde_json::json!({
@@ -1149,8 +1150,8 @@ accept_downstream_apis = ["openai_responses"]
     #[tokio::test]
     async fn chat_stream_recorder_consumes_streaming_response_ir() {
         let store = crate::response_state::ResponseStateStore::new(4);
-        let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
-            .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
+        let request_ir = RequestParserKind::OpenAiResponses
+            .parse(&serde_json::json!({"model":"m", "input":"hi"}))
             .unwrap();
         let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
         let body = concat!(

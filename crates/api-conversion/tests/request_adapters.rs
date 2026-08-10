@@ -7,7 +7,7 @@ use codex_provider_proxy_api_conversion::{
     },
     ir::ContentItem,
     protocol::Protocol,
-    request_adapter::{RequestAdapter, RequestAdapterKind},
+    request::{RequestParserKind, RequestRendererKind},
 };
 use serde_json::Value;
 
@@ -20,7 +20,7 @@ fn fixture(name: &str) -> Value {
 }
 
 #[test]
-fn each_protocol_has_an_independent_request_adapter() {
+fn each_protocol_has_independent_request_parser_and_renderer() {
     let cases = [
         (Protocol::OpenAiResponses, "openai_responses"),
         (Protocol::OpenAiChatCompletions, "openai_chat_completions"),
@@ -28,11 +28,11 @@ fn each_protocol_has_an_independent_request_adapter() {
     ];
 
     for (protocol, fixture_name) in cases {
-        let adapter = RequestAdapterKind::for_protocol(protocol);
-        assert_eq!(adapter.protocol(), protocol);
-        let request = adapter.parse_v2(&fixture(fixture_name)).unwrap();
-        let rendered = adapter
-            .render_v2(&request, protocol, &ModelCapabilities::default())
+        let parser = RequestParserKind::for_protocol(protocol);
+        assert_eq!(parser.protocol(), protocol);
+        let request = parser.parse(&fixture(fixture_name)).unwrap();
+        let rendered = RequestRendererKind::for_protocol(protocol)
+            .render(&request, &ModelCapabilities::default())
             .unwrap();
         assert!(rendered.body.is_object());
         assert_eq!(rendered.body["model"], "phase0-model");
@@ -46,9 +46,8 @@ fn request_extensions_record_their_source_protocol() {
         (Protocol::OpenAiChatCompletions, "openai_chat_completions"),
         (Protocol::AnthropicMessages, "anthropic_messages"),
     ] {
-        let adapter = RequestAdapterKind::for_protocol(protocol);
-        let request = adapter
-            .parse_v2(&serde_json::json!({
+        let request = RequestParserKind::for_protocol(protocol)
+            .parse(&serde_json::json!({
                 "model": "m",
                 "x_provider_parameter": true,
                 "x_session_id": "session-1"
@@ -67,16 +66,16 @@ fn request_extensions_record_their_source_protocol() {
 
 #[test]
 fn adapter_dispatch_preserves_responses_continuation_context() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let previous = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::OpenAiResponses;
+    let previous = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "input": "first",
             "prompt_cache_key": "cache-1"
         }))
         .unwrap();
-    let current = adapter
-        .parse_v2_with_context(
+    let current = parser
+        .parse_with_context(
             &serde_json::json!({
                 "model": "m",
                 "previous_response_id": "resp-1",
@@ -88,8 +87,8 @@ fn adapter_dispatch_preserves_responses_continuation_context() {
         .unwrap();
     let mut capabilities = ModelCapabilities::default();
     capabilities.cache.prompt_cache_key = true;
-    let rendered = adapter
-        .render_v2(&current, Protocol::OpenAiResponses, &capabilities)
+    let rendered = RequestRendererKind::OpenAiResponses
+        .render(&current, &capabilities)
         .unwrap();
 
     assert_eq!(rendered.body["previous_response_id"], "resp-1");
@@ -98,9 +97,8 @@ fn adapter_dispatch_preserves_responses_continuation_context() {
 
 #[test]
 fn responses_adapter_exposes_semantic_v2_request_without_messages_shape() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let request = RequestParserKind::OpenAiResponses
+        .parse(&serde_json::json!({
             "model": "m",
             "input": [
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
@@ -141,9 +139,9 @@ fn responses_adapter_exposes_semantic_v2_request_without_messages_shape() {
 
 #[test]
 fn v2_state_rendering_respects_cache_and_identity_capabilities() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiResponses);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "input": "hello",
             "user": "end-user",
@@ -162,8 +160,8 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     capabilities.cache.prompt_cache_options = true;
     capabilities.cache.block_cache_control = true;
 
-    let responses = adapter
-        .render_v2(&request, Protocol::OpenAiResponses, &capabilities)
+    let responses = RequestRendererKind::OpenAiResponses
+        .render(&request, &capabilities)
         .unwrap()
         .body;
     assert_eq!(responses["user"], "end-user");
@@ -175,8 +173,8 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     assert_eq!(responses["metadata"]["tenant"], "workspace");
     assert_eq!(responses["store"], false);
 
-    let chat = adapter
-        .render_v2(&request, Protocol::OpenAiChatCompletions, &capabilities)
+    let chat = RequestRendererKind::OpenAiChatCompletions
+        .render(&request, &capabilities)
         .unwrap()
         .body;
     assert_eq!(chat["user"], "cache-1");
@@ -185,8 +183,8 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     assert_eq!(chat["x_provider_session_id"], "session-1");
     assert_eq!(chat["safety_identifier"], "safety-1");
 
-    let messages = adapter
-        .render_v2(&request, Protocol::AnthropicMessages, &capabilities)
+    let messages = RequestRendererKind::AnthropicMessages
+        .render(&request, &capabilities)
         .unwrap()
         .body;
     assert_eq!(messages["metadata"]["tenant"], "workspace");
@@ -194,12 +192,8 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     assert_eq!(messages["cache_control"]["type"], "ephemeral");
     assert_eq!(messages["x_provider_session_id"], "session-1");
 
-    let disabled = adapter
-        .render_v2(
-            &request,
-            Protocol::OpenAiResponses,
-            &ModelCapabilities::default(),
-        )
+    let disabled = RequestRendererKind::OpenAiResponses
+        .render(&request, &ModelCapabilities::default())
         .unwrap()
         .body;
     assert!(disabled.get("prompt_cache_key").is_none());
@@ -210,9 +204,9 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
 
 #[test]
 fn chat_v2_renderer_applies_generation_capabilities() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiResponses);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "stream": true,
             "input": "hello",
@@ -238,8 +232,8 @@ fn chat_v2_renderer_applies_generation_capabilities() {
         reasoning_split: Some(true),
         ..ModelCapabilities::default()
     };
-    let rendered = adapter
-        .render_v2(&request, Protocol::OpenAiChatCompletions, &capabilities)
+    let rendered = RequestRendererKind::OpenAiChatCompletions
+        .render(&request, &capabilities)
         .unwrap()
         .body;
 
@@ -265,16 +259,16 @@ fn chat_v2_renderer_applies_generation_capabilities() {
         response_format: ResponseFormatCap::Text,
         ..capabilities
     };
-    assert!(adapter
-        .render_v2(&request, Protocol::OpenAiChatCompletions, &rejecting,)
+    assert!(RequestRendererKind::OpenAiChatCompletions
+        .render(&request, &rejecting)
         .is_err());
 }
 
 #[test]
 fn messages_v2_renderer_maps_generation_controls_by_dialect() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiResponses);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "input": "hello",
             "temperature": 0.3,
@@ -289,8 +283,8 @@ fn messages_v2_renderer_maps_generation_controls_by_dialect() {
         max_tokens_cap: Some(300),
         ..ModelCapabilities::default()
     };
-    let rendered = adapter
-        .render_v2(&request, Protocol::AnthropicMessages, &capabilities)
+    let rendered = RequestRendererKind::AnthropicMessages
+        .render(&request, &capabilities)
         .unwrap()
         .body;
 
@@ -305,8 +299,8 @@ fn messages_v2_renderer_maps_generation_controls_by_dialect() {
         accept_stop: false,
         ..capabilities
     };
-    let rendered = adapter
-        .render_v2(&request, Protocol::AnthropicMessages, &no_stop)
+    let rendered = RequestRendererKind::AnthropicMessages
+        .render(&request, &no_stop)
         .unwrap()
         .body;
     assert!(rendered.get("stop_sequences").is_none());
@@ -314,9 +308,9 @@ fn messages_v2_renderer_maps_generation_controls_by_dialect() {
 
 #[test]
 fn responses_v2_renderer_preserves_reasoning_extensions_and_role_policy() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiResponses);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "input": [
                 {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "policy"}]},
@@ -333,8 +327,8 @@ fn responses_v2_renderer_preserves_reasoning_extensions_and_role_policy() {
         accept_developer_role: false,
         ..ModelCapabilities::default()
     };
-    let rendered = adapter
-        .render_v2(&request, Protocol::OpenAiResponses, &capabilities)
+    let rendered = RequestRendererKind::OpenAiResponses
+        .render(&request, &capabilities)
         .unwrap()
         .body;
 
@@ -350,9 +344,9 @@ fn responses_v2_renderer_preserves_reasoning_extensions_and_role_policy() {
 
 #[test]
 fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::AnthropicMessages);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::AnthropicMessages);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "rust releases"}],
             "tools": [
@@ -364,12 +358,8 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
         }))
         .unwrap();
 
-    let dropped = adapter
-        .render_v2(
-            &request,
-            Protocol::OpenAiChatCompletions,
-            &ModelCapabilities::default(),
-        )
+    let dropped = RequestRendererKind::OpenAiChatCompletions
+        .render(&request, &ModelCapabilities::default())
         .unwrap();
     assert_eq!(dropped.body["tools"].as_array().unwrap().len(), 1);
     assert_eq!(dropped.report.dropped_server_tools.len(), 3);
@@ -378,12 +368,8 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
         server_tools: ServerToolPolicy::MapToFunction,
         ..ModelCapabilities::default()
     };
-    let mapped = adapter
-        .render_v2(
-            &request,
-            Protocol::OpenAiChatCompletions,
-            &mapped_capabilities,
-        )
+    let mapped = RequestRendererKind::OpenAiChatCompletions
+        .render(&request, &mapped_capabilities)
         .unwrap();
     let mapped_tools = mapped.body["tools"].as_array().unwrap();
     assert_eq!(mapped_tools.len(), 3);
@@ -399,12 +385,8 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
         server_tools: ServerToolPolicy::Passthrough,
         ..ModelCapabilities::default()
     };
-    let passthrough = adapter
-        .render_v2(
-            &request,
-            Protocol::OpenAiResponses,
-            &passthrough_capabilities,
-        )
+    let passthrough = RequestRendererKind::OpenAiResponses
+        .render(&request, &passthrough_capabilities)
         .unwrap();
     assert_eq!(passthrough.body["tools"][0]["type"], "web_search_20250305");
     assert_eq!(passthrough.body["tools"][1]["type"], "web_fetch_20250910");
@@ -422,8 +404,8 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
         always_enable_tools: vec!["WebFetch".to_owned()],
         ..ModelCapabilities::default()
     };
-    let native = adapter
-        .render_v2(&request, Protocol::OpenAiResponses, &native_capabilities)
+    let native = RequestRendererKind::OpenAiResponses
+        .render(&request, &native_capabilities)
         .unwrap();
     assert_eq!(native.body["tools"].as_array().unwrap().len(), 2);
     assert_eq!(native.body["tools"][0]["type"], "web_search");
@@ -439,9 +421,9 @@ fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
 
 #[test]
 fn nested_request_extensions_survive_protocol_translation() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiChatCompletions);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "messages": [
                 {
@@ -475,12 +457,8 @@ fn nested_request_extensions_survive_protocol_translation() {
             }]
         }))
         .unwrap();
-    let rendered = adapter
-        .render_v2(
-            &request,
-            Protocol::OpenAiResponses,
-            &ModelCapabilities::default(),
-        )
+    let rendered = RequestRendererKind::OpenAiResponses
+        .render(&request, &ModelCapabilities::default())
         .unwrap()
         .body;
     assert_eq!(rendered["input"][0]["x_message"], "message-extra");
@@ -497,9 +475,9 @@ fn nested_request_extensions_survive_protocol_translation() {
 
 #[test]
 fn chat_tool_messages_map_without_empty_assistant_items() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions);
-    let request = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::for_protocol(Protocol::OpenAiChatCompletions);
+    let request = parser
+        .parse(&serde_json::json!({
             "model": "m",
             "messages": [
                 {

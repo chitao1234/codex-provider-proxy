@@ -5,7 +5,7 @@ use codex_provider_proxy_api_conversion::{
     ir::{CanonicalResponseEvent, ContentPart, ResponseAccumulator, ResponseIr, StopReason},
     protocol::Protocol,
     protocols::{self, anthropic_messages, openai_chat_completions, openai_responses},
-    request_adapter::{RequestAdapter, RequestAdapterKind},
+    request::{RequestParserKind, RequestRendererKind},
 };
 use serde_json::Value;
 
@@ -26,10 +26,11 @@ fn read_lines(path: &str) -> Vec<String> {
 #[test]
 fn phase0_request_fixtures_parse_and_preserve_unknown_fields() {
     for (protocol, path) in request_cases() {
-        let adapter = RequestAdapterKind::for_protocol(protocol);
-        let request = adapter.parse_v2(&read_json(path)).unwrap();
-        let rendered = adapter
-            .render_v2(&request, protocol, &ModelCapabilities::default())
+        let request = RequestParserKind::for_protocol(protocol)
+            .parse(&read_json(path))
+            .unwrap();
+        let rendered = RequestRendererKind::for_protocol(protocol)
+            .render(&request, &ModelCapabilities::default())
             .unwrap()
             .body;
         assert_eq!(rendered["x_client_field"]["keep"], true, "{path}");
@@ -40,11 +41,12 @@ fn phase0_request_fixtures_parse_and_preserve_unknown_fields() {
 fn phase0_request_matrix_has_basic_outputs_for_each_target_protocol() {
     let targets = [Protocol::OpenAiResponses, Protocol::AnthropicMessages];
     for (source_protocol, path) in request_cases() {
-        let adapter = RequestAdapterKind::for_protocol(source_protocol);
-        let request = adapter.parse_v2(&read_json(path)).unwrap();
+        let request = RequestParserKind::for_protocol(source_protocol)
+            .parse(&read_json(path))
+            .unwrap();
         for target in targets {
-            let rendered = adapter
-                .render_v2(&request, target, &ModelCapabilities::default())
+            let rendered = RequestRendererKind::for_protocol(target)
+                .render(&request, &ModelCapabilities::default())
                 .unwrap()
                 .body;
             assert_eq!(rendered["model"], "phase0-model", "{path} -> {target:?}");
@@ -89,16 +91,16 @@ fn phase0_response_matrix_has_basic_outputs_for_supported_targets() {
 
 #[test]
 fn phase0_state_and_cache_identity_mapping_is_explicit() {
-    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
-    let previous = adapter
-        .parse_v2(&serde_json::json!({
+    let parser = RequestParserKind::OpenAiResponses;
+    let previous = parser
+        .parse(&serde_json::json!({
             "model": "phase0-model",
             "input": "first",
             "prompt_cache_key": "phase0-cache"
         }))
         .unwrap();
-    let continued = adapter
-        .parse_v2_with_context(
+    let continued = parser
+        .parse_with_context(
             &serde_json::json!({
                 "model": "phase0-model",
                 "previous_response_id": "resp_phase0",
@@ -111,19 +113,15 @@ fn phase0_state_and_cache_identity_mapping_is_explicit() {
 
     let mut capabilities = ModelCapabilities::default();
     capabilities.cache.prompt_cache_key = true;
-    let responses = adapter
-        .render_v2(&continued, Protocol::OpenAiResponses, &capabilities)
+    let responses = RequestRendererKind::OpenAiResponses
+        .render(&continued, &capabilities)
         .unwrap()
         .body;
     assert_eq!(responses["previous_response_id"], "resp_phase0");
     assert_eq!(responses["prompt_cache_key"], "phase0-cache");
 
-    let messages = adapter
-        .render_v2(
-            &continued,
-            Protocol::AnthropicMessages,
-            &ModelCapabilities::default(),
-        )
+    let messages = RequestRendererKind::AnthropicMessages
+        .render(&continued, &ModelCapabilities::default())
         .unwrap()
         .body;
     assert_eq!(messages["metadata"]["user_id"], "phase0-cache");
