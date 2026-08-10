@@ -106,7 +106,26 @@ impl Parser {
                 cache_write_input_tokens: usage.cache_write_tokens,
                 cache_miss_input_tokens: usage.prompt_cache_miss_tokens,
                 reasoning_tokens: usage.reasoning_tokens,
-                extensions: Vec::new(),
+                extensions: chunk
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(|usage| {
+                        scoped_extensions(
+                            usage,
+                            &[
+                                "prompt_tokens",
+                                "completion_tokens",
+                                "total_tokens",
+                                "prompt_tokens_details",
+                                "completion_tokens_details",
+                                "cached_tokens",
+                                "prompt_cache_hit_tokens",
+                                "prompt_cache_miss_tokens",
+                            ],
+                            ExtensionScope::Usage,
+                        )
+                    })
+                    .unwrap_or_default(),
             };
             out.push(CanonicalResponseEvent::UsageUpdated(self.usage.clone()));
         }

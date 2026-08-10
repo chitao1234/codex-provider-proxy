@@ -42,7 +42,7 @@ fn chat_stream_tool_extensions_are_scoped_without_duplicate_starts() {
         .unwrap();
     parser
         .on_chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","x_late":true,"function":{"name":"lookup","arguments":""}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","x_late":true,"function":{"name":"lookup","arguments":""}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"x_usage":"usage-meta"}}"#,
             &mut events,
         )
         .unwrap();
@@ -76,4 +76,10 @@ fn chat_stream_tool_extensions_are_scoped_without_duplicate_starts() {
     assert!(call.extensions.iter().any(|extension| {
         extension.scope == ExtensionScope::ToolCall && extension.key == "x_late"
     }));
+    assert!(accumulator
+        .response()
+        .usage
+        .extensions
+        .iter()
+        .any(|extension| extension.key == "x_usage"));
 }
