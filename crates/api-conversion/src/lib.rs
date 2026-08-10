@@ -19,6 +19,7 @@ pub mod messages_renderer;
 pub mod protocols;
 pub mod request_adapter;
 pub mod request_ir;
+pub mod response_adapter;
 pub mod response_ir;
 pub mod responses;
 pub mod responses_parser;

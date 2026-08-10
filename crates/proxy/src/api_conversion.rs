@@ -17,6 +17,7 @@ use codex_provider_proxy_api_conversion::chat_parser::ChatParser;
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
+use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
@@ -636,6 +637,7 @@ pin_project! {
         target: T,
         recorder: Option<ResponseRecorder>,
         response: StreamingResponseIr,
+        core_response: ResponseAccumulator,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
         pending_error: Option<std::io::Error>,
@@ -671,6 +673,7 @@ impl<S, T> ChatConversionStream<S, T> {
             target,
             recorder,
             response: StreamingResponseIr::default(),
+            core_response: ResponseAccumulator::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
             pending_error: None,
@@ -751,6 +754,8 @@ where
                             }
                             for event in events.drain(..) {
                                 this.response.on_event(&event);
+                                codex_provider_proxy_api_conversion::response_adapter::
+                                apply_stream_event(this.core_response, &event);
                                 this.target.on_event(&event, &mut rendered);
                             }
                         }
@@ -805,6 +810,10 @@ where
                     let mut rendered = Vec::new();
                     for event in &events {
                         this.response.on_event(event);
+                        codex_provider_proxy_api_conversion::response_adapter::apply_stream_event(
+                            this.core_response,
+                            event,
+                        );
                         this.target.on_event(event, &mut rendered);
                     }
                     this.target.finish(&mut rendered);
