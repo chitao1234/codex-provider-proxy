@@ -4,7 +4,7 @@ use crate::ir::{ContentItem, ContentPart, ResponseIr};
 
 pub fn render(response: &ResponseIr) -> Value {
     let response_id = response.response_id.as_deref().map(|id| {
-        if id.starts_with("resp_") {
+        if id.starts_with("resp_") || id.starts_with("resp-") {
             id.to_owned()
         } else {
             format!("resp_{id}")
