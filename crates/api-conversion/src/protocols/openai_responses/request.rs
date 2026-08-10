@@ -10,6 +10,12 @@ pub fn render(
     request: &RequestIr,
     capabilities: &ModelCapabilities,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
+    if !capabilities.image_input && request.transcript.iter().any(item_has_image) {
+        return Err(ConversionError::unsupported(
+            "messages[].content.image",
+            "upstream does not support image input",
+        ));
+    }
     let mut output = opaque_root(request);
     insert_string(&mut output, "model", request.model.as_deref());
     if let Some(stream) = request.stream {
@@ -36,7 +42,13 @@ pub fn render(
     if !request.tools.is_empty() {
         output.insert(
             "tools".to_owned(),
-            Value::Array(request.tools.iter().map(render_tool).collect::<Vec<_>>()),
+            Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| render_tool(tool, capabilities))
+                    .collect::<Vec<_>>(),
+            ),
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
@@ -269,7 +281,14 @@ fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
     object
 }
 
-fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
+fn render_tool(tool: &crate::ir::ToolDefinition, capabilities: &ModelCapabilities) -> Value {
+    if capabilities.server_tools == crate::dialect::ServerToolPolicy::ProviderNative
+        && tool.kind.starts_with("web_search")
+    {
+        if let Some(template) = &capabilities.search_tool_template {
+            return template.clone();
+        }
+    }
     let mut object = serde_json::json!({
         "type": tool.kind,
         "name": tool.name,
@@ -286,6 +305,29 @@ fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
         }
     }
     object
+}
+
+fn item_has_image(item: &ContentItem) -> bool {
+    match item {
+        ContentItem::Message { content, .. }
+        | ContentItem::Refusal { content, .. }
+        | ContentItem::Reasoning { content, .. }
+        | ContentItem::ToolResult {
+            result: crate::ir::ToolResult { content, .. },
+        } => content.iter().any(part_has_image),
+        _ => false,
+    }
+}
+
+fn part_has_image(part: &ContentPart) -> bool {
+    match part {
+        ContentPart::Image { .. } => true,
+        ContentPart::Json(value) => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.contains("image")),
+        _ => false,
+    }
 }
 
 fn content_item_text(item: &ContentItem) -> Vec<String> {

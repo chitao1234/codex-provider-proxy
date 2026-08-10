@@ -10,6 +10,12 @@ pub fn render(
     request: &RequestIr,
     capabilities: &ModelCapabilities,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
+    if !capabilities.image_input && request.transcript.iter().any(item_has_image) {
+        return Err(ConversionError::unsupported(
+            "messages[].content.image",
+            "upstream does not support image input",
+        ));
+    }
     let mut output = opaque_root(request);
     if let Some(model) = &request.model {
         output.insert("model".to_owned(), Value::String(model.clone()));
@@ -283,5 +289,28 @@ fn content_item_text(item: &ContentItem) -> Vec<String> {
         | ContentItem::Refusal { content, .. }
         | ContentItem::Reasoning { content, .. } => content.iter().filter_map(text_part).collect(),
         _ => Vec::new(),
+    }
+}
+
+fn item_has_image(item: &ContentItem) -> bool {
+    match item {
+        ContentItem::Message { content, .. }
+        | ContentItem::Refusal { content, .. }
+        | ContentItem::Reasoning { content, .. }
+        | ContentItem::ToolResult {
+            result: crate::ir::ToolResult { content, .. },
+        } => content.iter().any(part_has_image),
+        _ => false,
+    }
+}
+
+fn part_has_image(part: &ContentPart) -> bool {
+    match part {
+        ContentPart::Image { .. } => true,
+        ContentPart::Json(value) => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.contains("image")),
+        _ => false,
     }
 }

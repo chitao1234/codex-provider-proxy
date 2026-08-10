@@ -255,16 +255,15 @@ pub fn convert_request_body(
             let source = downstream_protocol(plan.downstream);
             let adapter = RequestAdapterKind::for_protocol(source);
             let request = adapter
-                .parse_with_context(&json, previous_request, last_reasoning)
+                .parse_v2_with_context(&json, previous_request, last_reasoning)
                 .map_err(|err| {
                     RequestConversionRejected::from_conversion_error(err, plan.downstream)
                 })?;
-            let rendered_request =
-                adapter
-                    .render(&request, pipeline.target, &caps)
-                    .map_err(|err| {
-                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                    })?;
+            let rendered_request = adapter
+                .render_v2(&request, pipeline.target, &caps)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?;
             let mut rendered = rendered_request.body;
             let report = rendered_request.report;
             normalize_rendered_request(pipeline.normalizer, pipeline.target, &caps, &mut rendered);

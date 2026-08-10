@@ -10,6 +10,12 @@ pub fn render(
     request: &RequestIr,
     capabilities: &ModelCapabilities,
 ) -> Result<(Value, RequestConversionReport), ConversionError> {
+    if !capabilities.image_input && request.transcript.iter().any(item_has_image) {
+        return Err(ConversionError::unsupported(
+            "messages[].content.image",
+            "upstream does not support image input",
+        ));
+    }
     let mut output: Map<String, Value> = request
         .opaque
         .iter()
@@ -32,6 +38,21 @@ pub fn render(
     }
     if let Some(metadata) = &request.state.metadata {
         output.insert("metadata".to_owned(), metadata.clone());
+    }
+    for extension in &request.state.extensions {
+        if extension.scope == crate::ir::ExtensionScope::State
+            && !matches!(
+                extension.key.as_str(),
+                "prompt_cache_key"
+                    | "prompt_cache_options"
+                    | "prompt_cache_retention"
+                    | "cache_control"
+            )
+        {
+            output
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
     }
     render_generation(&request.generation, capabilities, &mut output);
 
@@ -137,6 +158,20 @@ fn render_generation(
     if let Some(reasoning) = &generation.reasoning_effort {
         output.insert("reasoning_effort".to_owned(), reasoning.clone());
     }
+    if let Some(thinking) = &generation.thinking {
+        let thinking_type = thinking.get("type").and_then(Value::as_str);
+        if matches!(
+            capabilities.thinking_param,
+            crate::dialect::ThinkingParam::TopLevel | crate::dialect::ThinkingParam::Adaptive
+        ) {
+            output.insert(
+                "thinking".to_owned(),
+                serde_json::json!({
+                    "type": if thinking_type == Some("disabled") { "disabled" } else { "enabled" }
+                }),
+            );
+        }
+    }
     if let Some(config) = &generation.output_config {
         if let Some(effort) = config.get("effort") {
             output.insert("reasoning_effort".to_owned(), effort.clone());
@@ -202,5 +237,28 @@ fn content_item_text(item: &ContentItem) -> Option<String> {
                 .join("\n"),
         ),
         _ => None,
+    }
+}
+
+fn item_has_image(item: &ContentItem) -> bool {
+    match item {
+        ContentItem::Message { content, .. }
+        | ContentItem::Refusal { content, .. }
+        | ContentItem::Reasoning { content, .. }
+        | ContentItem::ToolResult {
+            result: crate::ir::ToolResult { content, .. },
+        } => content.iter().any(part_has_image),
+        _ => false,
+    }
+}
+
+fn part_has_image(part: &ContentPart) -> bool {
+    match part {
+        ContentPart::Image { .. } => true,
+        ContentPart::Json(value) => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.contains("image")),
+        _ => false,
     }
 }
