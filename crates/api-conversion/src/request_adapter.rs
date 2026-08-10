@@ -1,15 +1,14 @@
 //! Protocol-owned request adapter boundaries.
 //!
-//! The adapters keep wire parsing/rendering dispatch protocol-local. Their implementation still
-//! delegates to the established request semantic representation until the v2 field migration is
-//! complete; callers must not dispatch by pairing protocol modules directly.
+//! The adapters keep wire parsing/rendering dispatch protocol-local while sharing only the
+//! protocol-neutral request IR.
 
 use serde_json::Value;
 
 use crate::{
     dialect::{ModelCapabilities, RequestConversionReport},
     error::ConversionError,
-    request_ir::{Protocol, RequestIr},
+    protocol::Protocol,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,10 +20,6 @@ pub struct RenderedRequest {
 pub trait RequestAdapter {
     fn protocol(&self) -> Protocol;
 
-    fn parse(&self, body: &Value) -> Result<RequestIr, ConversionError> {
-        RequestIr::parse(self.protocol(), body)
-    }
-
     fn parse_v2(&self, body: &Value) -> Result<crate::ir::RequestIr, ConversionError> {
         match self.protocol() {
             Protocol::OpenAiResponses => crate::protocols::openai_responses::parser::parse(body),
@@ -34,20 +29,6 @@ pub trait RequestAdapter {
             Protocol::AnthropicMessages => {
                 crate::protocols::anthropic_messages::parser::parse(body)
             }
-        }
-    }
-
-    fn parse_with_context(
-        &self,
-        body: &Value,
-        previous: Option<&crate::ir::RequestIr>,
-        _last_reasoning: Option<&str>,
-    ) -> Result<RequestIr, ConversionError> {
-        if self.protocol() == Protocol::OpenAiResponses {
-            let _ = previous;
-            self.parse(body)
-        } else {
-            self.parse(body)
         }
     }
 
@@ -81,16 +62,6 @@ pub trait RequestAdapter {
             }
         }
         Ok(request)
-    }
-
-    fn render(
-        &self,
-        request: &RequestIr,
-        target: Protocol,
-        capabilities: &ModelCapabilities,
-    ) -> Result<RenderedRequest, ConversionError> {
-        let (body, report) = request.render_with_report(target, capabilities)?;
-        Ok(RenderedRequest { body, report })
     }
 
     fn render_v2(
@@ -202,38 +173,11 @@ impl RequestAdapter for RequestAdapterKind {
         }
     }
 
-    fn parse(&self, body: &Value) -> Result<RequestIr, ConversionError> {
-        match self {
-            Self::OpenAiResponses(adapter) => adapter.parse(body),
-            Self::OpenAiChatCompletions(adapter) => adapter.parse(body),
-            Self::AnthropicMessages(adapter) => adapter.parse(body),
-        }
-    }
-
     fn parse_v2(&self, body: &Value) -> Result<crate::ir::RequestIr, ConversionError> {
         match self {
             Self::OpenAiResponses(adapter) => adapter.parse_v2(body),
             Self::OpenAiChatCompletions(adapter) => adapter.parse_v2(body),
             Self::AnthropicMessages(adapter) => adapter.parse_v2(body),
-        }
-    }
-
-    fn parse_with_context(
-        &self,
-        body: &Value,
-        previous: Option<&crate::ir::RequestIr>,
-        last_reasoning: Option<&str>,
-    ) -> Result<RequestIr, ConversionError> {
-        match self {
-            Self::OpenAiResponses(adapter) => {
-                adapter.parse_with_context(body, previous, last_reasoning)
-            }
-            Self::OpenAiChatCompletions(adapter) => {
-                adapter.parse_with_context(body, previous, last_reasoning)
-            }
-            Self::AnthropicMessages(adapter) => {
-                adapter.parse_with_context(body, previous, last_reasoning)
-            }
         }
     }
 

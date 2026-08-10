@@ -525,11 +525,11 @@ async fn handle_proxy_inner(
         if is_text_event_stream(&resp_headers) {
             match (response_pipeline.source, response_pipeline.target) {
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
                 ) => resp_stream,
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
                 ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
                     resp_stream,
@@ -537,7 +537,7 @@ async fn handle_proxy_inner(
                     codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
                 )) as BoxRespStream,
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
                 ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
                     resp_stream,
@@ -545,7 +545,7 @@ async fn handle_proxy_inner(
                     codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
                 )) as BoxRespStream,
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
                 ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
                     resp_stream,
@@ -554,7 +554,7 @@ async fn handle_proxy_inner(
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
                 ) => Box::pin(crate::streams::RecordingPassthroughStream::new(
                     resp_stream,
@@ -562,7 +562,7 @@ async fn handle_proxy_inner(
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
                 (
-                    codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
+                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
                 ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
                     resp_stream,
@@ -1514,7 +1514,7 @@ fn maybe_convert_request_body(
         })?;
         Some(
             codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
             )
             .parse_v2_with_context(
                 &value,
@@ -5056,11 +5056,11 @@ mod tests {
         let recorded = response_states.get("resp_1").unwrap();
         let rendered =
             codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
             )
             .render_v2(
                 &recorded.request_ir,
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+                codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
                 &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
             )
             .unwrap()

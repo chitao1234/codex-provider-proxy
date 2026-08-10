@@ -3,8 +3,8 @@ use codex_provider_proxy_api_conversion::{
         ContentItem, ContentPart, Extension, ExtensionScope, ReplayPolicy, ResponseIr, StopReason,
         ToolResult,
     },
+    protocol::Protocol,
     protocols::{parse_response, render_response},
-    request_ir::Protocol,
 };
 use serde_json::json;
 

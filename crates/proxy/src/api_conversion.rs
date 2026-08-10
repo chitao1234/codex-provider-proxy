@@ -17,8 +17,8 @@ use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamAp
 use codex_provider_proxy_api_conversion::error::ApiErrorIr;
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
+use codex_provider_proxy_api_conversion::protocol::Protocol;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
-use codex_provider_proxy_api_conversion::request_ir::Protocol;
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;

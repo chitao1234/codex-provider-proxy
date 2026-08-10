@@ -5,6 +5,17 @@ use crate::{
     ir::ToolDefinition,
 };
 
+const SERVER_TOOL_TYPE_PREFIXES: &[&str] = &[
+    "web_search_",
+    "web_fetch_",
+    "code_execution_",
+    "tool_search_",
+    "computer_",
+    "memory_",
+    "bash_",
+    "text_editor_",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolTarget {
     AnthropicMessages,
@@ -51,10 +62,7 @@ pub fn render(
             ServerToolPolicy::ProviderNative => match short_name(tool) {
                 Some("web_search") => {
                     if let Some(template) = &capabilities.search_tool_template {
-                        rendered.push(crate::conversion_utils::render_search_tool_template(
-                            template,
-                            last_user_query,
-                        ));
+                        rendered.push(render_search_tool_template(template, last_user_query));
                         report.mapped_server_tools.push("web_search".to_owned());
                     } else if capabilities.search_request_params.is_some() {
                         report.mapped_server_tools.push("web_search".to_owned());
@@ -168,7 +176,7 @@ fn merge_params(
         return;
     };
     let rendered = if tool_name == "web_search" {
-        crate::conversion_utils::render_search_tool_template(params, last_user_query)
+        render_search_tool_template(params, last_user_query)
     } else {
         params.clone()
     };
@@ -185,7 +193,7 @@ fn is_server_tool(tool: &ToolDefinition) -> bool {
     if !matches!(tool.kind.as_str(), "function" | "custom" | "") {
         return true;
     }
-    is_freeform_tool(tool) || crate::server_tools::is_known_name(&tool.name)
+    is_freeform_tool(tool) || is_known_server_tool_name(&tool.name)
 }
 
 fn is_freeform_tool(tool: &ToolDefinition) -> bool {
@@ -193,7 +201,7 @@ fn is_freeform_tool(tool: &ToolDefinition) -> bool {
 }
 
 fn short_name(tool: &ToolDefinition) -> Option<&str> {
-    if crate::server_tools::is_known_name(&tool.name) {
+    if is_known_server_tool_name(&tool.name) {
         return Some(normalize_name(&tool.name));
     }
     let kind = tool.kind.as_str();
@@ -201,13 +209,55 @@ fn short_name(tool: &ToolDefinition) -> Option<&str> {
         "web_search" | "web_search_preview" => return Some("web_search"),
         "web_fetch" | "web_fetch_preview" => return Some("web_fetch"),
         "code_interpreter" => return Some("code_execution"),
-        _ if crate::server_tools::is_known_name(kind) => return Some(normalize_name(kind)),
+        _ if is_known_server_tool_name(kind) => return Some(normalize_name(kind)),
         _ => {}
     }
-    crate::server_tools::TYPE_PREFIXES
+    SERVER_TOOL_TYPE_PREFIXES
         .iter()
         .find(|prefix| kind.starts_with(**prefix))
         .map(|prefix| prefix.trim_end_matches('_'))
+}
+
+fn is_known_server_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "web_search"
+            | "web_fetch"
+            | "WebSearch"
+            | "WebFetch"
+            | "code_execution"
+            | "bash"
+            | "str_replace_editor"
+            | "str_replace_based_edit_tool"
+            | "memory"
+            | "tool_search_tool_regex"
+            | "tool_search_tool_bm25"
+    )
+}
+
+fn render_search_tool_template(template: &Value, query: Option<&str>) -> Value {
+    let Some(object) = template.as_object() else {
+        return template.clone();
+    };
+    let mut rendered = object.clone();
+    let replacement = query.filter(|query| !query.is_empty()).unwrap_or("search");
+    for value in rendered.values_mut() {
+        substitute_search_query(value, replacement);
+        if let Value::Object(nested) = value {
+            for nested_value in nested.values_mut() {
+                substitute_search_query(nested_value, replacement);
+            }
+        }
+    }
+    Value::Object(rendered)
+}
+
+fn substitute_search_query(value: &mut Value, replacement: &str) {
+    if let Value::String(text) = value {
+        if text.contains("{search_query}") {
+            *text = text.replace("{search_query}", replacement);
+        }
+    }
 }
 
 fn normalize_name(name: &str) -> &str {

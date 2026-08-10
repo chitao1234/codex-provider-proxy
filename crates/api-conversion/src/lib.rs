@@ -8,14 +8,11 @@
 //! This crate is intentionally pure: no axum, no reqwest, no proxy runtime state. The proxy
 //! crate owns networking, routing, configuration, and logging.
 
-pub(crate) mod chat;
-pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
 pub mod ir;
+pub mod protocol;
 pub mod protocols;
 pub(crate) mod provider_tools;
 pub mod request_adapter;
-pub mod request_ir;
-pub(crate) mod server_tools;
 pub mod sse;

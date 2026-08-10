@@ -137,8 +137,8 @@ pub(crate) fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use codex_provider_proxy_api_conversion::{
+        protocol::Protocol,
         request_adapter::{RequestAdapter, RequestAdapterKind},
-        request_ir::Protocol,
     };
     use serde_json::json;
 

@@ -3,9 +3,9 @@ use std::fs;
 use codex_provider_proxy_api_conversion::{
     dialect::ModelCapabilities,
     ir::{CanonicalResponseEvent, ContentPart, ResponseAccumulator, ResponseIr, StopReason},
+    protocol::Protocol,
     protocols::{self, anthropic_messages, openai_chat_completions, openai_responses},
     request_adapter::{RequestAdapter, RequestAdapterKind},
-    request_ir::Protocol,
 };
 use serde_json::Value;
 

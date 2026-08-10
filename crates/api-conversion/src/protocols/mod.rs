@@ -5,7 +5,7 @@ pub(crate) mod request_support;
 
 use serde_json::Value;
 
-use crate::{error::ConversionError, ir::ResponseIr, request_ir::Protocol};
+use crate::{error::ConversionError, ir::ResponseIr, protocol::Protocol};
 
 pub fn parse_response(protocol: Protocol, body: &Value) -> Result<ResponseIr, ConversionError> {
     let mut response = match protocol {

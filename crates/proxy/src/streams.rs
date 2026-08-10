@@ -447,8 +447,8 @@ mod tests {
 
     use codex_provider_proxy_api_conversion::{
         ir::{CanonicalResponseEvent, RequestIr},
+        protocol::Protocol,
         request_adapter::{RequestAdapter, RequestAdapterKind},
-        request_ir::Protocol,
     };
     use futures_util::{stream, StreamExt};
     use serde_json::Value;

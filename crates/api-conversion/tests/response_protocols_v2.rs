@@ -1,7 +1,7 @@
 use codex_provider_proxy_api_conversion::{
     ir::{CanonicalResponseEvent, ContentItem, ResponseAccumulator, Usage},
+    protocol::Protocol,
     protocols::{anthropic_messages, openai_chat_completions, openai_responses, parse_response},
-    request_ir::Protocol,
 };
 use serde_json::json;
 

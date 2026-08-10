@@ -3,14 +3,14 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::{
-    chat::{
-        extract_usage, first_choice_delta, first_choice_finish_reason, is_usage_only_chunk,
-        upstream_id, upstream_model,
-    },
     error::ConversionError,
     ir::{
         CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
         StopReason, ToolCall, Usage,
+    },
+    protocols::openai_chat_completions::support::{
+        extract_usage, first_choice_delta, first_choice_finish_reason, is_usage_only_chunk,
+        upstream_id, upstream_model,
     },
 };
 
@@ -266,15 +266,15 @@ fn chunk_extension(chunk: &Value) -> Option<Extension> {
     let structural = [
         "id", "object", "created", "model", "choices", "usage", "error",
     ];
-    let extra: Map<String, Value> = object
+    let opaque: Map<String, Value> = object
         .iter()
         .filter(|(key, _)| !structural.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    (!extra.is_empty()).then(|| Extension {
+    (!opaque.is_empty()).then(|| Extension {
         namespace: "openai.chat_completions".into(),
         key: "chunk".into(),
-        value: Value::Object(extra),
+        value: Value::Object(opaque),
         scope: ExtensionScope::Response,
         source_protocol: None,
         provider: None,
