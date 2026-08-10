@@ -523,53 +523,41 @@ async fn handle_proxy_inner(
             .expect("conversion applies only when a plan exists")
             .response;
         if is_text_event_stream(&resp_headers) {
-            match (response_pipeline.source, response_pipeline.target) {
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages,
-                    crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => resp_stream,
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
-                    crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
-                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
-                )) as BoxRespStream,
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions,
-                    crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
-                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
-                )) as BoxRespStream,
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages,
-                    crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Parser::new(),
-                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
-                    final_attempt.response_recorder.clone(),
-                )) as BoxRespStream,
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses,
-                    crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::streams::RecordingPassthroughStream::new(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
-                    final_attempt.response_recorder.clone(),
-                )) as BoxRespStream,
-                (
-                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions,
-                    crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
-                    resp_stream,
-                    codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
-                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
-                    final_attempt.response_recorder.clone(),
-                )) as BoxRespStream,
+            let target = response_pipeline.target_protocol();
+            if response_pipeline.source == target {
+                match target {
+                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses => {
+                        Box::pin(crate::streams::RecordingPassthroughStream::new(
+                            resp_stream,
+                            codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
+                                response_pipeline.source,
+                            ),
+                            final_attempt.response_recorder.clone(),
+                        )) as BoxRespStream
+                    }
+                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages
+                    | codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions => {
+                        resp_stream
+                    }
+                }
+            } else {
+                let parser =
+                    codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
+                        response_pipeline.source,
+                    );
+                let renderer =
+                    codex_provider_proxy_api_conversion::protocols::StreamRendererKind::for_protocol(
+                        target,
+                    )
+                    .expect("downstream protocol must support streaming response rendering");
+                Box::pin(
+                    crate::streams::CanonicalParserRendererStream::with_recorder(
+                        resp_stream,
+                        parser,
+                        renderer,
+                        final_attempt.response_recorder.clone(),
+                    ),
+                ) as BoxRespStream
             }
         } else {
             Box::pin(

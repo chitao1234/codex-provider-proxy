@@ -93,6 +93,21 @@ impl CanonicalParser
     }
 }
 
+impl CanonicalParser for codex_provider_proxy_api_conversion::protocols::StreamParserKind {
+    fn on_event(
+        &mut self,
+        event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError> {
+        self.on_event(event_type, payload, out)
+    }
+
+    fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>) {
+        self.finish(out);
+    }
+}
+
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer
 {
@@ -108,6 +123,20 @@ impl CanonicalRenderer
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer
 {
+    fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
+        self.on_update(update, out);
+    }
+
+    fn finish(&mut self, out: &mut Vec<Bytes>) {
+        self.finish(out);
+    }
+
+    fn response_id(&self) -> Option<&str> {
+        self.response_id()
+    }
+}
+
+impl CanonicalRenderer for codex_provider_proxy_api_conversion::protocols::StreamRendererKind {
     fn on_update(&mut self, update: &CoreUpdate, out: &mut Vec<Bytes>) {
         self.on_update(update, out);
     }
@@ -151,6 +180,7 @@ pin_project! {
 }
 
 impl<S, P, R> CanonicalParserRendererStream<S, P, R> {
+    #[cfg(test)]
     pub fn new(inner: S, parser: P, renderer: R) -> Self {
         Self::with_recorder(inner, parser, renderer, None)
     }

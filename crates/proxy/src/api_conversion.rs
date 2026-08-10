@@ -58,7 +58,7 @@ pub struct ResponsePipeline {
 }
 
 impl ResponsePipeline {
-    fn target_protocol(self) -> Protocol {
+    pub(crate) fn target_protocol(self) -> Protocol {
         downstream_protocol(self.target)
     }
 }
