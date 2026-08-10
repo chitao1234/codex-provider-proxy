@@ -13,9 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codex_provider_proxy_api_conversion::{
-    ir::RequestIr as SemanticRequestIr, request_ir::RequestIr,
-};
+use codex_provider_proxy_api_conversion::ir::RequestIr;
 
 /// Default time-to-live for stored response transcripts.
 pub const DEFAULT_RESPONSE_STATE_TTL_SECS: u64 = 3600;
@@ -30,7 +28,6 @@ pub struct ResponseState {
     pub model: String,
     /// The complete protocol-neutral request transcript, ready to render for a continuation.
     pub request_ir: RequestIr,
-    pub semantic_request: Option<SemanticRequestIr>,
     /// Reasoning from the assistant turn that produced this response.
     pub last_reasoning: Option<String>,
     pub created_at_unix: u64,
@@ -52,7 +49,6 @@ impl ResponseState {
             provider_name,
             model,
             request_ir,
-            semantic_request: None,
             last_reasoning,
             created_at_unix: now_unix,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
@@ -140,18 +136,24 @@ pub(crate) fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_provider_proxy_api_conversion::{
+        request_adapter::{RequestAdapter, RequestAdapterKind},
+        request_ir::Protocol,
+    };
     use serde_json::json;
+
+    fn request(body: serde_json::Value) -> RequestIr {
+        RequestAdapterKind::for_protocol(Protocol::OpenAiChatCompletions)
+            .parse_v2(&body)
+            .unwrap()
+    }
 
     fn state(id: &str, created: u64) -> ResponseState {
         ResponseState::new(
             id.to_string(),
             "ds".to_string(),
             "deepseek-v4-pro".to_string(),
-            RequestIr::parse(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
-                &serde_json::json!({"messages": []}),
-            )
-            .unwrap(),
+            request(serde_json::json!({"messages": []})),
             None,
             created,
             100,
@@ -165,11 +167,7 @@ mod tests {
             "resp_1".to_string(),
             "ds".to_string(),
             "m".to_string(),
-            RequestIr::parse(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
-                &json!({"messages": [{"role": "user", "content": "hi"}]}),
-            )
-            .unwrap(),
+            request(json!({"messages": [{"role": "user", "content": "hi"}]})),
             Some("think".to_string()),
             now_unix(),
             100,
@@ -189,11 +187,7 @@ mod tests {
             "resp_old".to_string(),
             "ds".to_string(),
             "m".to_string(),
-            RequestIr::parse(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
-                &serde_json::json!({"messages": []}),
-            )
-            .unwrap(),
+            request(serde_json::json!({"messages": []})),
             None,
             now_unix().saturating_sub(100), // created long ago, already expired
             10,

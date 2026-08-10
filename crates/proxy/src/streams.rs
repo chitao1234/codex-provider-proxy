@@ -664,9 +664,10 @@ where
                     for event in events {
                         this.response.apply(event);
                     }
-                    if let (Some(recorder), Some(response_id)) = (
+                    if let (Some(recorder), Some(response_id), true) = (
                         this.recorder.as_ref(),
                         this.response.response().response_id.as_deref(),
+                        this.response.continuation_state().is_some(),
                     ) {
                         recorder.record_semantic(response_id, this.response.response());
                     }
@@ -692,10 +693,20 @@ fn oversized_sse_event_error() -> std::io::Error {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
+    use codex_provider_proxy_api_conversion::{
+        ir::RequestIr,
+        request_adapter::{RequestAdapter, RequestAdapterKind},
+        request_ir::Protocol,
+    };
     use futures_util::{stream, StreamExt};
 
     use super::*;
+
+    fn responses_request() -> RequestIr {
+        RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
+            .parse_v2(&serde_json::json!({"model":"model", "input":"hi"}))
+            .unwrap()
+    }
 
     struct ProbeParser {
         values: Rc<RefCell<Vec<Value>>>,
@@ -838,11 +849,7 @@ mod tests {
     #[tokio::test]
     async fn recording_passthrough_keeps_malformed_sse_and_skips_recording() {
         let store = crate::response_state::ResponseStateStore::new(4);
-        let request_ir = RequestIr::parse(
-            Protocol::OpenAiResponses,
-            &serde_json::json!({"model":"model", "input":"hi"}),
-        )
-        .unwrap();
+        let request_ir = responses_request();
         let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
         let body = Bytes::from_static(
             concat!(
@@ -873,11 +880,7 @@ mod tests {
     #[tokio::test]
     async fn recording_passthrough_does_not_record_unterminated_response() {
         let store = crate::response_state::ResponseStateStore::new(4);
-        let request_ir = RequestIr::parse(
-            Protocol::OpenAiResponses,
-            &serde_json::json!({"model":"model", "input":"hi"}),
-        )
-        .unwrap();
+        let request_ir = responses_request();
         let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
         let body = Bytes::from_static(
             concat!(
@@ -906,11 +909,7 @@ mod tests {
     #[tokio::test]
     async fn recording_passthrough_disables_parsing_for_oversized_event() {
         let store = crate::response_state::ResponseStateStore::new(4);
-        let request_ir = RequestIr::parse(
-            Protocol::OpenAiResponses,
-            &serde_json::json!({"model":"model", "input":"hi"}),
-        )
-        .unwrap();
+        let request_ir = responses_request();
         let recorder = ResponseRecorder::new(store.clone(), "provider", "model", request_ir);
         let body = Bytes::from(vec![b'x'; sse::MAX_EVENT_BYTES + 1]);
         let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);

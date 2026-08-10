@@ -105,7 +105,29 @@ pub fn render(
                 "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
             })),
             ContentItem::ToolUse { id, call } => {
-                messages.push(render_tool_message(id.as_deref(), call))
+                let tool_call = render_tool_call(id.as_deref(), call);
+                if let Some(message) = messages.last_mut().filter(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                }) {
+                    if let Some(reasoning) = pending_reasoning.take() {
+                        message["reasoning_content"] = Value::String(reasoning);
+                    }
+                    if let Some(calls) = message["tool_calls"].as_array_mut() {
+                        calls.push(tool_call);
+                    } else {
+                        message["tool_calls"] = Value::Array(vec![tool_call]);
+                    }
+                } else {
+                    let mut message = serde_json::json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [tool_call],
+                    });
+                    if let Some(reasoning) = pending_reasoning.take() {
+                        message["reasoning_content"] = Value::String(reasoning);
+                    }
+                    messages.push(message);
+                }
             }
             ContentItem::ToolResult { result } => messages.push(serde_json::json!({
                 "role": "tool",
@@ -204,15 +226,11 @@ fn render_content_part(part: &ContentPart) -> Value {
     }
 }
 
-fn render_tool_message(id: Option<&str>, call: &ToolCall) -> Value {
+fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
     serde_json::json!({
-        "role": "assistant",
-        "content": null,
-        "tool_calls": [{
-            "id": call.id.as_deref().or(id),
-            "type": "function",
-            "function": {"name": call.name, "arguments": call.arguments}
-        }]
+        "id": call.id.as_deref().or(id),
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments}
     })
 }
 
@@ -223,7 +241,8 @@ fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
 fn text_part(part: &ContentPart) -> Option<String> {
     match part {
         ContentPart::Text(text) | ContentPart::Refusal(text) => Some(text.clone()),
-        _ => None,
+        ContentPart::Reasoning { text, .. } => Some(text.clone()),
+        ContentPart::Image { .. } | ContentPart::Json(_) => None,
     }
 }
 

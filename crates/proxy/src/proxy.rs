@@ -1513,33 +1513,12 @@ fn maybe_convert_request_body(
             )
         })?;
         Some(
-            codex_provider_proxy_api_conversion::request_ir::RequestIr::parse_with_context(
-                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
-                &value,
-                previous_state.as_ref().map(|previous| &previous.request_ir),
-                last_reasoning,
-            )
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
-        )
-    } else {
-        None
-    };
-    let semantic_request = if is_responses {
-        let value: Value = serde_json::from_slice(&body).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "responses request body is not valid JSON",
-            )
-        })?;
-        Some(
             codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
                 codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
             )
             .parse_v2_with_context(
                 &value,
-                previous_state
-                    .as_ref()
-                    .and_then(|previous| previous.semantic_request.as_ref()),
+                previous_state.as_ref().map(|previous| &previous.request_ir),
                 last_reasoning,
             )
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
@@ -1552,9 +1531,7 @@ fn maybe_convert_request_body(
         &attempt.provider_name,
         forwarded_path,
         body,
-        previous_state
-            .as_ref()
-            .and_then(|previous| previous.semantic_request.as_ref()),
+        previous_state.as_ref().map(|previous| &previous.request_ir),
         last_reasoning,
     )
     .map_err(|rejected| std::io::Error::new(std::io::ErrorKind::InvalidInput, rejected))?;
@@ -1563,15 +1540,12 @@ fn maybe_convert_request_body(
         // synthesized response can be continued with previous_response_id.
         if let Some(request_ir) = request_ir {
             let model = request_ir.model().unwrap_or_default().to_owned();
-            attempt.response_recorder = Some(
-                crate::api_conversion::ResponseRecorder::new(
-                    state.runtime.response_states(),
-                    attempt.provider_name.clone(),
-                    model,
-                    request_ir,
-                )
-                .with_semantic_request(semantic_request.expect("responses semantic request")),
-            );
+            attempt.response_recorder = Some(crate::api_conversion::ResponseRecorder::new(
+                state.runtime.response_states(),
+                attempt.provider_name.clone(),
+                model,
+                request_ir,
+            ));
         }
     }
     attempt.headers.remove(header::CONTENT_LENGTH);
@@ -5085,7 +5059,7 @@ mod tests {
                 codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
             )
             .render_v2(
-                &recorded.semantic_request.expect("semantic response state"),
+                &recorded.request_ir,
                 codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                 &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
             )

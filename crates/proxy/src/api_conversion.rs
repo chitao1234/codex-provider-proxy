@@ -18,8 +18,7 @@ use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
-use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
-use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
+use codex_provider_proxy_api_conversion::request_ir::Protocol;
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;
@@ -423,9 +422,7 @@ pub struct ResponseRecorder {
     store: crate::response_state::ResponseStateStore,
     provider_name: String,
     model: String,
-    /// The protocol-neutral request transcript for this response chain.
-    request_ir: RequestIr,
-    semantic_request: Option<codex_provider_proxy_api_conversion::ir::RequestIr>,
+    request_ir: codex_provider_proxy_api_conversion::ir::RequestIr,
 }
 
 impl ResponseRecorder {
@@ -433,48 +430,14 @@ impl ResponseRecorder {
         store: crate::response_state::ResponseStateStore,
         provider_name: impl Into<String>,
         model: impl Into<String>,
-        request_ir: RequestIr,
+        request_ir: codex_provider_proxy_api_conversion::ir::RequestIr,
     ) -> Self {
         Self {
             store,
             provider_name: provider_name.into(),
             model: model.into(),
             request_ir,
-            semantic_request: None,
         }
-    }
-
-    pub fn with_semantic_request(
-        mut self,
-        request: codex_provider_proxy_api_conversion::ir::RequestIr,
-    ) -> Self {
-        self.semantic_request = Some(request);
-        self
-    }
-
-    pub fn record_ir(&self, response_id: &str, response: &ResponseIr) {
-        let mut request_ir = self.request_ir.clone();
-        response.append_to_request(&mut request_ir);
-        let now = crate::response_state::now_unix();
-        let mut state = crate::response_state::ResponseState::new(
-            response_id.to_string(),
-            self.provider_name.clone(),
-            self.model.clone(),
-            request_ir,
-            response.last_reasoning().map(str::to_owned),
-            now,
-            crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
-        );
-        if let Some(request) = &self.semantic_request {
-            let snapshot =
-                codex_provider_proxy_api_conversion::response_adapter::accumulate_complete_response(
-                    response,
-                );
-            let mut request = request.clone();
-            request.append_response(&snapshot.response);
-            state.semantic_request = Some(request);
-        }
-        self.store.put(state);
     }
 
     pub fn record_semantic(
@@ -482,10 +445,7 @@ impl ResponseRecorder {
         response_id: &str,
         response: &codex_provider_proxy_api_conversion::ir::ResponseIr,
     ) {
-        let Some(request) = &self.semantic_request else {
-            return;
-        };
-        let mut request = request.clone();
+        let mut request = self.request_ir.clone();
         request.append_response(response);
         let last_reasoning = response.output.iter().rev().find_map(|item| match item {
             codex_provider_proxy_api_conversion::ir::ContentItem::Reasoning { content, .. } => {
@@ -500,16 +460,15 @@ impl ResponseRecorder {
             _ => None,
         });
         let now = crate::response_state::now_unix();
-        let mut state = crate::response_state::ResponseState::new(
+        let state = crate::response_state::ResponseState::new(
             response_id.to_owned(),
             self.provider_name.clone(),
             self.model.clone(),
-            self.request_ir.clone(),
+            request,
             last_reasoning,
             now,
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
         );
-        state.semantic_request = Some(request);
         self.store.put(state);
     }
 }
@@ -551,7 +510,6 @@ struct ConvertedNonStreamingResponse {
     body: Bytes,
     response_id: Option<String>,
     semantic_response: Option<codex_provider_proxy_api_conversion::ir::ResponseIr>,
-    response: Option<ResponseIr>,
 }
 
 fn convert_non_streaming_response(
@@ -559,22 +517,26 @@ fn convert_non_streaming_response(
     pipeline: ResponsePipeline,
 ) -> Result<ConvertedNonStreamingResponse, std::io::Error> {
     if pipeline.source == pipeline.target_protocol() {
-        let response = (pipeline.source == Protocol::OpenAiResponses)
+        let semantic_response = (pipeline.source == Protocol::OpenAiResponses)
             .then(|| {
                 serde_json::from_slice::<Value>(&body)
                     .ok()
-                    .and_then(|json| ResponseIr::parse(pipeline.source, &json).ok())
+                    .and_then(|json| {
+                        codex_provider_proxy_api_conversion::protocols::parse_response(
+                            pipeline.source,
+                            &json,
+                        )
+                        .ok()
+                    })
             })
             .flatten();
-        let response_id = response
+        let response_id = semantic_response
             .as_ref()
-            .and_then(ResponseIr::id)
-            .map(str::to_owned);
+            .and_then(|response| response.response_id.clone());
         return Ok(ConvertedNonStreamingResponse {
             body,
             response_id,
-            semantic_response: None,
-            response,
+            semantic_response,
         });
     }
     let json: Value = serde_json::from_slice(&body).map_err(|_| {
@@ -591,7 +553,6 @@ fn convert_non_streaming_response(
         &semantic_response,
     )
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let response = ResponseIr::parse(pipeline.source, &json).ok();
     let response_id = converted
         .get("id")
         .and_then(Value::as_str)
@@ -609,7 +570,6 @@ fn convert_non_streaming_response(
         body,
         response_id,
         semantic_response: Some(semantic_response),
-        response,
     })
 }
 
@@ -708,11 +668,17 @@ where
                                 this.recorder.as_ref(),
                                 converted.response_id.as_deref(),
                                 converted
-                                    .response
+                                    .semantic_response
                                     .as_ref()
-                                    .filter(|response| response.is_continuable()),
+                                    .filter(|response| {
+                                        response.error.is_none()
+                                            && response
+                                                .stop_reason
+                                                .as_ref()
+                                                .is_some_and(|reason| reason.is_successful())
+                                    }),
                             ) {
-                                recorder.record_ir(response_id, response);
+                                recorder.record_semantic(response_id, response);
                             }
                             converted.body
                         }),
@@ -1086,7 +1052,7 @@ accept_downstream_apis = ["openai_responses"]
 
         assert_eq!(converted.body, body);
         assert_eq!(converted.response_id.as_deref(), Some("resp_1"));
-        assert!(converted.response.is_some());
+        assert!(converted.semantic_response.is_some());
     }
 
     #[test]
@@ -1103,7 +1069,7 @@ accept_downstream_apis = ["openai_responses"]
                 convert_non_streaming_response(body.clone(), ResponsePipeline { source, target })
                     .unwrap();
             assert_eq!(converted.body, body);
-            assert!(converted.response.is_none());
+            assert!(converted.semantic_response.is_none());
         }
     }
 
@@ -1144,11 +1110,9 @@ accept_downstream_apis = ["openai_responses"]
 
         for (source, body, expected_id) in cases {
             let store = crate::response_state::ResponseStateStore::new(4);
-            let request_ir = RequestIr::parse(
-                Protocol::OpenAiResponses,
-                &serde_json::json!({"model":"m", "input":"hi"}),
-            )
-            .unwrap();
+            let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
+                .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
+                .unwrap();
             let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
             let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from(
                 serde_json::to_vec(&body).unwrap(),
@@ -1168,14 +1132,14 @@ accept_downstream_apis = ["openai_responses"]
 
             let state = store.get(expected_id).expect("response state recorded");
             assert_eq!(state.last_reasoning.as_deref(), Some("thought"));
-            let rendered = state
-                .request_ir
-                .render_with_report(
+            let rendered = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
+                .render_v2(
+                    &state.request_ir,
                     Protocol::OpenAiChatCompletions,
                     &ModelCapabilities::default(),
                 )
                 .unwrap()
-                .0;
+                .body;
             let messages = rendered["messages"].as_array().unwrap();
             assert_eq!(messages[1]["reasoning_content"], "thought");
             assert_eq!(messages[1]["content"][0]["text"], "answer");
@@ -1190,11 +1154,9 @@ accept_downstream_apis = ["openai_responses"]
             ("failed", serde_json::json!({"message":"boom"})),
         ] {
             let store = crate::response_state::ResponseStateStore::new(4);
-            let request_ir = RequestIr::parse(
-                Protocol::OpenAiResponses,
-                &serde_json::json!({"model":"m", "input":"hi"}),
-            )
-            .unwrap();
+            let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
+                .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
+                .unwrap();
             let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
             let body = serde_json::json!({
                 "id": "resp_1",
@@ -1226,16 +1188,10 @@ accept_downstream_apis = ["openai_responses"]
     #[tokio::test]
     async fn chat_stream_recorder_consumes_streaming_response_ir() {
         let store = crate::response_state::ResponseStateStore::new(4);
-        let request_ir = RequestIr::parse(
-            Protocol::OpenAiResponses,
-            &serde_json::json!({"model":"m", "input":"hi"}),
-        )
-        .unwrap();
-        let semantic_request = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
+        let request_ir = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses)
             .parse_v2(&serde_json::json!({"model":"m", "input":"hi"}))
             .unwrap();
-        let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir)
-            .with_semantic_request(semantic_request);
+        let recorder = ResponseRecorder::new(store.clone(), "provider", "m", request_ir);
         let body = concat!(
             "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thought\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
@@ -1257,7 +1213,7 @@ accept_downstream_apis = ["openai_responses"]
             .get("resp_chatcmpl_1")
             .expect("stream response state recorded");
         assert_eq!(state.last_reasoning.as_deref(), Some("thought"));
-        let request = state.semantic_request.expect("semantic request recorded");
+        let request = state.request_ir;
         assert!(request.transcript.iter().any(|item| {
             matches!(
                 item,

@@ -100,7 +100,11 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
             Some("function_call" | "custom_tool_call") => output.push(ContentItem::ToolUse {
                 id: id.clone(),
                 call: ToolCall {
-                    id,
+                    id: item_object
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or(id),
                     name: item_object
                         .get("name")
                         .and_then(Value::as_str)
@@ -174,17 +178,18 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
         .and_then(Value::as_object)
         .and_then(|v| v.get("reason"))
         .and_then(Value::as_str)
-        .unwrap_or(if status == "completed" {
-            "stop"
-        } else {
-            "unknown"
-        });
-    let stop_reason = match reason {
-        "max_output_tokens" => StopReason::MaxTokens,
-        "content_filter" => StopReason::ContentFilter,
-        "tool_use" => StopReason::ToolUse,
-        "stop" => StopReason::Natural,
-        other => StopReason::Unknown(other.into()),
+        .unwrap_or(status);
+    let stop_reason = match status {
+        "in_progress" | "queued" => None,
+        "failed" => Some(StopReason::Error),
+        "cancelled" => Some(StopReason::Cancelled),
+        _ => Some(match reason {
+            "max_output_tokens" => StopReason::MaxTokens,
+            "content_filter" => StopReason::ContentFilter,
+            "tool_use" => StopReason::ToolUse,
+            "completed" | "stop" => StopReason::Natural,
+            other => StopReason::Unknown(other.into()),
+        }),
     };
     let error = object.get("error").filter(|v| !v.is_null()).cloned();
     Ok(ResponseIr {
@@ -195,8 +200,8 @@ pub fn parse(body: &Value) -> Result<ResponseIr, ConversionError> {
             .map(str::to_owned),
         output,
         usage,
-        stop_reason: Some(stop_reason),
-        original_stop_reason: Some(reason.into()),
+        stop_reason,
+        original_stop_reason: (!reason.is_empty()).then(|| reason.into()),
         error,
         extensions: extensions(
             object,
