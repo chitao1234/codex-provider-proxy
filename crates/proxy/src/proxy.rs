@@ -522,7 +522,7 @@ async fn handle_proxy_inner(
         let conversion_plan = conversion_plan.expect("conversion applies only when a plan exists");
         let response_pipeline = conversion_plan.response;
         if is_text_event_stream(&resp_headers) {
-            let target = response_pipeline.target_protocol();
+            let target = response_pipeline.target;
             match conversion_plan.stream {
                 crate::api_conversion::StreamPolicy::Passthrough => match target {
                     codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses => {

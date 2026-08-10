@@ -17,6 +17,9 @@ use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamAp
 use codex_provider_proxy_api_conversion::error::ApiErrorIr;
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
+pub use codex_provider_proxy_api_conversion::plan::{
+    ContinuationPolicy, ConversionPlan, RequestAction, ResponsePipeline, StreamPolicy,
+};
 use codex_provider_proxy_api_conversion::protocol::Protocol;
 use codex_provider_proxy_api_conversion::provider_normalizer::RequestNormalizerKind;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
@@ -35,63 +38,11 @@ const RESPONSES_UPSTREAM_PATH: &str = "v1/responses";
 const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestPipeline {
-    pub target: Protocol,
-    pub normalizer: Option<RequestNormalizerKind>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestAction {
-    Passthrough,
-    Transform(RequestPipeline),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContinuationPolicy {
-    None,
-    ResponsesState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamPolicy {
-    Passthrough,
-    Translate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtensionPolicy {
-    PreserveScopedOpaque,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponsePipeline {
-    pub source: Protocol,
-    pub target: DownstreamApi,
-}
-
-impl ResponsePipeline {
-    pub(crate) fn target_protocol(self) -> Protocol {
-        downstream_protocol(self.target)
-    }
-}
-
 fn downstream_protocol(downstream: DownstreamApi) -> Protocol {
     match downstream {
         DownstreamApi::AnthropicMessages => Protocol::AnthropicMessages,
         DownstreamApi::OpenAiResponses => Protocol::OpenAiResponses,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConversionPlan {
-    pub downstream: DownstreamApi,
-    pub upstream: UpstreamApi,
-    pub request: RequestAction,
-    pub response: ResponsePipeline,
-    pub continuation: ContinuationPolicy,
-    pub stream: StreamPolicy,
-    pub extensions: ExtensionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,34 +80,13 @@ pub fn resolve_conversion_plan(
     let downstream_protocol = downstream_protocol(downstream);
     let normalizer = (upstream_protocol == Protocol::OpenAiResponses)
         .then_some(RequestNormalizerKind::ArkResponses);
-    let request = if upstream_protocol == downstream_protocol && normalizer.is_none() {
-        RequestAction::Passthrough
-    } else {
-        RequestAction::Transform(RequestPipeline {
-            target: upstream_protocol,
-            normalizer,
-        })
-    };
-    let plan = ConversionPlan {
+    let plan = ConversionPlan::new(
         downstream,
-        upstream: provider.upstream_api,
-        request,
-        response: ResponsePipeline {
-            source: upstream_protocol,
-            target: downstream,
-        },
-        continuation: if downstream_protocol == Protocol::OpenAiResponses {
-            ContinuationPolicy::ResponsesState
-        } else {
-            ContinuationPolicy::None
-        },
-        stream: if upstream_protocol == downstream_protocol {
-            StreamPolicy::Passthrough
-        } else {
-            StreamPolicy::Translate
-        },
-        extensions: ExtensionPolicy::PreserveScopedOpaque,
-    };
+        provider.upstream_api,
+        downstream_protocol,
+        upstream_protocol,
+        normalizer,
+    );
     Ok(Some(plan))
 }
 
@@ -430,12 +360,13 @@ impl ResponseRecorder {
 
 /// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
 pub fn convert_error_body(status: StatusCode, body: &Value, pipeline: ResponsePipeline) -> Value {
-    if pipeline.source == pipeline.target_protocol() {
+    if pipeline.source == pipeline.target {
         return body.clone();
     }
     match pipeline.target {
-        DownstreamApi::AnthropicMessages => ApiErrorIr::parse(status, body).render_anthropic(),
-        DownstreamApi::OpenAiResponses => ApiErrorIr::parse(status, body).render_openai(),
+        Protocol::AnthropicMessages => ApiErrorIr::parse(status, body).render_anthropic(),
+        Protocol::OpenAiResponses => ApiErrorIr::parse(status, body).render_openai(),
+        Protocol::OpenAiChatCompletions => body.clone(),
     }
 }
 
@@ -471,7 +402,7 @@ fn convert_non_streaming_response(
     body: Bytes,
     pipeline: ResponsePipeline,
 ) -> Result<ConvertedNonStreamingResponse, std::io::Error> {
-    if pipeline.source == pipeline.target_protocol() {
+    if pipeline.source == pipeline.target {
         let semantic_response = (pipeline.source == Protocol::OpenAiResponses)
             .then(|| {
                 serde_json::from_slice::<Value>(&body)
@@ -504,7 +435,7 @@ fn convert_non_streaming_response(
         codex_provider_proxy_api_conversion::protocols::parse_response(pipeline.source, &json)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     let converted = codex_provider_proxy_api_conversion::protocols::render_response(
-        pipeline.target_protocol(),
+        pipeline.target,
         &semantic_response,
     )
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -538,7 +469,7 @@ pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> Re
                 Protocol::OpenAiChatCompletions
             }
         },
-        target: downstream,
+        target: downstream_protocol(downstream),
     }
 }
 
@@ -656,6 +587,7 @@ pub fn strip_converted_response_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
+    use codex_provider_proxy_api_conversion::plan::{ExtensionPolicy, RequestPipeline};
     use futures_util::{stream, StreamExt};
 
     use super::*;
@@ -676,12 +608,13 @@ mod tests {
                 DownstreamApi::AnthropicMessages,
                 "/v1/messages",
                 RequestAction::Transform(RequestPipeline {
+                    source: Protocol::AnthropicMessages,
                     target: Protocol::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
                     source: Protocol::OpenAiChatCompletions,
-                    target: DownstreamApi::AnthropicMessages,
+                    target: Protocol::AnthropicMessages,
                 },
             ),
             (
@@ -689,12 +622,13 @@ mod tests {
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
+                    source: Protocol::OpenAiResponses,
                     target: Protocol::OpenAiChatCompletions,
                     normalizer: None,
                 }),
                 ResponsePipeline {
                     source: Protocol::OpenAiChatCompletions,
-                    target: DownstreamApi::OpenAiResponses,
+                    target: Protocol::OpenAiResponses,
                 },
             ),
             (
@@ -704,7 +638,7 @@ mod tests {
                 RequestAction::Passthrough,
                 ResponsePipeline {
                     source: Protocol::AnthropicMessages,
-                    target: DownstreamApi::AnthropicMessages,
+                    target: Protocol::AnthropicMessages,
                 },
             ),
             (
@@ -712,12 +646,13 @@ mod tests {
                 DownstreamApi::OpenAiResponses,
                 "/v1/responses",
                 RequestAction::Transform(RequestPipeline {
+                    source: Protocol::OpenAiResponses,
                     target: Protocol::OpenAiResponses,
                     normalizer: Some(RequestNormalizerKind::ArkResponses),
                 }),
                 ResponsePipeline {
                     source: Protocol::OpenAiResponses,
-                    target: DownstreamApi::OpenAiResponses,
+                    target: Protocol::OpenAiResponses,
                 },
             ),
         ];
@@ -739,7 +674,7 @@ mod tests {
             );
             assert_eq!(
                 plan.stream,
-                if response.source == response.target_protocol() {
+                if response.source == response.target {
                     StreamPolicy::Passthrough
                 } else {
                     StreamPolicy::Translate
@@ -1066,7 +1001,7 @@ accept_downstream_apis = ["openai_responses"]
             body.clone(),
             ResponsePipeline {
                 source: Protocol::OpenAiResponses,
-                target: DownstreamApi::OpenAiResponses,
+                target: Protocol::OpenAiResponses,
             },
         )
         .unwrap();
@@ -1086,9 +1021,14 @@ accept_downstream_apis = ["openai_responses"]
             (Protocol::OpenAiResponses, DownstreamApi::OpenAiResponses),
         ] {
             let body = Bytes::from_static(b"provider returned non-json diagnostics");
-            let converted =
-                convert_non_streaming_response(body.clone(), ResponsePipeline { source, target })
-                    .unwrap();
+            let converted = convert_non_streaming_response(
+                body.clone(),
+                ResponsePipeline {
+                    source,
+                    target: downstream_protocol(target),
+                },
+            )
+            .unwrap();
             assert_eq!(converted.body, body);
             assert!(converted.semantic_response.is_none());
         }
@@ -1143,7 +1083,7 @@ accept_downstream_apis = ["openai_responses"]
                 1024 * 1024,
                 ResponsePipeline {
                     source,
-                    target: DownstreamApi::OpenAiResponses,
+                    target: Protocol::OpenAiResponses,
                 },
                 Some(recorder),
             );
@@ -1194,7 +1134,7 @@ accept_downstream_apis = ["openai_responses"]
                 1024 * 1024,
                 ResponsePipeline {
                     source: Protocol::OpenAiResponses,
-                    target: DownstreamApi::OpenAiResponses,
+                    target: Protocol::OpenAiResponses,
                 },
                 Some(recorder),
             );

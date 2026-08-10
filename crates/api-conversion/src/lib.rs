@@ -11,6 +11,7 @@
 pub mod dialect;
 pub mod error;
 pub mod ir;
+pub mod plan;
 pub mod protocol;
 pub mod protocols;
 pub mod provider_normalizer;
