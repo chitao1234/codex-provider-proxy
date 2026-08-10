@@ -539,7 +539,11 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::api_conversion::V2ChatConversionStream::<_, crate::api_conversion::MessagesV2StreamTarget>::messages(resp_stream)) as BoxRespStream,
+                ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
+                    resp_stream,
+                    codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
+                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
+                )) as BoxRespStream,
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
@@ -561,8 +565,10 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::api_conversion::V2ChatConversionStream::<_, crate::api_conversion::ResponsesV2StreamTarget>::responses(
+                ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
                     resp_stream,
+                    codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
+                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
             }

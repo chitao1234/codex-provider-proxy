@@ -13,6 +13,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::error::ConversionError;
+use codex_provider_proxy_api_conversion::ir::{CanonicalResponseEvent, ResponseAccumulator};
 use codex_provider_proxy_api_conversion::sse;
 use codex_provider_proxy_api_conversion::stream::{StreamEvent, StreamingResponseIr};
 use futures_util::Stream;
@@ -20,6 +21,71 @@ use pin_project_lite::pin_project;
 use serde_json::Value;
 
 use crate::api_conversion::ResponseRecorder;
+
+/// A protocol-local SSE parser that emits protocol-neutral response events.
+pub trait CanonicalParser {
+    fn on_event(
+        &mut self,
+        event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError>;
+    fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>);
+}
+
+/// A protocol-local SSE renderer consuming protocol-neutral response events.
+pub trait CanonicalRenderer {
+    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>);
+    fn finish(&mut self, out: &mut Vec<Bytes>);
+    fn response_id(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl CanonicalParser
+    for codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser
+{
+    fn on_event(
+        &mut self,
+        _event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError> {
+        self.on_chunk(payload, out)
+    }
+
+    fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>) {
+        self.finish(out);
+    }
+}
+
+impl CanonicalRenderer
+    for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer
+{
+    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
+        self.on_event(event, out);
+    }
+
+    fn finish(&mut self, out: &mut Vec<Bytes>) {
+        self.finish(out);
+    }
+}
+
+impl CanonicalRenderer
+    for codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer
+{
+    fn on_event(&mut self, event: &CanonicalResponseEvent, out: &mut Vec<Bytes>) {
+        self.on_event(event, out);
+    }
+
+    fn finish(&mut self, out: &mut Vec<Bytes>) {
+        self.finish(out);
+    }
+
+    fn response_id(&self) -> Option<&str> {
+        self.response_id()
+    }
+}
 
 fn decode_json_event(event_bytes: &[u8]) -> std::io::Result<Option<(&str, Value)>> {
     let event = sse::decode_event(event_bytes).map_err(|err| {
@@ -69,6 +135,177 @@ pub trait Parser {
 pub trait Renderer {
     fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>);
     fn finish(&mut self, out: &mut Vec<Bytes>);
+}
+
+pin_project! {
+    pub struct CanonicalParserRendererStream<S, P, R> {
+        #[pin]
+        inner: S,
+        parser: P,
+        renderer: R,
+        recorder: Option<ResponseRecorder>,
+        response: ResponseAccumulator,
+        pending: BytesMut,
+        out_events: VecDeque<Bytes>,
+        pending_error: Option<std::io::Error>,
+        finished: bool,
+    }
+}
+
+impl<S, P, R> CanonicalParserRendererStream<S, P, R> {
+    pub fn new(inner: S, parser: P, renderer: R) -> Self {
+        Self::with_recorder(inner, parser, renderer, None)
+    }
+
+    pub fn with_recorder(
+        inner: S,
+        parser: P,
+        renderer: R,
+        recorder: Option<ResponseRecorder>,
+    ) -> Self {
+        Self {
+            inner,
+            parser,
+            renderer,
+            recorder,
+            response: ResponseAccumulator::default(),
+            pending: BytesMut::new(),
+            out_events: VecDeque::new(),
+            pending_error: None,
+            finished: false,
+        }
+    }
+}
+
+impl<S, P, R> Stream for CanonicalParserRendererStream<S, P, R>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+    P: CanonicalParser,
+    R: CanonicalRenderer,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if let Some(event) = this.out_events.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if let Some(error) = this.pending_error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending.extend_from_slice(&chunk);
+                    let mut rendered = Vec::new();
+                    while let Some(boundary_end) =
+                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
+                    {
+                        if boundary_end > sse::MAX_EVENT_BYTES {
+                            *this.finished = true;
+                            let error = oversized_sse_event_error();
+                            if rendered.is_empty() {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                            *this.pending_error = Some(error);
+                            break;
+                        }
+                        let event_bytes = this.pending.split_to(boundary_end).freeze();
+                        let event = match sse::decode_event(&event_bytes) {
+                            Ok(event) => event,
+                            Err(err) => {
+                                *this.finished = true;
+                                let error = std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("upstream SSE event is not valid UTF-8: {err}"),
+                                );
+                                if rendered.is_empty() {
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                                *this.pending_error = Some(error);
+                                break;
+                            }
+                        };
+                        let Some(payload) = event.data else {
+                            continue;
+                        };
+                        let mut semantic_events = Vec::new();
+                        if let Err(err) = this.parser.on_event(
+                            event.event_type.unwrap_or(""),
+                            &payload,
+                            &mut semantic_events,
+                        ) {
+                            *this.finished = true;
+                            let error = std::io::Error::new(std::io::ErrorKind::InvalidData, err);
+                            if rendered.is_empty() {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                            *this.pending_error = Some(error);
+                            break;
+                        }
+                        for event in semantic_events {
+                            this.response.apply(event.clone());
+                            this.renderer.on_event(&event, &mut rendered);
+                        }
+                    }
+                    if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
+                        *this.finished = true;
+                        let error = oversized_sse_event_error();
+                        if rendered.is_empty() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        *this.pending_error = Some(error);
+                    }
+                    if !rendered.is_empty() {
+                        this.out_events.extend(rendered);
+                        return Poll::Ready(Some(Ok(this
+                            .out_events
+                            .pop_front()
+                            .expect("events were just pushed"))));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    *this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    *this.finished = true;
+                    if pending_has_data(this.pending.as_ref())? {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "upstream SSE ended during a data event",
+                        ))));
+                    }
+                    let mut semantic_events = Vec::new();
+                    this.parser.finish(&mut semantic_events);
+                    let mut rendered = Vec::new();
+                    for event in semantic_events {
+                        this.response.apply(event.clone());
+                        this.renderer.on_event(&event, &mut rendered);
+                    }
+                    this.renderer.finish(&mut rendered);
+                    if let (Some(recorder), Some(response_id)) =
+                        (this.recorder.as_ref(), this.renderer.response_id())
+                    {
+                        recorder.record_semantic(response_id, this.response.response());
+                    }
+                    if rendered.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    this.out_events.extend(rendered);
+                    return Poll::Ready(Some(Ok(this
+                        .out_events
+                        .pop_front()
+                        .expect("events were just pushed"))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 impl Parser for codex_provider_proxy_api_conversion::messages_parser::MessagesParser {

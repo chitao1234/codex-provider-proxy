@@ -6,7 +6,6 @@
 //! to the downstream dialect.
 
 use std::{
-    collections::VecDeque,
     fmt,
     pin::Pin,
     task::{Context as TaskContext, Poll},
@@ -15,13 +14,13 @@ use std::{
 use bytes::{Bytes, BytesMut};
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
+use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
 use codex_provider_proxy_api_conversion::stream::StreamingResponseIr;
-use codex_provider_proxy_api_conversion::{error::ConversionError, sse};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;
@@ -643,284 +642,6 @@ pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> Re
     }
 }
 
-#[doc(hidden)]
-pub struct MessagesV2StreamTarget {
-    renderer: codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer,
-}
-
-impl MessagesV2StreamTarget {
-    fn new() -> Self {
-        Self {
-            renderer: Default::default(),
-        }
-    }
-    fn on_event(
-        &mut self,
-        event: &codex_provider_proxy_api_conversion::ir::CanonicalResponseEvent,
-        out: &mut Vec<Bytes>,
-    ) {
-        self.renderer.on_event(event, out);
-    }
-    fn finish(&mut self, out: &mut Vec<Bytes>) {
-        self.renderer.finish(out);
-    }
-}
-
-#[doc(hidden)]
-pub struct ResponsesV2StreamTarget {
-    renderer: codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer,
-}
-
-impl ResponsesV2StreamTarget {
-    fn new() -> Self {
-        Self {
-            renderer: Default::default(),
-        }
-    }
-    fn on_event(
-        &mut self,
-        event: &codex_provider_proxy_api_conversion::ir::CanonicalResponseEvent,
-        out: &mut Vec<Bytes>,
-    ) {
-        self.renderer.on_event(event, out);
-    }
-    fn finish(&mut self, out: &mut Vec<Bytes>) {
-        self.renderer.finish(out);
-    }
-    fn response_id(&self) -> Option<&str> {
-        self.renderer.response_id()
-    }
-}
-
-pin_project! {
-    pub struct V2ChatConversionStream<S, T> {
-        #[pin]
-        inner: S,
-        parser: codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser,
-        target: T,
-        recorder: Option<ResponseRecorder>,
-        core_response: ResponseAccumulator,
-        pending: BytesMut,
-        out_events: VecDeque<Bytes>,
-        pending_error: Option<std::io::Error>,
-        finished: bool,
-    }
-}
-
-impl<S> V2ChatConversionStream<S, MessagesV2StreamTarget> {
-    pub fn messages(inner: S) -> Self {
-        Self::new(inner, MessagesV2StreamTarget::new(), None)
-    }
-}
-
-impl<S> V2ChatConversionStream<S, ResponsesV2StreamTarget> {
-    pub fn responses(inner: S, recorder: Option<ResponseRecorder>) -> Self {
-        Self::new(inner, ResponsesV2StreamTarget::new(), recorder)
-    }
-}
-
-impl<S, T> V2ChatConversionStream<S, T> {
-    fn new(inner: S, target: T, recorder: Option<ResponseRecorder>) -> Self {
-        Self {
-            inner,
-            parser: Default::default(),
-            target,
-            recorder,
-            core_response: Default::default(),
-            pending: BytesMut::new(),
-            out_events: VecDeque::new(),
-            pending_error: None,
-            finished: false,
-        }
-    }
-}
-
-impl<S, T> Stream for V2ChatConversionStream<S, T>
-where
-    S: Stream<Item = Result<Bytes, std::io::Error>>,
-    T: V2StreamTarget,
-{
-    type Item = Result<Bytes, std::io::Error>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        if let Some(event) = this.out_events.pop_front() {
-            return Poll::Ready(Some(Ok(event)));
-        }
-        if let Some(error) = this.pending_error.take() {
-            return Poll::Ready(Some(Err(error)));
-        }
-        if *this.finished {
-            return Poll::Ready(None);
-        }
-        loop {
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    this.pending.extend_from_slice(&chunk);
-                    let mut events = Vec::new();
-                    let mut rendered = Vec::new();
-                    while let Some(boundary_end) =
-                        crate::proxy::find_sse_event_boundary(this.pending.as_ref())
-                    {
-                        if boundary_end > sse::MAX_EVENT_BYTES {
-                            *this.finished = true;
-                            let error = std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "upstream SSE event exceeds the {}-byte conversion limit",
-                                    sse::MAX_EVENT_BYTES
-                                ),
-                            );
-                            if rendered.is_empty() {
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                            *this.pending_error = Some(error);
-                            break;
-                        }
-                        let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        let event = match sse::decode_event(&event_bytes) {
-                            Ok(event) => event,
-                            Err(err) => {
-                                *this.finished = true;
-                                let error = std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("upstream SSE event is not valid UTF-8: {err}"),
-                                );
-                                if rendered.is_empty() {
-                                    return Poll::Ready(Some(Err(error)));
-                                }
-                                *this.pending_error = Some(error);
-                                break;
-                            }
-                        };
-                        if let Some(payload) = event.data {
-                            if let Err(err) = this.parser.on_chunk(&payload, &mut events) {
-                                *this.finished = true;
-                                let error =
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, err);
-                                if rendered.is_empty() {
-                                    return Poll::Ready(Some(Err(error)));
-                                }
-                                *this.pending_error = Some(error);
-                                break;
-                            }
-                            for event in events.drain(..) {
-                                this.core_response.apply(event.clone());
-                                this.target.on_event(&event, &mut rendered);
-                            }
-                        }
-                    }
-                    if !*this.finished && this.pending.len() > sse::MAX_EVENT_BYTES {
-                        *this.finished = true;
-                        let error = std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "upstream SSE event exceeds the {}-byte conversion limit",
-                                sse::MAX_EVENT_BYTES
-                            ),
-                        );
-                        if rendered.is_empty() {
-                            return Poll::Ready(Some(Err(error)));
-                        }
-                        *this.pending_error = Some(error);
-                    }
-                    if !rendered.is_empty() {
-                        this.out_events.extend(rendered);
-                        return Poll::Ready(Some(Ok(this
-                            .out_events
-                            .pop_front()
-                            .expect("events were just pushed"))));
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    *this.finished = true;
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(None) => {
-                    *this.finished = true;
-                    if !this.pending.is_empty() {
-                        match sse::decode_event(this.pending.as_ref()) {
-                            Ok(event) if event.data.is_none() => {}
-                            Ok(_) => {
-                                return Poll::Ready(Some(Err(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "upstream SSE ended during a data event",
-                                ))))
-                            }
-                            Err(err) => {
-                                return Poll::Ready(Some(Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("upstream SSE ended with invalid UTF-8: {err}"),
-                                ))))
-                            }
-                        }
-                    }
-                    let mut events = Vec::new();
-                    this.parser.finish(&mut events);
-                    let mut rendered = Vec::new();
-                    for event in events {
-                        this.core_response.apply(event.clone());
-                        this.target.on_event(&event, &mut rendered);
-                    }
-                    this.target.finish(&mut rendered);
-                    if let (Some(recorder), Some(response_id)) =
-                        (this.recorder.as_ref(), this.target.response_id())
-                    {
-                        recorder.record_semantic(response_id, this.core_response.response());
-                    }
-                    if rendered.is_empty() {
-                        return Poll::Ready(None);
-                    }
-                    this.out_events.extend(rendered);
-                    return Poll::Ready(Some(Ok(this
-                        .out_events
-                        .pop_front()
-                        .expect("events were just pushed"))));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-trait V2StreamTarget {
-    fn on_event(
-        &mut self,
-        event: &codex_provider_proxy_api_conversion::ir::CanonicalResponseEvent,
-        out: &mut Vec<Bytes>,
-    );
-    fn finish(&mut self, out: &mut Vec<Bytes>);
-    fn response_id(&self) -> Option<&str> {
-        None
-    }
-}
-impl V2StreamTarget for MessagesV2StreamTarget {
-    fn on_event(
-        &mut self,
-        e: &codex_provider_proxy_api_conversion::ir::CanonicalResponseEvent,
-        o: &mut Vec<Bytes>,
-    ) {
-        self.on_event(e, o)
-    }
-    fn finish(&mut self, o: &mut Vec<Bytes>) {
-        self.finish(o)
-    }
-}
-impl V2StreamTarget for ResponsesV2StreamTarget {
-    fn on_event(
-        &mut self,
-        e: &codex_provider_proxy_api_conversion::ir::CanonicalResponseEvent,
-        o: &mut Vec<Bytes>,
-    ) {
-        self.on_event(e, o)
-    }
-    fn finish(&mut self, o: &mut Vec<Bytes>) {
-        self.finish(o)
-    }
-    fn response_id(&self) -> Option<&str> {
-        self.response_id()
-    }
-}
-
 // Adapt a non-streaming upstream Chat Completions body into the downstream dialect,
 // buffering the whole response (bounded by `max_bytes`).
 pin_project! {
@@ -1538,8 +1259,12 @@ accept_downstream_apis = ["openai_responses"]
             "data: [DONE]\n\n",
         );
         let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body.as_bytes()))]);
-        let mut converted =
-            V2ChatConversionStream::<_, ResponsesV2StreamTarget>::responses(inner, Some(recorder));
+        let mut converted = crate::streams::CanonicalParserRendererStream::with_recorder(
+            inner,
+            codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
+            Some(recorder),
+        );
         while let Some(chunk) = converted.next().await {
             chunk.unwrap();
         }
@@ -1580,8 +1305,11 @@ accept_downstream_apis = ["openai_responses"]
             "data: not-json\n\n",
         );
         let inner = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body.as_bytes()))]);
-        let mut converted =
-            V2ChatConversionStream::<_, ResponsesV2StreamTarget>::responses(inner, None);
+        let mut converted = crate::streams::CanonicalParserRendererStream::new(
+            inner,
+            codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
+        );
         let mut output_count = 0;
         let error = loop {
             match converted.next().await {
@@ -1604,8 +1332,11 @@ accept_downstream_apis = ["openai_responses"]
                 + 1
         ]);
         let inner = stream::iter([Ok::<_, std::io::Error>(body)]);
-        let mut converted =
-            V2ChatConversionStream::<_, ResponsesV2StreamTarget>::responses(inner, None);
+        let mut converted = crate::streams::CanonicalParserRendererStream::new(
+            inner,
+            codex_provider_proxy_api_conversion::protocols::openai_chat_completions::stream::Parser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
+        );
 
         let error = converted.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
