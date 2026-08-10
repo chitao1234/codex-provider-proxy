@@ -10,6 +10,10 @@ use serde_json::{json, Map, Value};
 use crate::chat::{extract_usage, first_choice, first_choice_message, upstream_id, upstream_model};
 use crate::conversion_utils::format_url_citations;
 use crate::error::ConversionError;
+use crate::ir::{
+    CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
+    ToolCall, Usage,
+};
 use crate::request_ir::{ContentExtensions, IrContent, IrToolCall, Protocol, RequestIr};
 use crate::stream::{map_chat_finish_reason, StopReason};
 
@@ -167,6 +171,116 @@ impl ResponseIr {
             ResponseItem::Reasoning { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
             _ => None,
         })
+    }
+
+    /// Projects a completed response onto the shared semantic response event core.
+    pub fn canonical_events(&self) -> Vec<CanonicalResponseEvent> {
+        let mut events = vec![CanonicalResponseEvent::StreamStarted {
+            response_id: self.id().map(str::to_owned),
+            model: (!self.model.is_empty()).then(|| self.model.clone()),
+        }];
+        for (index, item) in self.items.iter().enumerate() {
+            let item_id = format!("item:{index}");
+            match item {
+                ResponseItem::Reasoning {
+                    text, signature, ..
+                } => {
+                    events.push(CanonicalResponseEvent::ItemStarted {
+                        item_id: item_id.clone(),
+                        item: ItemKind::Reasoning,
+                    });
+                    events.push(CanonicalResponseEvent::ContentDelta {
+                        item_id,
+                        content: ContentPart::Reasoning {
+                            text: text.clone(),
+                            signature: signature.clone(),
+                        },
+                    });
+                }
+                ResponseItem::Message { content, .. } => {
+                    events.push(CanonicalResponseEvent::ItemStarted {
+                        item_id: item_id.clone(),
+                        item: ItemKind::Message,
+                    });
+                    for part in content {
+                        match part {
+                            ResponseContent::Text(text) => {
+                                events.push(CanonicalResponseEvent::ContentDelta {
+                                    item_id: item_id.clone(),
+                                    content: ContentPart::Text(text.text.clone()),
+                                })
+                            }
+                            ResponseContent::Refusal(refusal) => {
+                                events.push(CanonicalResponseEvent::ContentDelta {
+                                    item_id: item_id.clone(),
+                                    content: ContentPart::Refusal(refusal.refusal.clone()),
+                                })
+                            }
+                            ResponseContent::Opaque(value) => {
+                                events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
+                                    namespace: "response".to_owned(),
+                                    key: "content".to_owned(),
+                                    value: value.clone(),
+                                    scope: ExtensionScope::Response,
+                                    source_protocol: None,
+                                    provider: None,
+                                    replay: ReplayPolicy::NeverReplay,
+                                }))
+                            }
+                        }
+                    }
+                }
+                ResponseItem::ToolCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    let item_id = item_id.clone();
+                    events.push(CanonicalResponseEvent::ToolCallStarted {
+                        item_id,
+                        call: ToolCall {
+                            id: id.clone().or_else(|| Some(call_id.clone())),
+                            name: name.clone(),
+                            arguments: arguments.to_string(),
+                            status: Some("completed".to_owned()),
+                            metadata: BTreeMap::new(),
+                            function_metadata: BTreeMap::new(),
+                            extensions: Vec::new(),
+                        },
+                    });
+                }
+                ResponseItem::Opaque(value) => {
+                    events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
+                        namespace: "response".to_owned(),
+                        key: "item".to_owned(),
+                        value: value.clone(),
+                        scope: ExtensionScope::Response,
+                        source_protocol: None,
+                        provider: None,
+                        replay: ReplayPolicy::NeverReplay,
+                    }))
+                }
+            }
+        }
+        events.push(CanonicalResponseEvent::UsageUpdated(Usage {
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            total_tokens: self.usage.total_tokens,
+            cached_input_tokens: self.usage.cached_tokens,
+        }));
+        events.push(CanonicalResponseEvent::ResponseCompleted {
+            stop_reason: match self.stop_reason() {
+                StopReason::Stop => crate::ir::StopReason::Natural,
+                StopReason::ToolUse => crate::ir::StopReason::ToolUse,
+                StopReason::MaxTokens => crate::ir::StopReason::MaxTokens,
+                StopReason::ContentFilter => crate::ir::StopReason::ContentFilter,
+                StopReason::Other => crate::ir::StopReason::Unknown("other".to_owned()),
+            },
+            original_reason: self.protocol_stop_reason().map(str::to_owned),
+        });
+        events
     }
 
     pub fn append_to_request(&self, request: &mut RequestIr) {
@@ -1614,5 +1728,56 @@ mod tests {
         assert_eq!(input[4]["id"], "fc_1");
         assert_eq!(input[4]["status"], "completed");
         assert_eq!(input[4]["x_provider"], "kept");
+    }
+
+    #[test]
+    fn completed_response_projects_into_shared_event_core() {
+        let response = ResponseIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "id": "resp-1",
+                "model": "m",
+                "status": "completed",
+                "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            }),
+        )
+        .unwrap();
+        let snapshot = crate::response_adapter::accumulate_stream(
+            response
+                .canonical_events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    crate::ir::CanonicalResponseEvent::StreamStarted { response_id, model } => {
+                        Some(crate::stream::StreamEvent::Start {
+                            id: response_id.unwrap_or_default(),
+                            model: model.unwrap_or_default(),
+                        })
+                    }
+                    crate::ir::CanonicalResponseEvent::ContentDelta { content, .. } => {
+                        match content {
+                            crate::ir::ContentPart::Text(text) => {
+                                Some(crate::stream::StreamEvent::TextDelta { text })
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::ir::CanonicalResponseEvent::ResponseCompleted {
+                        stop_reason,
+                        original_reason,
+                    } => Some(crate::stream::StreamEvent::End {
+                        stop_reason: match stop_reason {
+                            crate::ir::StopReason::Natural => crate::stream::StopReason::Stop,
+                            _ => crate::stream::StopReason::Other,
+                        },
+                        protocol_reason: original_reason,
+                        usage: Default::default(),
+                    }),
+                    _ => None,
+                }),
+        );
+        assert_eq!(snapshot.response.response_id.as_deref(), Some("resp-1"));
+        assert_eq!(snapshot.response.output.len(), 1);
+        assert!(snapshot.terminal);
     }
 }
