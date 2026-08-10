@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use codex_provider_proxy_api_conversion::{
     ir::{
         CanonicalResponseEvent, ContentItem, ContentPart, Extension, ExtensionScope, ItemKind,
-        ReplayPolicy, ResponseAccumulator, StopReason, ToolCall, Usage,
+        ReplayPolicy, RequestIr, ResponseAccumulator, StopReason, ToolCall, Usage,
     },
     protocols::openai_responses::stream::{Parser, Renderer},
     sse,
@@ -244,6 +244,45 @@ fn responses_stream_parser_preserves_item_and_usage_extensions() {
         .extensions
         .iter()
         .any(|extension| extension.key == "x_usage" && extension.value == json!(true)));
+}
+
+#[test]
+fn unknown_responses_stream_events_do_not_pollute_continuation_requests() {
+    let mut parser = Parser::new();
+    let mut events = Vec::new();
+    parser
+        .on_event(
+            "response.future_provider_event",
+            &json!({"type":"response.future_provider_event","provider_state":"opaque"}).to_string(),
+            &mut events,
+        )
+        .unwrap();
+    parser
+        .on_event(
+            "response.completed",
+            &json!({"response":{"id":"resp-1","status":"completed"}}).to_string(),
+            &mut events,
+        )
+        .unwrap();
+
+    let mut accumulator = ResponseAccumulator::default();
+    for event in events {
+        accumulator.apply(event);
+    }
+    let snapshot = accumulator.snapshot();
+    let extension = snapshot
+        .response
+        .extensions
+        .iter()
+        .find(|extension| extension.key == "response.future_provider_event")
+        .expect("unknown event is retained as response-scoped diagnostic data");
+    assert_eq!(extension.replay, ReplayPolicy::NeverReplay);
+
+    let mut continuation = RequestIr::default();
+    continuation.append_response(&snapshot.response);
+    assert!(continuation.transcript.is_empty());
+    assert!(continuation.opaque.is_empty());
+    assert!(continuation.state.extensions.is_empty());
 }
 
 fn decode_events(chunks: &[bytes::Bytes]) -> Vec<Value> {
