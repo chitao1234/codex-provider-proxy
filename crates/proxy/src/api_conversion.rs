@@ -52,6 +52,23 @@ pub enum RequestAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationPolicy {
+    None,
+    ResponsesState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPolicy {
+    Passthrough,
+    Translate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionPolicy {
+    PreserveScopedOpaque,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsePipeline {
     pub source: Protocol,
     pub target: DownstreamApi,
@@ -76,6 +93,9 @@ pub struct ConversionPlan {
     pub upstream: UpstreamApi,
     pub request: RequestAction,
     pub response: ResponsePipeline,
+    pub continuation: ContinuationPolicy,
+    pub stream: StreamPolicy,
+    pub extensions: ExtensionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,61 +127,50 @@ pub fn resolve_conversion_plan(
     if !provider.accept_downstream_apis.contains(&downstream) {
         return Ok(None);
     }
-    let plan = match (provider.upstream_api, downstream) {
-        (UpstreamApi::Passthrough, _) => return Ok(None),
-        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::AnthropicMessages) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Transform(RequestPipeline {
-                target: Protocol::OpenAiChatCompletions,
-                normalizer: None,
-            }),
-            response: response_pipeline(provider.upstream_api, downstream),
+    let Some(upstream_protocol) = upstream_protocol(provider.upstream_api) else {
+        return Ok(None);
+    };
+    let downstream_protocol = downstream_protocol(downstream);
+    let normalizer = (upstream_protocol == Protocol::OpenAiResponses)
+        .then_some(RequestNormalizerKind::ArkResponses);
+    let request = if upstream_protocol == downstream_protocol && normalizer.is_none() {
+        RequestAction::Passthrough
+    } else {
+        RequestAction::Transform(RequestPipeline {
+            target: upstream_protocol,
+            normalizer,
+        })
+    };
+    let plan = ConversionPlan {
+        downstream,
+        upstream: provider.upstream_api,
+        request,
+        response: ResponsePipeline {
+            source: upstream_protocol,
+            target: downstream,
         },
-        (UpstreamApi::OpenAiChatCompletions, DownstreamApi::OpenAiResponses) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Transform(RequestPipeline {
-                target: Protocol::OpenAiChatCompletions,
-                normalizer: None,
-            }),
-            response: response_pipeline(provider.upstream_api, downstream),
+        continuation: if downstream_protocol == Protocol::OpenAiResponses {
+            ContinuationPolicy::ResponsesState
+        } else {
+            ContinuationPolicy::None
         },
-        (UpstreamApi::AnthropicMessages, DownstreamApi::AnthropicMessages) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Passthrough,
-            response: response_pipeline(provider.upstream_api, downstream),
+        stream: if upstream_protocol == downstream_protocol {
+            StreamPolicy::Passthrough
+        } else {
+            StreamPolicy::Translate
         },
-        (UpstreamApi::AnthropicMessages, DownstreamApi::OpenAiResponses) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Transform(RequestPipeline {
-                target: Protocol::AnthropicMessages,
-                normalizer: None,
-            }),
-            response: response_pipeline(provider.upstream_api, downstream),
-        },
-        (UpstreamApi::OpenAiResponses, DownstreamApi::OpenAiResponses) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Transform(RequestPipeline {
-                target: Protocol::OpenAiResponses,
-                normalizer: Some(RequestNormalizerKind::ArkResponses),
-            }),
-            response: response_pipeline(provider.upstream_api, downstream),
-        },
-        (UpstreamApi::OpenAiResponses, DownstreamApi::AnthropicMessages) => ConversionPlan {
-            downstream,
-            upstream: provider.upstream_api,
-            request: RequestAction::Transform(RequestPipeline {
-                target: Protocol::OpenAiResponses,
-                normalizer: Some(RequestNormalizerKind::ArkResponses),
-            }),
-            response: response_pipeline(provider.upstream_api, downstream),
-        },
+        extensions: ExtensionPolicy::PreserveScopedOpaque,
     };
     Ok(Some(plan))
+}
+
+fn upstream_protocol(upstream: UpstreamApi) -> Option<Protocol> {
+    match upstream {
+        UpstreamApi::Passthrough => None,
+        UpstreamApi::OpenAiChatCompletions => Some(Protocol::OpenAiChatCompletions),
+        UpstreamApi::AnthropicMessages => Some(Protocol::AnthropicMessages),
+        UpstreamApi::OpenAiResponses => Some(Protocol::OpenAiResponses),
+    }
 }
 
 /// Whether this provider converts the downstream dialect for the given path.
@@ -248,12 +257,22 @@ pub fn convert_request_body(
         RequestAction::Passthrough => return Ok(body),
         RequestAction::Transform(pipeline) => {
             let source = downstream_protocol(plan.downstream);
+            if source == pipeline.target
+                && pipeline.normalizer == Some(RequestNormalizerKind::ArkResponses)
+                && !caps.ark_style
+            {
+                return Ok(body);
+            }
             let adapter = RequestAdapterKind::for_protocol(source);
-            let request = adapter
-                .parse_v2_with_context(&json, previous_request, last_reasoning)
-                .map_err(|err| {
-                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                })?;
+            let request = match plan.continuation {
+                ContinuationPolicy::None => adapter.parse_v2(&json),
+                ContinuationPolicy::ResponsesState => {
+                    adapter.parse_v2_with_context(&json, previous_request, last_reasoning)
+                }
+            }
+            .map_err(|err| {
+                RequestConversionRejected::from_conversion_error(err, plan.downstream)
+            })?;
             let rendered_request = adapter
                 .render_v2(&request, pipeline.target, &caps)
                 .map_err(|err| {
@@ -515,6 +534,7 @@ fn convert_non_streaming_response(
     })
 }
 
+#[cfg(test)]
 pub fn response_pipeline(upstream: UpstreamApi, downstream: DownstreamApi) -> ResponsePipeline {
     ResponsePipeline {
         source: match upstream {
@@ -715,7 +735,59 @@ mod tests {
                     .unwrap();
             assert_eq!(plan.request, request);
             assert_eq!(plan.response, response);
+            assert_eq!(
+                plan.continuation,
+                if downstream == DownstreamApi::OpenAiResponses {
+                    ContinuationPolicy::ResponsesState
+                } else {
+                    ContinuationPolicy::None
+                }
+            );
+            assert_eq!(
+                plan.stream,
+                if response.source == response.target_protocol() {
+                    StreamPolicy::Passthrough
+                } else {
+                    StreamPolicy::Translate
+                }
+            );
+            assert_eq!(plan.extensions, ExtensionPolicy::PreserveScopedOpaque);
         }
+    }
+
+    #[test]
+    fn non_ark_responses_request_is_byte_transparent() {
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "responses"
+listen_addr = "127.0.0.1:0"
+[providers.responses]
+base_url = "https://example.com/"
+api_key = "test"
+upstream_api = "openai_responses"
+accept_downstream_apis = ["openai_responses"]
+"#,
+        )
+        .unwrap();
+        let body = Bytes::from_static(
+            br#"{
+  "model": "m",
+  "input": "hello",
+  "x_provider": {"preserve": true}
+}"#,
+        );
+
+        let converted = convert_request_body(
+            &config,
+            "responses",
+            "/v1/responses",
+            body.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(converted, body);
     }
 
     #[test]

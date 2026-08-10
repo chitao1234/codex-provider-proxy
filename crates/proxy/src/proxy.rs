@@ -519,13 +519,12 @@ async fn handle_proxy_inner(
         resp_stream,
     );
     let resp_stream = if conversion_applies {
-        let response_pipeline = conversion_plan
-            .expect("conversion applies only when a plan exists")
-            .response;
+        let conversion_plan = conversion_plan.expect("conversion applies only when a plan exists");
+        let response_pipeline = conversion_plan.response;
         if is_text_event_stream(&resp_headers) {
             let target = response_pipeline.target_protocol();
-            if response_pipeline.source == target {
-                match target {
+            match conversion_plan.stream {
+                crate::api_conversion::StreamPolicy::Passthrough => match target {
                     codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses => {
                         Box::pin(crate::streams::RecordingPassthroughStream::new(
                             resp_stream,
@@ -539,25 +538,24 @@ async fn handle_proxy_inner(
                     | codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions => {
                         resp_stream
                     }
+                },
+                crate::api_conversion::StreamPolicy::Translate => {
+                    let parser = codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
+                            response_pipeline.source,
+                        );
+                    let renderer = codex_provider_proxy_api_conversion::protocols::StreamRendererKind::for_protocol(
+                            target,
+                        )
+                        .expect("downstream protocol must support streaming response rendering");
+                    Box::pin(
+                        crate::streams::CanonicalParserRendererStream::with_recorder(
+                            resp_stream,
+                            parser,
+                            renderer,
+                            final_attempt.response_recorder.clone(),
+                        ),
+                    ) as BoxRespStream
                 }
-            } else {
-                let parser =
-                    codex_provider_proxy_api_conversion::protocols::StreamParserKind::for_protocol(
-                        response_pipeline.source,
-                    );
-                let renderer =
-                    codex_provider_proxy_api_conversion::protocols::StreamRendererKind::for_protocol(
-                        target,
-                    )
-                    .expect("downstream protocol must support streaming response rendering");
-                Box::pin(
-                    crate::streams::CanonicalParserRendererStream::with_recorder(
-                        resp_stream,
-                        parser,
-                        renderer,
-                        final_attempt.response_recorder.clone(),
-                    ),
-                ) as BoxRespStream
             }
         } else {
             Box::pin(
