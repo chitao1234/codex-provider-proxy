@@ -39,14 +39,14 @@ fn each_protocol_has_an_independent_request_adapter() {
 fn adapter_dispatch_preserves_responses_continuation_context() {
     let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
     let previous = adapter
-        .parse(&serde_json::json!({
+        .parse_v2(&serde_json::json!({
             "model": "m",
             "input": "first",
             "prompt_cache_key": "cache-1"
         }))
         .unwrap();
     let current = adapter
-        .parse_with_context(
+        .parse_v2_with_context(
             &serde_json::json!({
                 "model": "m",
                 "previous_response_id": "resp-1",
@@ -59,7 +59,7 @@ fn adapter_dispatch_preserves_responses_continuation_context() {
     let mut capabilities = ModelCapabilities::default();
     capabilities.cache.prompt_cache_key = true;
     let rendered = adapter
-        .render(&current, Protocol::OpenAiResponses, &capabilities)
+        .render_v2(&current, Protocol::OpenAiResponses, &capabilities)
         .unwrap();
 
     assert_eq!(rendered.body["previous_response_id"], "resp-1");

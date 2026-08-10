@@ -33,3 +33,20 @@ pub struct RequestIr {
     pub extensions: Vec<Extension>,
     pub opaque: Vec<Extension>,
 }
+
+impl RequestIr {
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn append_response(&mut self, response: &super::response::ResponseIr) {
+        self.transcript.extend(response.output.clone());
+        if self.state.source_response_id.is_none() {
+            self.state
+                .source_response_id
+                .clone_from(&response.response_id);
+        }
+        self.extensions.extend(response.extensions.clone());
+        self.opaque.extend(response.opaque.clone());
+    }
+}

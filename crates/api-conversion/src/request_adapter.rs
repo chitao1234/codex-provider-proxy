@@ -40,11 +40,12 @@ pub trait RequestAdapter {
     fn parse_with_context(
         &self,
         body: &Value,
-        previous: Option<&RequestIr>,
-        last_reasoning: Option<&str>,
+        previous: Option<&crate::ir::RequestIr>,
+        _last_reasoning: Option<&str>,
     ) -> Result<RequestIr, ConversionError> {
         if self.protocol() == Protocol::OpenAiResponses {
-            RequestIr::parse_with_context(self.protocol(), body, previous, last_reasoning)
+            let _ = previous;
+            self.parse(body)
         } else {
             self.parse(body)
         }
@@ -53,14 +54,13 @@ pub trait RequestAdapter {
     fn parse_v2_with_context(
         &self,
         body: &Value,
-        previous: Option<&RequestIr>,
+        previous: Option<&crate::ir::RequestIr>,
         last_reasoning: Option<&str>,
     ) -> Result<crate::ir::RequestIr, ConversionError> {
         let mut request = self.parse_v2(body)?;
         if self.protocol() == Protocol::OpenAiResponses {
             if let Some(previous) = previous {
-                let previous = previous.to_v2();
-                request.transcript.splice(0..0, previous.transcript);
+                request.transcript.splice(0..0, previous.transcript.clone());
                 inherit_state(&mut request.state, &previous.state);
             }
             if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
@@ -221,7 +221,7 @@ impl RequestAdapter for RequestAdapterKind {
     fn parse_with_context(
         &self,
         body: &Value,
-        previous: Option<&RequestIr>,
+        previous: Option<&crate::ir::RequestIr>,
         last_reasoning: Option<&str>,
     ) -> Result<RequestIr, ConversionError> {
         match self {
@@ -255,7 +255,7 @@ impl RequestAdapter for RequestAdapterKind {
     fn parse_v2_with_context(
         &self,
         body: &Value,
-        previous: Option<&RequestIr>,
+        previous: Option<&crate::ir::RequestIr>,
         last_reasoning: Option<&str>,
     ) -> Result<crate::ir::RequestIr, ConversionError> {
         match self {
