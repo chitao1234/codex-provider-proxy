@@ -1754,14 +1754,10 @@ mod tests {
                             model: model.unwrap_or_default(),
                         })
                     }
-                    crate::ir::CanonicalResponseEvent::ContentDelta { content, .. } => {
-                        match content {
-                            crate::ir::ContentPart::Text(text) => {
-                                Some(crate::stream::StreamEvent::TextDelta { text })
-                            }
-                            _ => None,
-                        }
-                    }
+                    crate::ir::CanonicalResponseEvent::ContentDelta {
+                        content: crate::ir::ContentPart::Text(text),
+                        ..
+                    } => Some(crate::stream::StreamEvent::TextDelta { text }),
                     crate::ir::CanonicalResponseEvent::ResponseCompleted {
                         stop_reason,
                         original_reason,

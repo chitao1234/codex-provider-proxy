@@ -924,9 +924,8 @@ where
                     *this.result = Some(
                         convert_non_streaming_response(buffered, *this.pipeline).map(|converted| {
                             if let Some(response) = converted.response.as_ref() {
-                                for event in response.canonical_events() {
-                                    this.core_response.apply(event);
-                                }
+                                codex_provider_proxy_api_conversion::response_adapter::
+                                    apply_complete_response(this.core_response, response);
                             }
                             if let (Some(recorder), Some(response_id), Some(response)) = (
                                 this.recorder.as_ref(),

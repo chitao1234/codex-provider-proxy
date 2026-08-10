@@ -11,6 +11,15 @@ use crate::{
     stream::{StopReason as LegacyStopReason, StreamEvent},
 };
 
+pub fn apply_complete_response(
+    accumulator: &mut ResponseAccumulator,
+    response: &crate::response_ir::ResponseIr,
+) {
+    for event in response.canonical_events() {
+        accumulator.apply(event);
+    }
+}
+
 pub fn apply_stream_event(
     accumulator: &mut ResponseAccumulator,
     event: &StreamEvent,
