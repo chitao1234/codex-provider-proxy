@@ -59,6 +59,23 @@ impl CanonicalParser
     }
 }
 
+impl CanonicalParser
+    for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Parser
+{
+    fn on_event(
+        &mut self,
+        event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError> {
+        self.on_event(event_type, payload, out)
+    }
+
+    fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>) {
+        self.finish(out);
+    }
+}
+
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer
 {
@@ -380,25 +397,6 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             parser,
             renderer,
             recorder: None,
-            response: StreamingResponseIr::default(),
-            pending: BytesMut::new(),
-            out_events: VecDeque::new(),
-            pending_error: None,
-            finished: false,
-        }
-    }
-
-    pub fn with_recorder(
-        inner: S,
-        parser: P,
-        renderer: R,
-        recorder: Option<ResponseRecorder>,
-    ) -> Self {
-        Self {
-            inner,
-            parser,
-            renderer,
-            recorder,
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),

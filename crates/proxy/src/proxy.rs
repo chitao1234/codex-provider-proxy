@@ -547,11 +547,10 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::AnthropicMessages,
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
-                ) => Box::pin(crate::streams::ParserRendererStream::with_recorder(
+                ) => Box::pin(crate::streams::CanonicalParserRendererStream::with_recorder(
                     resp_stream,
-                    codex_provider_proxy_api_conversion::messages_parser::MessagesParser::new(),
-                    codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer::new(
-                    ),
+                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Parser::new(),
+                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Renderer::new(),
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
                 (
