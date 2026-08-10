@@ -332,22 +332,50 @@ impl ResponseIr {
                 replay: ReplayPolicy::NeverReplay,
             }));
         }
+        for (key, value) in &self.opaque_extensions {
+            events.push(CanonicalResponseEvent::ProtocolExtension(Extension {
+                namespace: "response".to_owned(),
+                key: key.clone(),
+                value: value.clone(),
+                scope: ExtensionScope::Response,
+                source_protocol: None,
+                provider: None,
+                replay: ReplayPolicy::NeverReplay,
+            }));
+        }
         events.push(CanonicalResponseEvent::UsageUpdated(Usage {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             total_tokens: self.usage.total_tokens,
             cached_input_tokens: self.usage.cached_tokens,
         }));
-        events.push(CanonicalResponseEvent::ResponseCompleted {
-            stop_reason: match self.stop_reason() {
-                StopReason::Stop => crate::ir::StopReason::Natural,
-                StopReason::ToolUse => crate::ir::StopReason::ToolUse,
-                StopReason::MaxTokens => crate::ir::StopReason::MaxTokens,
-                StopReason::ContentFilter => crate::ir::StopReason::ContentFilter,
-                StopReason::Other => crate::ir::StopReason::Unknown("other".to_owned()),
-            },
-            original_reason: self.protocol_stop_reason().map(str::to_owned),
-        });
+        if self.error.as_ref().is_some_and(|error| !error.is_null()) || self.status == "failed" {
+            let message = self
+                .error
+                .as_ref()
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("upstream response failed")
+                .to_owned();
+            let code = self
+                .error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            events.push(CanonicalResponseEvent::StreamError { message, code });
+        } else {
+            events.push(CanonicalResponseEvent::ResponseCompleted {
+                stop_reason: match self.stop_reason() {
+                    StopReason::Stop => crate::ir::StopReason::Natural,
+                    StopReason::ToolUse => crate::ir::StopReason::ToolUse,
+                    StopReason::MaxTokens => crate::ir::StopReason::MaxTokens,
+                    StopReason::ContentFilter => crate::ir::StopReason::ContentFilter,
+                    StopReason::Other => crate::ir::StopReason::Unknown("other".to_owned()),
+                },
+                original_reason: self.protocol_stop_reason().map(str::to_owned),
+            });
+        }
         events
     }
 
@@ -1843,5 +1871,27 @@ mod tests {
         assert_eq!(snapshot.response.response_id.as_deref(), Some("resp-1"));
         assert_eq!(snapshot.response.output.len(), 1);
         assert!(snapshot.terminal);
+    }
+
+    #[test]
+    fn failed_response_projects_as_stream_error() {
+        let response = ResponseIr::parse(
+            Protocol::OpenAiResponses,
+            &json!({
+                "id": "resp-failed",
+                "status": "failed",
+                "error": {"message": "upstream boom", "code": "bad_gateway"},
+                "output": []
+            }),
+        )
+        .unwrap();
+        assert!(response
+            .canonical_events()
+            .iter()
+            .any(|event| matches!(event, crate::ir::CanonicalResponseEvent::StreamError { message, code } if message == "upstream boom" && code.as_deref() == Some("bad_gateway"))));
+        assert!(!response.canonical_events().iter().any(|event| matches!(
+            event,
+            crate::ir::CanonicalResponseEvent::ResponseCompleted { .. }
+        )));
     }
 }
