@@ -20,8 +20,10 @@ struct ToolState {
     name: Option<String>,
     arguments: String,
     emitted: usize,
-    opaque: Map<String, Value>,
-    function: Map<String, Value>,
+    started: bool,
+    metadata: BTreeMap<String, Value>,
+    function_metadata: BTreeMap<String, Value>,
+    extensions: Vec<Extension>,
 }
 
 pub struct Parser {
@@ -228,8 +230,22 @@ impl Parser {
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     state.arguments.push_str(arguments);
                 }
+                if let Some(metadata) = function.get("metadata").and_then(Value::as_object) {
+                    state.function_metadata.extend(metadata.clone());
+                }
             }
-            if state.id.is_some() && state.name.is_some() && state.emitted == 0 {
+            if let Some(metadata) = call_object.get("metadata").and_then(Value::as_object) {
+                state.metadata.extend(metadata.clone());
+            }
+            let added_extensions = collect_tool_extensions(state, call_object);
+            if state.started && !added_extensions.is_empty() {
+                out.push(CanonicalResponseEvent::ItemMetadataUpdated {
+                    item_id: format!("tool:{index}"),
+                    metadata: added_extensions,
+                });
+            }
+            if state.id.is_some() && state.name.is_some() && !state.started {
+                state.started = true;
                 out.push(CanonicalResponseEvent::ToolCallStarted {
                     item_id: format!("tool:{index}"),
                     provider_id: None,
@@ -238,9 +254,9 @@ impl Parser {
                         name: state.name.clone().unwrap_or_default(),
                         arguments: String::new(),
                         status: Some("in_progress".into()),
-                        metadata: state.opaque.clone().into_iter().collect(),
-                        function_metadata: state.function.clone().into_iter().collect(),
-                        extensions: Vec::new(),
+                        metadata: state.metadata.clone(),
+                        function_metadata: state.function_metadata.clone(),
+                        extensions: state.extensions.clone(),
                     },
                 });
             }
@@ -254,6 +270,48 @@ impl Parser {
             }
         }
     }
+}
+
+fn collect_tool_extensions(state: &mut ToolState, call: &Map<String, Value>) -> Vec<Extension> {
+    let mut candidates = scoped_extensions(
+        call,
+        &["index", "id", "type", "function", "metadata"],
+        ExtensionScope::ToolCall,
+    );
+    if let Some(function) = call.get("function").and_then(Value::as_object) {
+        candidates.extend(scoped_extensions(
+            function,
+            &["name", "arguments", "metadata"],
+            ExtensionScope::ToolFunction,
+        ));
+    }
+    let mut added = Vec::new();
+    for extension in candidates {
+        if state.extensions.iter().any(|existing| {
+            existing.scope == extension.scope
+                && existing.key == extension.key
+                && existing.value == extension.value
+        }) {
+            continue;
+        }
+        state.extensions.push(extension.clone());
+        added.push(extension);
+    }
+    added
+}
+
+fn scoped_extensions(
+    object: &Map<String, Value>,
+    structural: &[&str],
+    scope: ExtensionScope,
+) -> Vec<Extension> {
+    object
+        .iter()
+        .filter(|(key, _)| !structural.contains(&key.as_str()))
+        .map(|(key, value)| {
+            Extension::scoped_opaque("openai.chat_completions", key, value.clone(), scope)
+        })
+        .collect()
 }
 
 fn map_stop(reason: &str, saw_tool: bool) -> StopReason {

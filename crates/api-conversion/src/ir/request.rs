@@ -117,6 +117,5 @@ impl RequestIr {
                 .clone_from(&response.response_id);
         }
         self.extensions.extend(response.extensions.clone());
-        self.opaque.extend(response.opaque.clone());
     }
 }

@@ -37,6 +37,5 @@ pub struct ResponseIr {
     pub original_stop_reason: Option<String>,
     pub state: ConversationState,
     pub extensions: Vec<Extension>,
-    pub opaque: Vec<Extension>,
     pub error: Option<Value>,
 }

@@ -163,7 +163,7 @@ fn replay_content_item_extensions(block: &mut Value, item: &ContentItem) {
 }
 
 fn replay_response_extensions(output: &mut Map<String, Value>, response: &ResponseIr) {
-    for extension in response.extensions.iter().chain(response.opaque.iter()) {
+    for extension in &response.extensions {
         if extension.key != "output_tokens_details"
             && extension.is_replayable_in(ExtensionScope::Response)
         {

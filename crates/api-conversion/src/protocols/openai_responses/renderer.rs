@@ -39,7 +39,7 @@ pub fn render(response: &ResponseIr) -> Value {
         ),
     );
     object.insert("usage".into(), render_usage(&response.usage));
-    for extension in response.extensions.iter().chain(response.opaque.iter()) {
+    for extension in &response.extensions {
         if extension.is_replayable_in(ExtensionScope::Response) {
             object
                 .entry(extension.key.clone())
