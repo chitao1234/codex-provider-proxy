@@ -26,7 +26,15 @@ pub trait RequestAdapter {
     }
 
     fn parse_v2(&self, body: &Value) -> Result<crate::ir::RequestIr, ConversionError> {
-        self.parse(body).map(|request| request.to_v2())
+        match self.protocol() {
+            Protocol::OpenAiResponses => crate::protocols::openai_responses::parser::parse(body),
+            Protocol::OpenAiChatCompletions => {
+                crate::protocols::openai_chat_completions::parser::parse(body)
+            }
+            Protocol::AnthropicMessages => {
+                crate::protocols::anthropic_messages::parser::parse(body)
+            }
+        }
     }
 
     fn parse_with_context(
@@ -48,8 +56,31 @@ pub trait RequestAdapter {
         previous: Option<&RequestIr>,
         last_reasoning: Option<&str>,
     ) -> Result<crate::ir::RequestIr, ConversionError> {
-        self.parse_with_context(body, previous, last_reasoning)
-            .map(|request| request.to_v2())
+        let mut request = self.parse_v2(body)?;
+        if self.protocol() == Protocol::OpenAiResponses {
+            if let Some(previous) = previous {
+                let previous = previous.to_v2();
+                request.transcript.splice(0..0, previous.transcript);
+                inherit_state(&mut request.state, &previous.state);
+            }
+            if let Some(reasoning) = last_reasoning.filter(|value| !value.trim().is_empty()) {
+                let has_reasoning = request
+                    .transcript
+                    .iter()
+                    .any(|item| matches!(item, crate::ir::ContentItem::Reasoning { .. }));
+                if !has_reasoning {
+                    request.transcript.push(crate::ir::ContentItem::Reasoning {
+                        id: None,
+                        content: vec![crate::ir::ContentPart::Reasoning {
+                            text: reasoning.to_owned(),
+                            signature: None,
+                        }],
+                        extensions: Vec::new(),
+                    });
+                }
+            }
+        }
+        Ok(request)
     }
 
     fn render(
@@ -81,6 +112,41 @@ pub trait RequestAdapter {
         };
         Ok(RenderedRequest { body, report })
     }
+}
+
+fn inherit_state(
+    current: &mut crate::ir::ConversationState,
+    previous: &crate::ir::ConversationState,
+) {
+    if current.conversation.is_none() {
+        current.conversation.clone_from(&previous.conversation);
+    }
+    if current.logical_conversation_id.is_none() {
+        current
+            .logical_conversation_id
+            .clone_from(&previous.logical_conversation_id);
+    }
+    if current.identity.user_id.is_none() {
+        current
+            .identity
+            .user_id
+            .clone_from(&previous.identity.user_id);
+    }
+    if current.identity.session_id.is_none() {
+        current
+            .identity
+            .session_id
+            .clone_from(&previous.identity.session_id);
+    }
+    if current.cache.key.is_none() {
+        current.cache.key.clone_from(&previous.cache.key);
+    }
+    current.extensions = previous
+        .extensions
+        .iter()
+        .chain(&current.extensions)
+        .cloned()
+        .collect();
 }
 
 #[derive(Debug, Clone, Copy, Default)]
