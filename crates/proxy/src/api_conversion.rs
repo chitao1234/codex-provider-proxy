@@ -1230,7 +1230,7 @@ ark_style = true
     }
 
     #[test]
-    fn strips_previous_response_id_when_responses_translation_is_enabled() {
+    fn preserves_previous_response_id_for_responses_translation() {
         let config = Config::from_toml_str(
             r#"
 default_provider = "responses"
@@ -1258,7 +1258,7 @@ accept_downstream_apis = ["openai_responses"]
         )
         .unwrap();
         let converted: Value = serde_json::from_slice(&converted).unwrap();
-        assert!(converted.get("previous_response_id").is_none());
+        assert_eq!(converted["previous_response_id"], "resp-local");
     }
 
     #[test]

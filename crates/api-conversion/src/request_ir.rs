@@ -740,8 +740,8 @@ impl RequestIr {
         if let Some(stream) = self.stream {
             out.insert("stream".to_owned(), Value::Bool(stream));
         }
-        // Structural fields, including `previous_response_id`, are represented separately and
-        // therefore never leak from the source protocol into a translated request.
+        // Structural fields are represented separately and only re-emitted by target-specific
+        // context rendering when the target protocol supports them.
         out
     }
 
@@ -1587,6 +1587,10 @@ impl RequestIr {
             if let Some(conversation) = &self.context.conversation {
                 out.entry("conversation".to_owned())
                     .or_insert_with(|| conversation.clone());
+            }
+            if let Some(previous_response_id) = &self.context.previous_response_id {
+                out.entry("previous_response_id".to_owned())
+                    .or_insert_with(|| Value::String(previous_response_id.clone()));
             }
         }
         if target != Protocol::AnthropicMessages {
@@ -3286,6 +3290,7 @@ mod tests {
         assert_eq!(responses["metadata"]["trace"], "root");
         assert_eq!(responses["conversation"]["id"], "conv-1");
         assert_eq!(responses["safety_identifier"], "safe-1");
+        assert_eq!(responses["previous_response_id"], "resp-1");
     }
 
     #[test]
