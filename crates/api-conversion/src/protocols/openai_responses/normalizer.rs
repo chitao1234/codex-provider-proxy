@@ -1,6 +1,24 @@
 use serde_json::{json, Map, Value};
 
-pub fn apply_ark(request: &mut Map<String, Value>) {
+use crate::{dialect::ModelCapabilities, ir::RequestIr};
+
+pub fn normalize_ark(
+    semantic: &RequestIr,
+    capabilities: &ModelCapabilities,
+    mut rendered: Value,
+) -> Value {
+    if !capabilities.ark_style {
+        return rendered;
+    }
+    let Some(request) = rendered.as_object_mut() else {
+        return rendered;
+    };
+    normalize_ark_wire(request);
+    apply_explicit_cache(semantic, capabilities, request);
+    rendered
+}
+
+fn normalize_ark_wire(request: &mut Map<String, Value>) {
     let effort = request
         .get("reasoning")
         .and_then(Value::as_object)
@@ -36,6 +54,42 @@ pub fn apply_ark(request: &mut Map<String, Value>) {
         }
     }
     normalize_web_search_tools(request);
+}
+
+fn apply_explicit_cache(
+    semantic: &RequestIr,
+    capabilities: &ModelCapabilities,
+    request: &mut Map<String, Value>,
+) {
+    if !capabilities.cache.ark_explicit_cache {
+        return;
+    }
+    if request
+        .get("tools")
+        .is_some_and(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()))
+    {
+        return;
+    }
+    if request
+        .get("instructions")
+        .and_then(Value::as_str)
+        .is_some_and(|instructions| !instructions.trim().is_empty())
+    {
+        return;
+    }
+    if semantic.state.source_response_id.is_some() {
+        request.insert("caching".to_owned(), json!({"type": "enabled"}));
+        return;
+    }
+    if request.get("stream").and_then(Value::as_bool) == Some(true) {
+        request.insert("caching".to_owned(), json!({"type": "enabled"}));
+    } else {
+        request.insert(
+            "caching".to_owned(),
+            json!({"type": "enabled", "prefix": true}),
+        );
+        request.insert("store".to_owned(), Value::Bool(true));
+    }
 }
 
 fn ark_thinking_type(effort: &str) -> &'static str {

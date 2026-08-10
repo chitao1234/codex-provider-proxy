@@ -259,12 +259,15 @@ pub fn convert_request_body(
                 .map_err(|err| {
                     RequestConversionRejected::from_conversion_error(err, plan.downstream)
                 })?;
-            let mut rendered = rendered_request.body;
+            let rendered = rendered_request.body;
             let report = rendered_request.report;
-            normalize_rendered_request(pipeline.normalizer, pipeline.target, &caps, &mut rendered);
-            if pipeline.target == Protocol::OpenAiResponses {
-                inject_ark_explicit_cache(&caps, &json, &mut rendered);
-            }
+            let rendered = normalize_rendered_request(
+                pipeline.normalizer,
+                pipeline.target,
+                &request,
+                &caps,
+                rendered,
+            );
             (rendered, report)
         }
     };
@@ -289,85 +292,22 @@ pub fn convert_request_body(
         .map_err(|_| RequestConversionRejected::invalid("failed to serialize converted request"))
 }
 
-/// Inject Ark's explicit caching controls into a rendered Responses request when the
-/// provider enabled `ark_explicit_cache` (Volcengine docs: caching + previous_response_id
-/// + store; PDF p1087/p1093/p1108).
-///
-/// Conservative constraints (documented):
-/// - `tools` may only be set on the first round, so requests carrying tools skip caching;
-/// - `instructions` must be empty to write or hit the cache;
-/// - prefix caching creation requires `stream=false` (session caching has no such limit),
-///   so streaming first rounds fall back to session caching.
-fn inject_ark_explicit_cache(caps: &ModelCapabilities, original: &Value, request: &mut Value) {
-    if !caps.cache.ark_explicit_cache || !caps.ark_style {
-        return;
-    }
-    let Some(object) = request.as_object_mut() else {
-        return;
-    };
-    if object
-        .get("tools")
-        .is_some_and(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()))
-    {
-        return;
-    }
-    if object
-        .get("instructions")
-        .and_then(Value::as_str)
-        .is_some_and(|instructions| !instructions.trim().is_empty())
-    {
-        return;
-    }
-    let has_previous = original
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty());
-    if has_previous {
-        // Continue the session cache chain; Ark's response ids pass through the
-        // synthesized id unchanged (resp_ prefix preserved), so the downstream
-        // previous_response_id is the upstream id.
-        object.insert(
-            "previous_response_id".to_owned(),
-            original
-                .get("previous_response_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
-        object.insert("caching".to_owned(), serde_json::json!({"type": "enabled"}));
-        return;
-    }
-    let streaming = object
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if streaming {
-        // Prefix-cache creation requires stream=false; use session caching instead.
-        object.insert("caching".to_owned(), serde_json::json!({"type": "enabled"}));
-    } else {
-        object.insert(
-            "caching".to_owned(),
-            serde_json::json!({"type": "enabled", "prefix": true}),
-        );
-        object.insert("store".to_owned(), serde_json::json!(true));
-    }
-}
-
 fn normalize_rendered_request(
     normalizer: Option<RequestNormalizerKind>,
     target: Protocol,
+    semantic: &codex_provider_proxy_api_conversion::ir::RequestIr,
     caps: &ModelCapabilities,
-    request: &mut Value,
-) {
+    request: Value,
+) -> Value {
     if normalizer == Some(RequestNormalizerKind::ArkResponses)
         && caps.ark_style
         && target == Protocol::OpenAiResponses
     {
-        if let Some(object) = request.as_object_mut() {
-            codex_provider_proxy_api_conversion::protocols::openai_responses::normalizer::apply_ark(
-                object,
-            );
-        }
+        return codex_provider_proxy_api_conversion::protocols::openai_responses::normalizer::normalize_ark(
+            semantic, caps, request,
+        );
     }
+    request
 }
 
 /// A request that cannot be converted; carries the Anthropic-style error envelope to return
