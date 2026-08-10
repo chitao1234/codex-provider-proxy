@@ -16,6 +16,7 @@ use axum::{
     Router,
 };
 use bytes::{Bytes, BytesMut};
+use codex_provider_proxy_api_conversion::request_adapter::RequestAdapter;
 use futures_util::{Stream, TryStreamExt};
 use pin_project_lite::pin_project;
 use serde_json::Value;
@@ -1524,6 +1525,29 @@ fn maybe_convert_request_body(
     } else {
         None
     };
+    let semantic_request = if is_responses {
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "responses request body is not valid JSON",
+            )
+        })?;
+        Some(
+            codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+            )
+            .parse_v2_with_context(
+                &value,
+                previous_state
+                    .as_ref()
+                    .and_then(|previous| previous.semantic_request.as_ref()),
+                last_reasoning,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        )
+    } else {
+        None
+    };
     let converted = crate::api_conversion::convert_request_body(
         cfg,
         &attempt.provider_name,
@@ -1538,12 +1562,15 @@ fn maybe_convert_request_body(
         // synthesized response can be continued with previous_response_id.
         if let Some(request_ir) = request_ir {
             let model = request_ir.model().unwrap_or_default().to_owned();
-            attempt.response_recorder = Some(crate::api_conversion::ResponseRecorder::new(
-                state.runtime.response_states(),
-                attempt.provider_name.clone(),
-                model,
-                request_ir,
-            ));
+            attempt.response_recorder = Some(
+                crate::api_conversion::ResponseRecorder::new(
+                    state.runtime.response_states(),
+                    attempt.provider_name.clone(),
+                    model,
+                    request_ir,
+                )
+                .with_semantic_request(semantic_request.expect("responses semantic request")),
+            );
         }
     }
     attempt.headers.remove(header::CONTENT_LENGTH);

@@ -20,6 +20,12 @@ pub fn apply_complete_response(
     }
 }
 
+pub fn accumulate_complete_response(response: &crate::response_ir::ResponseIr) -> ResponseSnapshot {
+    let mut accumulator = ResponseAccumulator::default();
+    apply_complete_response(&mut accumulator, response);
+    accumulator.snapshot()
+}
+
 pub fn apply_stream_event(
     accumulator: &mut ResponseAccumulator,
     event: &StreamEvent,

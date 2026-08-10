@@ -432,6 +432,7 @@ pub struct ResponseRecorder {
     model: String,
     /// The protocol-neutral request transcript for this response chain.
     request_ir: RequestIr,
+    semantic_request: Option<codex_provider_proxy_api_conversion::ir::RequestIr>,
 }
 
 impl ResponseRecorder {
@@ -446,14 +447,23 @@ impl ResponseRecorder {
             provider_name: provider_name.into(),
             model: model.into(),
             request_ir,
+            semantic_request: None,
         }
+    }
+
+    pub fn with_semantic_request(
+        mut self,
+        request: codex_provider_proxy_api_conversion::ir::RequestIr,
+    ) -> Self {
+        self.semantic_request = Some(request);
+        self
     }
 
     pub fn record_ir(&self, response_id: &str, response: &ResponseIr) {
         let mut request_ir = self.request_ir.clone();
         response.append_to_request(&mut request_ir);
         let now = crate::response_state::now_unix();
-        self.store.put(crate::response_state::ResponseState::new(
+        let mut state = crate::response_state::ResponseState::new(
             response_id.to_string(),
             self.provider_name.clone(),
             self.model.clone(),
@@ -461,7 +471,17 @@ impl ResponseRecorder {
             response.last_reasoning().map(str::to_owned),
             now,
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
-        ));
+        );
+        if let Some(request) = &self.semantic_request {
+            let snapshot =
+                codex_provider_proxy_api_conversion::response_adapter::accumulate_complete_response(
+                    response,
+                );
+            let mut request = request.clone();
+            request.append_response(&snapshot.response);
+            state.semantic_request = Some(request);
+        }
+        self.store.put(state);
     }
 
     pub fn record_stream(&self, response_id: &str, response: &StreamingResponseIr) {
