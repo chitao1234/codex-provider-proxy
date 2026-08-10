@@ -91,6 +91,24 @@ impl RequestIr {
         self.model.as_deref()
     }
 
+    pub(crate) fn last_user_text(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|item| {
+            let ContentItem::Message { role, content, .. } = item else {
+                return None;
+            };
+            (role == "user").then(|| {
+                content
+                    .iter()
+                    .filter_map(|part| match part {
+                        super::ContentPart::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+    }
+
     pub fn append_response(&mut self, response: &super::response::ResponseIr) {
         self.transcript.extend(response.output.clone());
         if self.state.source_response_id.is_none() {

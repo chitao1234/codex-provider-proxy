@@ -4,6 +4,7 @@ use crate::{
     dialect::{ModelCapabilities, RequestConversionReport, ThinkingParam},
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr},
+    provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
 pub fn render(
@@ -80,16 +81,21 @@ pub fn render(
         );
     }
     output.insert("messages".to_owned(), Value::Array(messages));
-    if !request.tools.is_empty() {
-        output.insert(
-            "tools".to_owned(),
-            Value::Array(request.tools.iter().map(render_tool).collect()),
-        );
+    let (tools, report) = provider_tools::render(
+        &request.tools,
+        ToolTarget::AnthropicMessages,
+        capabilities,
+        render_tool,
+        render_mapped_tool,
+        request.last_user_text().as_deref(),
+    );
+    if !tools.is_empty() {
+        output.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(choice) = &request.tool_choice {
         output.insert("tool_choice".to_owned(), render_tool_choice(choice));
     }
-    Ok((Value::Object(output), RequestConversionReport::default()))
+    Ok((Value::Object(output), report))
 }
 
 fn opaque_root(request: &RequestIr) -> Map<String, Value> {
@@ -242,6 +248,14 @@ fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
         value["description"] = Value::String(description.clone());
     }
     value
+}
+
+fn render_mapped_tool(_tool: &crate::ir::ToolDefinition, mapped: &MappedFunctionTool) -> Value {
+    serde_json::json!({
+        "name": mapped.name,
+        "description": mapped.description,
+        "input_schema": mapped.parameters,
+    })
 }
 
 fn render_tool_choice(choice: &Value) -> Value {

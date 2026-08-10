@@ -14,6 +14,7 @@ pub mod dialect;
 pub mod error;
 pub mod ir;
 pub mod protocols;
+pub(crate) mod provider_tools;
 pub mod request_adapter;
 pub mod request_ir;
 pub(crate) mod server_tools;

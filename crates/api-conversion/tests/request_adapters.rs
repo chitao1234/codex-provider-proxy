@@ -2,7 +2,8 @@ use std::fs;
 
 use codex_provider_proxy_api_conversion::{
     dialect::{
-        MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap, ThinkingParam,
+        MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
+        ServerToolPolicy, ThinkingParam,
     },
     request_adapter::{RequestAdapter, RequestAdapterKind},
     request_ir::Protocol,
@@ -399,4 +400,93 @@ fn responses_v2_renderer_preserves_reasoning_extensions_and_role_policy() {
     assert_eq!(rendered["temperature"], 0.2);
     assert_eq!(rendered["top_p"], 0.9);
     assert_eq!(rendered["stop"], "END");
+}
+
+#[test]
+fn v2_server_tool_policies_are_applied_before_protocol_rendering() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::AnthropicMessages);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "rust releases"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"type": "web_fetch_20250910", "name": "web_fetch"},
+                {"type": "code_execution_20250825", "name": "code_execution"},
+                {"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+
+    let dropped = adapter
+        .render_v2(
+            &request,
+            Protocol::OpenAiChatCompletions,
+            &ModelCapabilities::default(),
+        )
+        .unwrap();
+    assert_eq!(dropped.body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(dropped.report.dropped_server_tools.len(), 3);
+
+    let mapped_capabilities = ModelCapabilities {
+        server_tools: ServerToolPolicy::MapToFunction,
+        ..ModelCapabilities::default()
+    };
+    let mapped = adapter
+        .render_v2(
+            &request,
+            Protocol::OpenAiChatCompletions,
+            &mapped_capabilities,
+        )
+        .unwrap();
+    let mapped_tools = mapped.body["tools"].as_array().unwrap();
+    assert_eq!(mapped_tools.len(), 3);
+    assert_eq!(mapped_tools[0]["function"]["name"], "web_search");
+    assert_eq!(mapped_tools[1]["function"]["name"], "web_fetch");
+    assert_eq!(
+        mapped.report.mapped_server_tools,
+        ["web_search", "web_fetch"]
+    );
+    assert_eq!(mapped.report.dropped_server_tools, ["code_execution"]);
+
+    let passthrough_capabilities = ModelCapabilities {
+        server_tools: ServerToolPolicy::Passthrough,
+        ..ModelCapabilities::default()
+    };
+    let passthrough = adapter
+        .render_v2(
+            &request,
+            Protocol::OpenAiResponses,
+            &passthrough_capabilities,
+        )
+        .unwrap();
+    assert_eq!(passthrough.body["tools"][0]["type"], "web_search_20250305");
+    assert_eq!(passthrough.body["tools"][1]["type"], "web_fetch_20250910");
+
+    let native_capabilities = ModelCapabilities {
+        server_tools: ServerToolPolicy::ProviderNative,
+        search_tool_template: Some(serde_json::json!({
+            "type": "web_search",
+            "query": "{search_query}"
+        })),
+        fetch_request_params: Some(serde_json::json!({"enable_fetch": true})),
+        code_interpreter_request_params: Some(serde_json::json!({
+            "enable_code_interpreter": true
+        })),
+        always_enable_tools: vec!["WebFetch".to_owned()],
+        ..ModelCapabilities::default()
+    };
+    let native = adapter
+        .render_v2(&request, Protocol::OpenAiResponses, &native_capabilities)
+        .unwrap();
+    assert_eq!(native.body["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(native.body["tools"][0]["type"], "web_search");
+    assert_eq!(native.body["tools"][0]["query"], "rust releases");
+    assert_eq!(native.body["enable_fetch"], true);
+    assert_eq!(native.body["enable_code_interpreter"], true);
+    assert_eq!(native.body["stream"], true);
+    assert_eq!(
+        native.report.mapped_server_tools,
+        ["web_search", "web_fetch", "code_execution"]
+    );
 }

@@ -4,6 +4,7 @@ use crate::{
     dialect::{ModelCapabilities, RequestConversionReport},
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr, ToolCall},
+    provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
 pub fn render(
@@ -44,22 +45,27 @@ pub fn render(
                 .collect(),
         ),
     );
-    if !request.tools.is_empty() {
-        output.insert(
-            "tools".to_owned(),
-            Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| render_tool(tool, capabilities))
-                    .collect::<Vec<_>>(),
-            ),
-        );
+    let last_user_text = request.last_user_text();
+    let (tools, mut report) = provider_tools::render(
+        &request.tools,
+        ToolTarget::OpenAiResponses,
+        capabilities,
+        render_tool,
+        render_mapped_tool,
+        last_user_text.as_deref(),
+    );
+    if !tools.is_empty() {
+        output.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(tool_choice) = &request.tool_choice {
         output.insert("tool_choice".to_owned(), tool_choice.clone());
     }
-    let report = RequestConversionReport::default();
+    provider_tools::merge_native_params(
+        &mut output,
+        capabilities,
+        &mut report,
+        last_user_text.as_deref(),
+    );
     Ok((Value::Object(output), report))
 }
 
@@ -318,14 +324,7 @@ fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
     object
 }
 
-fn render_tool(tool: &crate::ir::ToolDefinition, capabilities: &ModelCapabilities) -> Value {
-    if capabilities.server_tools == crate::dialect::ServerToolPolicy::ProviderNative
-        && tool.kind.starts_with("web_search")
-    {
-        if let Some(template) = &capabilities.search_tool_template {
-            return template.clone();
-        }
-    }
+fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
     let mut object = serde_json::json!({
         "type": tool.kind,
         "name": tool.name,
@@ -342,6 +341,15 @@ fn render_tool(tool: &crate::ir::ToolDefinition, capabilities: &ModelCapabilitie
         }
     }
     object
+}
+
+fn render_mapped_tool(_tool: &crate::ir::ToolDefinition, mapped: &MappedFunctionTool) -> Value {
+    serde_json::json!({
+        "type": "function",
+        "name": mapped.name,
+        "description": mapped.description,
+        "parameters": mapped.parameters,
+    })
 }
 
 fn item_has_image(item: &ContentItem) -> bool {

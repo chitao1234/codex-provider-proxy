@@ -7,6 +7,7 @@ use crate::{
     },
     error::ConversionError,
     ir::{ContentItem, ContentPart, GenerationControls, RequestIr, ToolCall},
+    provider_tools::{self, MappedFunctionTool, ToolTarget},
 };
 
 pub fn render(
@@ -136,16 +137,28 @@ pub fn render(
         );
     }
     output.insert("messages".to_owned(), Value::Array(messages));
-    if !request.tools.is_empty() {
-        output.insert(
-            "tools".to_owned(),
-            Value::Array(request.tools.iter().map(render_tool).collect()),
-        );
+    let last_user_text = request.last_user_text();
+    let (tools, mut report) = provider_tools::render(
+        &request.tools,
+        ToolTarget::OpenAiChatCompletions,
+        capabilities,
+        render_tool,
+        render_mapped_tool,
+        last_user_text.as_deref(),
+    );
+    if !tools.is_empty() {
+        output.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(choice) = &request.tool_choice {
         output.insert("tool_choice".to_owned(), choice.clone());
     }
-    Ok((Value::Object(output), RequestConversionReport::default()))
+    provider_tools::merge_native_params(
+        &mut output,
+        capabilities,
+        &mut report,
+        last_user_text.as_deref(),
+    );
+    Ok((Value::Object(output), report))
 }
 
 fn render_generation(
@@ -330,6 +343,17 @@ fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
 
 fn render_tool(tool: &crate::ir::ToolDefinition) -> Value {
     serde_json::json!({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema.clone().unwrap_or_else(|| serde_json::json!({}))}})
+}
+
+fn render_mapped_tool(_tool: &crate::ir::ToolDefinition, mapped: &MappedFunctionTool) -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": mapped.name,
+            "description": mapped.description,
+            "parameters": mapped.parameters,
+        }
+    })
 }
 
 fn text_part(part: &ContentPart) -> Option<String> {
