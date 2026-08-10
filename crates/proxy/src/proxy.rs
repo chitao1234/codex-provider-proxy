@@ -531,10 +531,10 @@ async fn handle_proxy_inner(
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                     crate::api_conversion::DownstreamApi::AnthropicMessages,
-                ) => Box::pin(crate::streams::ParserRendererStream::new(
+                ) => Box::pin(crate::streams::CanonicalParserRendererStream::new(
                     resp_stream,
-                    codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
-                    codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer::new(),
+                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
+                    codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer::new(),
                 )) as BoxRespStream,
                 (
                     codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiChatCompletions,

@@ -2,9 +2,303 @@ use bytes::Bytes;
 use serde_json::json;
 
 use crate::{
-    ir::{CanonicalResponseEvent, ContentPart, ItemKind, StopReason},
+    error::ConversionError,
+    ir::{
+        CanonicalResponseEvent, ContentPart, Extension, ExtensionScope, ItemKind, ReplayPolicy,
+        StopReason, ToolCall, Usage,
+    },
     sse,
 };
+
+#[derive(Default)]
+pub struct Parser {
+    finished: bool,
+    started: bool,
+    item_kinds: std::collections::BTreeMap<String, ItemKind>,
+}
+
+impl Parser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn on_event(
+        &mut self,
+        event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError> {
+        if self.finished {
+            return Ok(());
+        }
+        let data: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|_| ConversionError::invalid("upstream SSE data is not valid JSON"))?;
+        match event_type {
+            "response.created" | "response.in_progress" => {
+                if !self.started {
+                    self.started = true;
+                    let response = data.get("response");
+                    out.push(CanonicalResponseEvent::StreamStarted {
+                        response_id: response
+                            .and_then(|response| response.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        model: response
+                            .and_then(|response| response.get("model"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+            }
+            "response.output_item.added" => self.item_added(&data, out),
+            "response.output_text.delta" => self.content_delta(&data, "delta", false, out),
+            "response.refusal.delta" => self.content_delta(&data, "delta", true, out),
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                if let Some(text) = data.get("delta").and_then(serde_json::Value::as_str) {
+                    let item_id = item_id(&data).unwrap_or_else(|| "reasoning".to_owned());
+                    self.ensure_item(&item_id, ItemKind::Reasoning, out);
+                    out.push(CanonicalResponseEvent::ContentDelta {
+                        item_id,
+                        content: ContentPart::Reasoning {
+                            text: text.to_owned(),
+                            signature: None,
+                        },
+                    });
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let (Some(item_id), Some(arguments)) = (
+                    item_id(&data),
+                    data.get("delta").and_then(serde_json::Value::as_str),
+                ) {
+                    out.push(CanonicalResponseEvent::ToolArgumentsDelta {
+                        item_id,
+                        arguments: arguments.to_owned(),
+                    });
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = data.get("item") {
+                    self.item_done(item, out);
+                }
+                if let Some(item_id) = item_id(&data).or_else(|| {
+                    data.get("item")
+                        .and_then(|item| item.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }) {
+                    out.push(CanonicalResponseEvent::ItemCompleted { item_id });
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                self.finished = true;
+                let response = data.get("response");
+                if let Some(usage) = response.and_then(|response| response.get("usage")) {
+                    out.push(CanonicalResponseEvent::UsageUpdated(parse_usage(usage)));
+                }
+                let status = response
+                    .and_then(|response| response.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(if event_type == "response.incomplete" {
+                        "incomplete"
+                    } else {
+                        "completed"
+                    });
+                let original = response
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(status)
+                    .to_owned();
+                out.push(CanonicalResponseEvent::ResponseCompleted {
+                    stop_reason: if status == "incomplete" {
+                        StopReason::MaxTokens
+                    } else {
+                        StopReason::Natural
+                    },
+                    original_reason: Some(original),
+                });
+            }
+            "error" => {
+                self.finished = true;
+                let error = data.get("error");
+                out.push(CanonicalResponseEvent::StreamError {
+                    message: error
+                        .and_then(|error| error.get("message"))
+                        .or_else(|| data.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("upstream request failed")
+                        .to_owned(),
+                    code: error
+                        .and_then(|error| error.get("code"))
+                        .or_else(|| data.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.done"
+            | "response.refusal.done"
+            | "response.reasoning_text.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_text.done"
+            | "response.function_call_arguments.done" => {}
+            _ => out.push(protocol_extension(event_type, data)),
+        }
+        Ok(())
+    }
+
+    pub fn finish(&mut self, _out: &mut Vec<CanonicalResponseEvent>) {
+        self.finished = true;
+    }
+
+    fn item_added(&mut self, data: &serde_json::Value, out: &mut Vec<CanonicalResponseEvent>) {
+        let Some(item) = data.get("item") else { return };
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| item_id(data))
+            .unwrap_or_else(|| format!("item:{}", self.item_kinds.len()));
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("reasoning") => self.ensure_item(&id, ItemKind::Reasoning, out),
+            Some("message") => self.ensure_item(&id, ItemKind::Message, out),
+            Some("function_call" | "custom_tool_call") => {
+                self.item_kinds.insert(id.clone(), ItemKind::ToolCall);
+                out.push(CanonicalResponseEvent::ToolCallStarted {
+                    item_id: id,
+                    call: ToolCall {
+                        id: item
+                            .get("call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        name: item
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        arguments: String::new(),
+                        status: item
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        metadata: Default::default(),
+                        function_metadata: Default::default(),
+                        extensions: Vec::new(),
+                    },
+                });
+            }
+            Some(kind) => {
+                self.item_kinds.insert(id.clone(), ItemKind::Unknown);
+                out.push(CanonicalResponseEvent::ItemStarted {
+                    item_id: id,
+                    item: ItemKind::Unknown,
+                });
+                out.push(protocol_extension(kind, item.clone()));
+            }
+            None => {}
+        }
+    }
+
+    fn item_done(&mut self, item: &serde_json::Value, out: &mut Vec<CanonicalResponseEvent>) {
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+            if let Some(arguments) = item
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .filter(|arguments| !arguments.is_empty())
+            {
+                out.push(CanonicalResponseEvent::ToolArgumentsDelta {
+                    item_id: id.to_owned(),
+                    arguments: arguments.to_owned(),
+                });
+            }
+        }
+    }
+
+    fn content_delta(
+        &mut self,
+        data: &serde_json::Value,
+        field: &str,
+        refusal: bool,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) {
+        if let Some(text) = data.get(field).and_then(serde_json::Value::as_str) {
+            let item_id = item_id(data).unwrap_or_else(|| {
+                if refusal {
+                    "refusal".to_owned()
+                } else {
+                    "message".to_owned()
+                }
+            });
+            self.ensure_item(
+                &item_id,
+                if refusal {
+                    ItemKind::Refusal
+                } else {
+                    ItemKind::Message
+                },
+                out,
+            );
+            out.push(CanonicalResponseEvent::ContentDelta {
+                item_id,
+                content: if refusal {
+                    ContentPart::Refusal(text.to_owned())
+                } else {
+                    ContentPart::Text(text.to_owned())
+                },
+            });
+        }
+    }
+
+    fn ensure_item(
+        &mut self,
+        item_id: &str,
+        kind: ItemKind,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) {
+        if self.item_kinds.insert(item_id.to_owned(), kind).is_none() {
+            out.push(CanonicalResponseEvent::ItemStarted {
+                item_id: item_id.to_owned(),
+                item: kind,
+            });
+        }
+    }
+}
+
+fn item_id(data: &serde_json::Value) -> Option<String> {
+    data.get("item_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn parse_usage(value: &serde_json::Value) -> Usage {
+    let field = |name| value.get(name).and_then(serde_json::Value::as_u64);
+    Usage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        total_tokens: field("total_tokens"),
+        cached_input_tokens: value
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64),
+    }
+}
+
+fn protocol_extension(kind: &str, value: serde_json::Value) -> CanonicalResponseEvent {
+    CanonicalResponseEvent::ProtocolExtension(Extension {
+        namespace: "openai.responses".to_owned(),
+        key: kind.to_owned(),
+        value,
+        scope: ExtensionScope::Response,
+        source_protocol: Some("openai_responses".to_owned()),
+        provider: None,
+        replay: ReplayPolicy::NeverReplay,
+    })
+}
 
 #[derive(Default)]
 pub struct Renderer {

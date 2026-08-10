@@ -76,6 +76,23 @@ impl CanonicalParser
     }
 }
 
+impl CanonicalParser
+    for codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser
+{
+    fn on_event(
+        &mut self,
+        event_type: &str,
+        payload: &str,
+        out: &mut Vec<CanonicalResponseEvent>,
+    ) -> Result<(), ConversionError> {
+        self.on_event(event_type, payload, out)
+    }
+
+    fn finish(&mut self, out: &mut Vec<CanonicalResponseEvent>) {
+        self.finish(out);
+    }
+}
+
 impl CanonicalRenderer
     for codex_provider_proxy_api_conversion::protocols::anthropic_messages::stream::Renderer
 {
@@ -149,6 +166,7 @@ pub trait Parser {
 }
 
 /// A downstream SSE renderer consuming semantic events.
+#[cfg(test)]
 pub trait Renderer {
     fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>);
     fn finish(&mut self, out: &mut Vec<Bytes>);
@@ -355,6 +373,7 @@ impl Parser for codex_provider_proxy_api_conversion::responses_parser::Responses
     }
 }
 
+#[cfg(test)]
 impl Renderer for codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer {
     fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>) {
         self.on_event(event, out);
@@ -365,6 +384,7 @@ impl Renderer for codex_provider_proxy_api_conversion::messages_renderer::Messag
     }
 }
 
+#[cfg(test)]
 impl Renderer for codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer {
     fn on_event(&mut self, event: &StreamEvent, out: &mut Vec<Bytes>) {
         self.on_event(event, out);
@@ -375,6 +395,7 @@ impl Renderer for codex_provider_proxy_api_conversion::responses_renderer::Respo
     }
 }
 
+#[cfg(test)]
 pin_project! {
     pub struct ParserRendererStream<S, P, R> {
         #[pin]
@@ -390,6 +411,7 @@ pin_project! {
     }
 }
 
+#[cfg(test)]
 impl<S, P, R> ParserRendererStream<S, P, R> {
     pub fn new(inner: S, parser: P, renderer: R) -> Self {
         Self {
@@ -406,6 +428,7 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
     }
 }
 
+#[cfg(test)]
 impl<S, P, R> Stream for ParserRendererStream<S, P, R>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>>,
