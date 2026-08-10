@@ -86,7 +86,7 @@ pub fn render(
                 }
                 let mut message = serde_json::json!({
                     "role": role,
-                    "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                    "content": content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>(),
                 });
                 if role == "assistant" {
                     apply_pending_reasoning(&mut message, &mut pending_reasoning);
@@ -107,7 +107,7 @@ pub fn render(
                 request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": "assistant",
-                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                        "content": content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>(),
                     }),
                     item,
                 ),
@@ -138,7 +138,13 @@ pub fn render(
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": result.call_id,
-                        "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
+                        // The protocol accepts string or array; some compatible
+                        // upstreams (MiMo) reject the array form with 400.
+                        "content": if capabilities.tool_content_string {
+                            Value::String(request_support::content_as_string(&result.content))
+                        } else {
+                            Value::Array(result.content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>())
+                        },
                     }),
                     item,
                 ),
@@ -335,7 +341,7 @@ fn render_response_format(
     }
 }
 
-fn render_content_part(part: &ContentPart) -> Value {
+fn render_content_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
     let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
@@ -347,7 +353,7 @@ fn render_content_part(part: &ContentPart) -> Value {
         ContentPart::Json(value) => value.clone(),
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part)
+    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {

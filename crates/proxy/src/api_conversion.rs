@@ -732,6 +732,128 @@ accept_downstream_apis = ["openai_responses"]
     }
 
     #[test]
+    fn responses_reasoning_item_becomes_thinking_block_for_messages() {
+        // Codex echoes a reasoning item; the Messages dialect has no `reasoning`
+        // content type (MiMo rejects it), so the summary becomes a thinking block.
+        let config = Config::from_toml_str(
+            r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "m",
+            "input": [
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "think step one"},
+                    {"type": "summary_text", "text": "think step two"}
+                ]},
+                {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ]
+        });
+        let converted = convert_request_body(
+            &config,
+            "mimo",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        let assistant = converted["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message present");
+        let block = &assistant["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert!(block["thinking"].as_str().unwrap().contains("think step one"));
+        assert!(block["thinking"].as_str().unwrap().contains("think step two"));
+        // No `reasoning` block leaks through.
+        assert!(assistant["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "reasoning"));
+    }
+
+    #[test]
+    fn tool_content_array_by_default_and_string_per_capability() {
+        // The official protocols accept both forms; the default is the array form
+        // (byte-stable prefixes), and tool_content_string opts into the string form
+        // for upstreams like MiMo that reject arrays with 400.
+        let make_config = |tool_content_string: bool| {
+            Config::from_toml_str(&format!(
+                r#"
+default_provider = "ds"
+listen_addr = "127.0.0.1:0"
+[providers.ds]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "openai_chat_completions"
+accept_downstream_apis = ["openai_responses"]
+[providers.ds.capabilities]
+tool_content_string = {tool_content_string}
+"#,
+            ))
+            .unwrap()
+        };
+        let body = serde_json::json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "result"}
+            ]
+        });
+        // Default: array form.
+        let converted = convert_request_body(
+            &make_config(false),
+            "ds",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        let tool = converted["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool message present");
+        assert!(tool["content"].is_array(), "array form by default");
+
+        // Capability on: string form.
+        let converted = convert_request_body(
+            &make_config(true),
+            "ds",
+            "/v1/responses",
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&converted).unwrap();
+        let tool = converted["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool message present");
+        assert_eq!(tool["content"], "result", "string form with capability");
+    }
+
+    #[test]
     fn normalizes_converted_messages_request_for_ark_responses_upstream() {
         let config = Config::from_toml_str(
             r#"

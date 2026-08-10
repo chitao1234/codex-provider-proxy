@@ -572,9 +572,37 @@ pub fn object_extensions(
         .collect()
 }
 
-pub fn replay_content_extensions(mut rendered: Value, part: &ContentPart) -> Value {
+/// Render content as a plain string for protocol slots that require one: Chat
+/// `role: "tool"` content and Responses `function_call_output.output`. Text blocks
+/// are joined; JSON parts are serialized so structured tool output is not lost.
+pub fn content_as_string(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part.semantic() {
+            ContentPart::Text(text) => Some(text.clone()),
+            ContentPart::Json(value) => serde_json::to_string(value).ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+pub fn replay_content_extensions(
+    mut rendered: Value,
+    part: &ContentPart,
+    keep_cache_control: bool,
+) -> Value {
     if let Some(object) = rendered.as_object_mut() {
-        replay_scoped_extensions(object, part.extensions(), &[ExtensionScope::ContentPart]);
+        let extensions = part
+            .extensions()
+            .iter()
+            .filter(|extension| {
+                // Block-level cache_control is only kept for upstreams that support it
+                // (MiniMax anthropic endpoint, Qwen); it is stripped otherwise so it
+                // never leaks to an upstream that would reject or silently ignore it.
+                keep_cache_control || extension.key != "cache_control"
+            });
+        replay_scoped_extensions(object, extensions, &[ExtensionScope::ContentPart]);
     }
     rendered
 }
@@ -590,9 +618,9 @@ pub fn replay_item_extensions(mut rendered: Value, item: &crate::ir::ContentItem
     rendered
 }
 
-pub fn replay_scoped_extensions(
+pub fn replay_scoped_extensions<'a>(
     output: &mut Map<String, Value>,
-    extensions: &[Extension],
+    extensions: impl IntoIterator<Item = &'a Extension>,
     scopes: &[ExtensionScope],
 ) {
     for extension in extensions {

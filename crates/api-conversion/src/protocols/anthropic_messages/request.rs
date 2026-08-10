@@ -45,7 +45,7 @@ pub fn render(
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": normalize_role(role),
-                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                        "content": content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>(),
                     }),
                     item,
                 ));
@@ -54,7 +54,7 @@ pub fn render(
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": "assistant",
-                        "content": content.iter().map(render_thinking_part).collect::<Vec<_>>(),
+                        "content": content.iter().map(|p| render_thinking_part(p, capabilities)).collect::<Vec<_>>(),
                     }),
                     item,
                 ))
@@ -63,7 +63,7 @@ pub fn render(
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": "assistant",
-                        "content": content.iter().map(render_content_part).collect::<Vec<_>>(),
+                        "content": content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>(),
                     }),
                     item,
                 ))
@@ -74,7 +74,7 @@ pub fn render(
             })),
             ContentItem::ToolResult { result } => messages.push(serde_json::json!({
                 "role": "user",
-                "content": [render_tool_result(result)],
+                "content": [render_tool_result(result, capabilities)],
             })),
             ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
                 if payload.is_object() {
@@ -203,7 +203,7 @@ fn render_generation(
     }
 }
 
-fn render_content_part(part: &ContentPart) -> Value {
+fn render_content_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
     let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
@@ -228,13 +228,33 @@ fn render_content_part(part: &ContentPart) -> Value {
         ContentPart::Json(value) => value.clone(),
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part)
+    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
 }
 
-fn render_thinking_part(part: &ContentPart) -> Value {
+fn render_thinking_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
     match part.semantic() {
-        ContentPart::Json(value) => value.clone(),
-        _ => render_content_part(part),
+        // A Responses reasoning item (`{"type":"reasoning","summary":[{"type":
+        // "summary_text","text":...}]}`) becomes an Anthropic thinking block; the
+        // Messages dialect has no `reasoning` content type (MiMo rejects it).
+        ContentPart::Json(value) => {
+            let is_reasoning_item = value.get("type").and_then(Value::as_str) == Some("reasoning");
+            if !is_reasoning_item {
+                return value.clone();
+            }
+            let text = value
+                .get("summary")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                return Value::Null;
+            }
+            serde_json::json!({"type": "thinking", "thinking": text})
+        }
+        _ => render_content_part(part, capabilities),
     }
 }
 
@@ -266,11 +286,11 @@ fn render_tool_use(id: Option<&str>, call: &crate::ir::ToolCall) -> Value {
     value
 }
 
-fn render_tool_result(result: &crate::ir::ToolResult) -> Value {
+fn render_tool_result(result: &crate::ir::ToolResult, capabilities: &ModelCapabilities) -> Value {
     let mut value = serde_json::json!({
         "type": "tool_result",
         "tool_use_id": result.call_id,
-        "content": result.content.iter().map(render_content_part).collect::<Vec<_>>(),
+        "content": result.content.iter().map(|p| render_content_part(p, capabilities)).collect::<Vec<_>>(),
         "is_error": result.is_error,
     });
     if let Some(object) = value.as_object_mut() {

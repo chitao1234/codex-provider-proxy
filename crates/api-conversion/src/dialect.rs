@@ -161,6 +161,12 @@ pub struct ModelCapabilities {
     /// upstreams reject it; when false, developer messages fold into system.
     #[serde(default = "default_true")]
     pub accept_developer_role: bool,
+    /// Render Chat `role: "tool"` content and Responses `function_call_output.output`
+    /// as a plain string instead of the protocol-legal array form. The official
+    /// protocols accept both; some compatible upstreams (MiMo) reject the array form
+    /// with 400. Default false (array, byte-stable prefixes).
+    #[serde(default)]
+    pub tool_content_string: bool,
     /// Native search tool template for `ServerToolPolicy::ProviderNative` (e.g.
     /// `{"type":"web_search","web_search":{"search_result":true}}` for glm). The optional
     /// `{search_query}` placeholder is replaced with the last user message.
@@ -233,6 +239,7 @@ impl Default for ModelCapabilities {
             always_enable_tools: Vec::new(),
             accept_stop: true,
             accept_developer_role: true,
+            tool_content_string: false,
             reasoning_split: None,
             ark_style: false,
             cache: CacheCapabilities::default(),

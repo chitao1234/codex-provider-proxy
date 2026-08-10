@@ -230,7 +230,7 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
         ContentItem::Message { role, content, .. } => vec![serde_json::json!({
             "type": "message",
             "role": if role == "developer" && !capabilities.accept_developer_role { "system" } else { role },
-            "content": content.iter().map(render_input_part).collect::<Vec<_>>(),
+            "content": content.iter().map(|p| render_input_part(p, capabilities)).collect::<Vec<_>>(),
         })],
         ContentItem::Reasoning { id, content, .. } => {
             if let Some(raw) = content.iter().find_map(|part| match part.semantic() {
@@ -241,7 +241,7 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
             } else {
                 let mut object = serde_json::json!({
                     "type": "reasoning",
-                    "summary": content.iter().map(render_summary_part).collect::<Vec<_>>(),
+                    "summary": content.iter().map(|p| render_summary_part(p, capabilities)).collect::<Vec<_>>(),
                 });
                 if let Some(id) = id {
                     object["id"] = Value::String(id.clone());
@@ -253,7 +253,7 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
             let mut object = serde_json::json!({
                 "type": "message",
                 "role": "assistant",
-                "content": content.iter().map(render_input_part).collect::<Vec<_>>(),
+                "content": content.iter().map(|p| render_input_part(p, capabilities)).collect::<Vec<_>>(),
             });
             if let Some(id) = id {
                 object["id"] = Value::String(id.clone());
@@ -264,7 +264,13 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
         ContentItem::ToolResult { result } => vec![serde_json::json!({
             "type": "function_call_output",
             "call_id": result.call_id,
-            "output": result.content.iter().map(render_input_part).collect::<Vec<_>>(),
+            // The protocol accepts string or array; some compatible
+            // upstreams (MiMo) reject the array form with 400.
+            "output": if capabilities.tool_content_string {
+                Value::String(request_support::content_as_string(&result.content))
+            } else {
+                Value::Array(result.content.iter().map(|p| render_input_part(p, capabilities)).collect::<Vec<_>>())
+            },
         })],
         ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
             vec![payload.clone()]
@@ -276,7 +282,7 @@ fn render_input_item(item: &ContentItem, capabilities: &ModelCapabilities) -> Ve
         .collect()
 }
 
-fn render_input_part(part: &ContentPart) -> Value {
+fn render_input_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
     let rendered = match part.semantic() {
         ContentPart::Text(text) => serde_json::json!({"type": "input_text", "text": text}),
         ContentPart::Refusal(text) => serde_json::json!({"type": "text", "text": text}),
@@ -303,18 +309,18 @@ fn render_input_part(part: &ContentPart) -> Value {
         }
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part)
+    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
 }
 
-fn render_summary_part(part: &ContentPart) -> Value {
+fn render_summary_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
     let rendered = match part.semantic() {
         ContentPart::Reasoning { text, .. } | ContentPart::Text(text) => {
             serde_json::json!({"type": "summary_text", "text": text})
         }
         ContentPart::Json(value) => value.clone(),
-        other => render_input_part(other),
+        other => render_input_part(other, capabilities),
     };
-    request_support::replay_content_extensions(rendered, part)
+    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {

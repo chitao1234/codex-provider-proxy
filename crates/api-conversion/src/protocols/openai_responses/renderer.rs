@@ -50,16 +50,48 @@ pub fn render(response: &ResponseIr) -> Value {
 }
 
 pub(crate) fn render_usage(usage: &crate::ir::Usage) -> Value {
-    let mut rendered = json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "total_tokens": usage.total_tokens,
-        "input_tokens_details": {
-            "cached_tokens": usage.cached_input_tokens,
-            "cache_write_tokens": usage.cache_write_input_tokens,
-        },
-        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
+    let mut rendered = serde_json::Map::new();
+    let mut insert = |key: &str, value: Option<u64>| {
+        if let Some(value) = value {
+            rendered.insert(key.to_owned(), serde_json::json!(value));
+        }
+    };
+    insert("input_tokens", usage.input_tokens);
+    insert("output_tokens", usage.output_tokens);
+    // Codex requires total_tokens to be a number, never null and never absent.
+    let total = usage.total_tokens.or_else(|| {
+        usage
+            .input_tokens
+            .zip(usage.output_tokens)
+            .and_then(|(input, output)| input.checked_add(output))
     });
+    rendered.insert("total_tokens".to_owned(), serde_json::json!(total.unwrap_or(0)));
+    let mut input_details = serde_json::Map::new();
+    insert_details(&mut input_details, "cached_tokens", usage.cached_input_tokens);
+    insert_details(
+        &mut input_details,
+        "cache_write_tokens",
+        usage.cache_write_input_tokens,
+    );
+    if !input_details.is_empty() {
+        rendered.insert(
+            "input_tokens_details".to_owned(),
+            serde_json::Value::Object(input_details),
+        );
+    }
+    let mut output_details = serde_json::Map::new();
+    insert_details(
+        &mut output_details,
+        "reasoning_tokens",
+        usage.reasoning_tokens,
+    );
+    if !output_details.is_empty() {
+        rendered.insert(
+            "output_tokens_details".to_owned(),
+            serde_json::Value::Object(output_details),
+        );
+    }
+    let mut rendered = serde_json::Value::Object(rendered);
     if let Some(object) = rendered.as_object_mut() {
         for extension in &usage.extensions {
             if extension.is_replayable_in(ExtensionScope::Usage) {
@@ -70,6 +102,12 @@ pub(crate) fn render_usage(usage: &crate::ir::Usage) -> Value {
         }
     }
     rendered
+}
+
+fn insert_details(output: &mut serde_json::Map<String, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        output.insert(key.to_owned(), serde_json::json!(value));
+    }
 }
 
 pub(crate) fn render_item(index: usize, item: &ContentItem) -> Value {
