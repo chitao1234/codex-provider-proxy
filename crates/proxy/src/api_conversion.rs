@@ -229,9 +229,27 @@ pub fn convert_request_body(
         .providers
         .get(provider_name)
         .expect("request conversion requires a resolved provider");
-    let json: Value = serde_json::from_slice(&body)
-        .map_err(|_| RequestConversionRejected::invalid("request body is not valid JSON"))?;
+    let plan = resolve_conversion_plan(provider, &Method::POST, path)
+        .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
+        .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
+    let source = downstream_protocol(plan.downstream);
+    let same_protocol = match plan.request {
+        RequestAction::Passthrough => true,
+        RequestAction::Transform(pipeline) => pipeline.target == source,
+    };
+    let json: Value = match serde_json::from_slice(&body) {
+        Ok(json) => json,
+        Err(_) if same_protocol => return Ok(body),
+        Err(_) => {
+            return Err(RequestConversionRejected::invalid(
+                "request body is not valid JSON",
+            ));
+        }
+    };
     if !json.is_object() {
+        if same_protocol {
+            return Ok(body);
+        }
         return Err(RequestConversionRejected::invalid(
             "request body is not a JSON object",
         ));
@@ -246,13 +264,9 @@ pub fn convert_request_body(
         provider.default_capabilities.as_ref(),
         &provider.model_capabilities,
     );
-    let plan = resolve_conversion_plan(provider, &Method::POST, path)
-        .map_err(|_| RequestConversionRejected::openai_invalid("unsupported API conversion"))?
-        .ok_or_else(|| RequestConversionRejected::openai_invalid("conversion is not enabled"))?;
     let (converted, report) = match plan.request {
         RequestAction::Passthrough => return Ok(body),
         RequestAction::Transform(pipeline) => {
-            let source = downstream_protocol(plan.downstream);
             if source == pipeline.target
                 && pipeline.normalizer == Some(RequestNormalizerKind::ArkResponses)
                 && !caps.ark_style
@@ -768,6 +782,19 @@ accept_downstream_apis = ["openai_responses"]
         .unwrap();
 
         assert_eq!(converted, body);
+
+        for body in [Bytes::from_static(b"not-json"), Bytes::from_static(b"[]")] {
+            let converted = convert_request_body(
+                &config,
+                "responses",
+                "/v1/responses",
+                body.clone(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(converted, body);
+        }
     }
 
     #[test]
