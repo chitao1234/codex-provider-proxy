@@ -54,6 +54,41 @@ fn phase0_request_fixtures_parse_and_preserve_unknown_fields() {
 }
 
 #[test]
+fn phase0_request_matrix_has_basic_outputs_for_each_target_protocol() {
+    let sources = [
+        (
+            Protocol::OpenAiResponses,
+            "tests/fixtures/phase0/requests/openai_responses.json",
+        ),
+        (
+            Protocol::OpenAiChatCompletions,
+            "tests/fixtures/phase0/requests/openai_chat_completions.json",
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "tests/fixtures/phase0/requests/anthropic_messages.json",
+        ),
+    ];
+    // Chat Completions is not a downstream target in the current conversion matrix.
+    let targets = [Protocol::OpenAiResponses, Protocol::AnthropicMessages];
+
+    for (source_protocol, path) in sources {
+        let ir = RequestIr::parse(source_protocol, &read_json(path)).unwrap();
+        for target_protocol in targets {
+            let rendered = ir
+                .render_with_report(target_protocol, &ModelCapabilities::default())
+                .unwrap()
+                .0;
+            assert!(rendered.is_object(), "{path} -> {target_protocol:?}");
+            assert_eq!(
+                rendered["model"], "phase0-model",
+                "{path} -> {target_protocol:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn phase0_response_fixtures_parse_with_stable_terminal_semantics() {
     let cases = [
         (
@@ -80,6 +115,77 @@ fn phase0_response_fixtures_parse_with_stable_terminal_semantics() {
             assert!(rendered.to_string().contains("hello"), "{path}");
         }
     }
+}
+
+#[test]
+fn phase0_response_matrix_has_basic_outputs_for_supported_targets() {
+    let sources = [
+        (
+            Protocol::OpenAiResponses,
+            "tests/fixtures/phase0/responses/openai_responses.json",
+        ),
+        (
+            Protocol::OpenAiChatCompletions,
+            "tests/fixtures/phase0/responses/openai_chat_completions.json",
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "tests/fixtures/phase0/responses/anthropic_messages.json",
+        ),
+    ];
+    let targets = [Protocol::OpenAiResponses, Protocol::AnthropicMessages];
+
+    for (source_protocol, path) in sources {
+        let response = ResponseIr::parse(source_protocol, &read_json(path)).unwrap();
+        for target_protocol in targets {
+            let rendered = response.render(target_protocol).unwrap();
+            assert!(rendered.is_object(), "{path} -> {target_protocol:?}");
+            assert!(
+                rendered.to_string().contains("hello"),
+                "{path} -> {target_protocol:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase0_state_and_cache_identity_mapping_is_explicit() {
+    let previous = RequestIr::parse(
+        Protocol::OpenAiResponses,
+        &serde_json::json!({
+            "model": "phase0-model",
+            "input": "first",
+            "prompt_cache_key": "phase0-cache"
+        }),
+    )
+    .unwrap();
+    let continued = RequestIr::parse_with_context(
+        Protocol::OpenAiResponses,
+        &serde_json::json!({
+            "model": "phase0-model",
+            "previous_response_id": "resp_phase0",
+            "input": "second"
+        }),
+        Some(&previous),
+        None,
+    )
+    .unwrap();
+
+    let mut capabilities = ModelCapabilities::default();
+    capabilities.cache.prompt_cache_key = true;
+    let responses = continued
+        .render_with_report(Protocol::OpenAiResponses, &capabilities)
+        .unwrap()
+        .0;
+    assert_eq!(responses["previous_response_id"], "resp_phase0");
+    assert_eq!(responses["prompt_cache_key"], "phase0-cache");
+
+    let messages = continued
+        .render_with_report(Protocol::AnthropicMessages, &ModelCapabilities::default())
+        .unwrap()
+        .0;
+    assert_eq!(messages["metadata"]["user_id"], "phase0-cache");
+    assert!(messages.get("previous_response_id").is_none());
 }
 
 #[test]
