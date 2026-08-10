@@ -558,7 +558,7 @@ async fn handle_proxy_inner(
                     crate::api_conversion::DownstreamApi::OpenAiResponses,
                 ) => Box::pin(crate::streams::RecordingPassthroughStream::new(
                     resp_stream,
-                    codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+                    codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
                     final_attempt.response_recorder.clone(),
                 )) as BoxRespStream,
                 (
@@ -2981,6 +2981,7 @@ mod tests {
         Router,
     };
     use bytes::BytesMut;
+    use codex_provider_proxy_api_conversion::request_adapter::RequestAdapter;
     use futures_util::{stream, StreamExt};
     use pid_resolver::platform::default_pid_resolver;
     use serde_json::json;
@@ -5079,14 +5080,17 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), upstream_body.as_bytes());
         let recorded = response_states.get("resp_1").unwrap();
-        let rendered = recorded
-            .request_ir
-            .render_with_report(
+        let rendered =
+            codex_provider_proxy_api_conversion::request_adapter::RequestAdapterKind::for_protocol(
+                codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
+            )
+            .render_v2(
+                &recorded.semantic_request.expect("semantic response state"),
                 codex_provider_proxy_api_conversion::request_ir::Protocol::OpenAiResponses,
                 &codex_provider_proxy_api_conversion::dialect::ModelCapabilities::default(),
             )
             .unwrap()
-            .0;
+            .body;
         assert!(rendered["input"]
             .as_array()
             .unwrap()

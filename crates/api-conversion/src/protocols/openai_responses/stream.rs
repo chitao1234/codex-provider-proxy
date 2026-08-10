@@ -191,11 +191,11 @@ impl Parser {
             }
             Some(kind) => {
                 self.item_kinds.insert(id.clone(), ItemKind::Unknown);
-                out.push(CanonicalResponseEvent::ItemStarted {
+                out.push(CanonicalResponseEvent::OpaqueItemStarted {
                     item_id: id,
-                    item: ItemKind::Unknown,
+                    kind: kind.to_owned(),
+                    payload: item.clone(),
                 });
-                out.push(protocol_extension(kind, item.clone()));
             }
             None => {}
         }
@@ -205,6 +205,18 @@ impl Parser {
         let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
             return;
         };
+        if !self.item_kinds.contains_key(id) {
+            let kind = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            self.item_kinds.insert(id.to_owned(), ItemKind::Unknown);
+            out.push(CanonicalResponseEvent::OpaqueItemStarted {
+                item_id: id.to_owned(),
+                kind: kind.to_owned(),
+                payload: item.clone(),
+            });
+        }
         if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
             if let Some(arguments) = item
                 .get("arguments")
@@ -364,6 +376,7 @@ impl Renderer {
                 self.emit("response.output_item.added", json!({"type":"response.output_item.added","output_index":index,"item":payload}), out);
                 let _ = kind;
             }
+            CanonicalResponseEvent::OpaqueItemStarted { .. } => {}
             CanonicalResponseEvent::ContentDelta { item_id, content } => {
                 let Some(index) = self.items.get(item_id).copied() else {
                     return;

@@ -15,9 +15,11 @@ use bytes::{Bytes, BytesMut};
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::{CanonicalResponseEvent, ResponseAccumulator};
 use codex_provider_proxy_api_conversion::sse;
+#[cfg(test)]
 use codex_provider_proxy_api_conversion::stream::{StreamEvent, StreamingResponseIr};
 use futures_util::Stream;
 use pin_project_lite::pin_project;
+#[cfg(test)]
 use serde_json::Value;
 
 use crate::api_conversion::ResponseRecorder;
@@ -121,6 +123,7 @@ impl CanonicalRenderer
     }
 }
 
+#[cfg(test)]
 fn decode_json_event(event_bytes: &[u8]) -> std::io::Result<Option<(&str, Value)>> {
     let event = sse::decode_event(event_bytes).map_err(|err| {
         std::io::Error::new(
@@ -155,6 +158,7 @@ fn pending_has_data(pending: &[u8]) -> std::io::Result<bool> {
 }
 
 /// An upstream SSE parser producing semantic events.
+#[cfg(test)]
 pub trait Parser {
     fn on_event(
         &mut self,
@@ -343,6 +347,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl Parser for codex_provider_proxy_api_conversion::messages_parser::MessagesParser {
     fn on_event(
         &mut self,
@@ -358,6 +363,7 @@ impl Parser for codex_provider_proxy_api_conversion::messages_parser::MessagesPa
     }
 }
 
+#[cfg(test)]
 impl Parser for codex_provider_proxy_api_conversion::responses_parser::ResponsesParser {
     fn on_event(
         &mut self,
@@ -402,7 +408,6 @@ pin_project! {
         inner: S,
         parser: P,
         renderer: R,
-        recorder: Option<ResponseRecorder>,
         response: StreamingResponseIr,
         pending: BytesMut,
         out_events: VecDeque<Bytes>,
@@ -418,7 +423,6 @@ impl<S, P, R> ParserRendererStream<S, P, R> {
             inner,
             parser,
             renderer,
-            recorder: None,
             response: StreamingResponseIr::default(),
             pending: BytesMut::new(),
             out_events: VecDeque::new(),
@@ -535,11 +539,6 @@ where
                     }
                     this.renderer.finish(&mut rendered);
                     let incomplete = this.response.has_started() && !this.response.is_terminal();
-                    if let (Some(recorder), Some(response_id)) =
-                        (this.recorder.as_ref(), this.response.openai_response_id())
-                    {
-                        recorder.record_stream(&response_id, this.response);
-                    }
                     if incomplete {
                         let error = std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -574,7 +573,7 @@ pin_project! {
         inner: S,
         parser: P,
         recorder: Option<ResponseRecorder>,
-        response: StreamingResponseIr,
+        response: ResponseAccumulator,
         pending: BytesMut,
         recording: bool,
         finished: bool,
@@ -588,7 +587,7 @@ impl<S, P> RecordingPassthroughStream<S, P> {
             inner,
             parser,
             recorder,
-            response: StreamingResponseIr::default(),
+            response: ResponseAccumulator::default(),
             pending: BytesMut::new(),
             recording,
             finished: false,
@@ -599,7 +598,7 @@ impl<S, P> RecordingPassthroughStream<S, P> {
 impl<S, P> Stream for RecordingPassthroughStream<S, P>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>>,
-    P: Parser,
+    P: CanonicalParser,
 {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -622,17 +621,17 @@ where
                             break;
                         }
                         let event_bytes = this.pending.split_to(boundary_end).freeze();
-                        let Ok(parsed) = decode_json_event(&event_bytes) else {
+                        let Ok(parsed) = sse::decode_event(&event_bytes) else {
                             *this.recording = false;
                             this.pending.clear();
                             break;
                         };
-                        let Some((event_type, parsed)) = parsed else {
+                        let Some(payload) = parsed.data else {
                             continue;
                         };
                         if this
                             .parser
-                            .on_event(event_type, &parsed, &mut events)
+                            .on_event(parsed.event_type.unwrap_or(""), &payload, &mut events)
                             .is_err()
                         {
                             *this.recording = false;
@@ -644,8 +643,8 @@ where
                         *this.recording = false;
                         this.pending.clear();
                     }
-                    for event in &events {
-                        this.response.on_event(event);
+                    for event in events {
+                        this.response.apply(event);
                     }
                 }
                 Poll::Ready(Some(Ok(chunk)))
@@ -662,13 +661,14 @@ where
                 if *this.recording {
                     let mut events = Vec::new();
                     this.parser.finish(&mut events);
-                    for event in &events {
-                        this.response.on_event(event);
+                    for event in events {
+                        this.response.apply(event);
                     }
-                    if let (Some(recorder), Some(response_id)) =
-                        (this.recorder.as_ref(), this.response.openai_response_id())
-                    {
-                        recorder.record_stream(&response_id, this.response);
+                    if let (Some(recorder), Some(response_id)) = (
+                        this.recorder.as_ref(),
+                        this.response.response().response_id.as_deref(),
+                    ) {
+                        recorder.record_semantic(response_id, this.response.response());
                     }
                 }
                 Poll::Ready(None)
@@ -858,7 +858,7 @@ mod tests {
         let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
         let mut passthrough = RecordingPassthroughStream::new(
             inner,
-            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
             Some(recorder),
         );
         let mut received = Vec::new();
@@ -891,7 +891,7 @@ mod tests {
         let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
         let mut passthrough = RecordingPassthroughStream::new(
             inner,
-            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
             Some(recorder),
         );
         let mut received = Vec::new();
@@ -916,7 +916,7 @@ mod tests {
         let inner = stream::iter([Ok::<_, std::io::Error>(body.clone())]);
         let mut passthrough = RecordingPassthroughStream::new(
             inner,
-            codex_provider_proxy_api_conversion::responses_parser::ResponsesParser::new(),
+            codex_provider_proxy_api_conversion::protocols::openai_responses::stream::Parser::new(),
             Some(recorder),
         );
 

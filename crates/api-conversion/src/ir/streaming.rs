@@ -13,6 +13,11 @@ pub enum CanonicalResponseEvent {
         item_id: String,
         item: ItemKind,
     },
+    OpaqueItemStarted {
+        item_id: String,
+        kind: String,
+        payload: serde_json::Value,
+    },
     ItemMetadataUpdated {
         item_id: String,
         metadata: Vec<Extension>,

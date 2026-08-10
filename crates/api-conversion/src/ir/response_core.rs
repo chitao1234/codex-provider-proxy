@@ -46,6 +46,23 @@ impl ResponseAccumulator {
                     self.response.output.push(empty_item(*item, item_id));
                 }
             }
+            CanonicalResponseEvent::OpaqueItemStarted {
+                item_id,
+                kind,
+                payload,
+            } => {
+                if !self.item_indexes.contains_key(item_id) {
+                    let index = self.response.output.len();
+                    self.item_indexes.insert(item_id.clone(), index);
+                    self.item_kinds.insert(item_id.clone(), ItemKind::Unknown);
+                    self.response.output.push(ContentItem::Unknown {
+                        id: Some(item_id.clone()),
+                        kind: kind.clone(),
+                        payload: payload.clone(),
+                        extensions: Vec::new(),
+                    });
+                }
+            }
             CanonicalResponseEvent::ItemMetadataUpdated { item_id, metadata } => {
                 if let Some(item) = self.item_mut(item_id) {
                     item_extensions_mut(item).extend(metadata.clone());

@@ -20,7 +20,6 @@ use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
-use codex_provider_proxy_api_conversion::stream::StreamingResponseIr;
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 use pin_project_lite::pin_project;
@@ -476,21 +475,6 @@ impl ResponseRecorder {
             state.semantic_request = Some(request);
         }
         self.store.put(state);
-    }
-
-    pub fn record_stream(&self, response_id: &str, response: &StreamingResponseIr) {
-        let mut request_ir = self.request_ir.clone();
-        response.append_to_request(&mut request_ir);
-        let now = crate::response_state::now_unix();
-        self.store.put(crate::response_state::ResponseState::new(
-            response_id.to_string(),
-            self.provider_name.clone(),
-            self.model.clone(),
-            request_ir,
-            response.last_reasoning().map(str::to_owned),
-            now,
-            crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
-        ));
     }
 
     pub fn record_semantic(
