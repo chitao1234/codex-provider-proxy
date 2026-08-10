@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codex_provider_proxy_api_conversion::request_ir::RequestIr;
+use codex_provider_proxy_api_conversion::{
+    ir::RequestIr as SemanticRequestIr, request_ir::RequestIr,
+};
 
 /// Default time-to-live for stored response transcripts.
 pub const DEFAULT_RESPONSE_STATE_TTL_SECS: u64 = 3600;
@@ -28,6 +30,7 @@ pub struct ResponseState {
     pub model: String,
     /// The complete protocol-neutral request transcript, ready to render for a continuation.
     pub request_ir: RequestIr,
+    pub semantic_request: Option<SemanticRequestIr>,
     /// Reasoning from the assistant turn that produced this response.
     pub last_reasoning: Option<String>,
     pub created_at_unix: u64,
@@ -49,6 +52,7 @@ impl ResponseState {
             provider_name,
             model,
             request_ir,
+            semantic_request: None,
             last_reasoning,
             created_at_unix: now_unix,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
