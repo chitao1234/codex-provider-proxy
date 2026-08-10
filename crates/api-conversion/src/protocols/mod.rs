@@ -14,3 +14,17 @@ pub fn parse_response(protocol: Protocol, body: &Value) -> Result<ResponseIr, Co
         Protocol::OpenAiChatCompletions => openai_chat_completions::response::parse(body),
     }
 }
+
+pub fn render_response(
+    protocol: Protocol,
+    response: &ResponseIr,
+) -> Result<Value, ConversionError> {
+    match protocol {
+        Protocol::OpenAiResponses => Ok(openai_responses::renderer::render(response)),
+        Protocol::AnthropicMessages => Ok(anthropic_messages::renderer::render(response)),
+        Protocol::OpenAiChatCompletions => Err(ConversionError::unsupported(
+            "response",
+            "Chat Completions is not a downstream response format",
+        )),
+    }
+}

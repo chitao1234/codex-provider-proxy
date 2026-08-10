@@ -514,6 +514,7 @@ fn convert_non_streaming_body_with_pipeline(
 struct ConvertedNonStreamingResponse {
     body: Bytes,
     response_id: Option<String>,
+    semantic_response: Option<codex_provider_proxy_api_conversion::ir::ResponseIr>,
     response: Option<ResponseIr>,
 }
 
@@ -536,6 +537,7 @@ fn convert_non_streaming_response(
         return Ok(ConvertedNonStreamingResponse {
             body,
             response_id,
+            semantic_response: None,
             response,
         });
     }
@@ -545,11 +547,15 @@ fn convert_non_streaming_response(
             "upstream response is not valid JSON",
         )
     })?;
-    let response = ResponseIr::parse(pipeline.source, &json)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let converted = response
-        .render(pipeline.target_protocol())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let semantic_response =
+        codex_provider_proxy_api_conversion::protocols::parse_response(pipeline.source, &json)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let converted = codex_provider_proxy_api_conversion::protocols::render_response(
+        pipeline.target_protocol(),
+        &semantic_response,
+    )
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let response = ResponseIr::parse(pipeline.source, &json).ok();
     let response_id = converted
         .get("id")
         .and_then(Value::as_str)
@@ -566,7 +572,8 @@ fn convert_non_streaming_response(
     Ok(ConvertedNonStreamingResponse {
         body,
         response_id,
-        response: Some(response),
+        semantic_response: Some(semantic_response),
+        response,
     })
 }
 
@@ -923,9 +930,8 @@ where
                     let buffered = std::mem::take(this.buffered).freeze();
                     *this.result = Some(
                         convert_non_streaming_response(buffered, *this.pipeline).map(|converted| {
-                            if let Some(response) = converted.response.as_ref() {
-                                codex_provider_proxy_api_conversion::response_adapter::
-                                    apply_complete_response(this.core_response, response);
+                            if let Some(response) = converted.semantic_response.as_ref() {
+                                *this.core_response = codex_provider_proxy_api_conversion::ir::ResponseAccumulator::from_response(response.clone());
                             }
                             if let (Some(recorder), Some(response_id), Some(response)) = (
                                 this.recorder.as_ref(),

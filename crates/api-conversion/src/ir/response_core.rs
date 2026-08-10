@@ -18,6 +18,15 @@ pub struct ResponseAccumulator {
 }
 
 impl ResponseAccumulator {
+    pub fn from_response(response: ResponseIr) -> Self {
+        Self {
+            response,
+            terminal: true,
+            failed: false,
+            ..Self::default()
+        }
+    }
+
     pub fn apply(&mut self, event: CanonicalResponseEvent) -> CoreUpdate {
         let mut newly_completed = false;
         match &event {
