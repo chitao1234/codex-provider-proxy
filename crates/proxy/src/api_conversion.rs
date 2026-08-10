@@ -412,17 +412,12 @@ fn convert_non_streaming_response(
     pipeline: ResponsePipeline,
 ) -> Result<ConvertedNonStreamingResponse, std::io::Error> {
     if pipeline.source == pipeline.target {
-        let semantic_response = (pipeline.source == Protocol::OpenAiResponses)
+        let semantic_response = pipeline
+            .records_continuation_state()
             .then(|| {
                 serde_json::from_slice::<Value>(&body)
                     .ok()
-                    .and_then(|json| {
-                        codex_provider_proxy_api_conversion::protocols::parse_response(
-                            pipeline.source,
-                            &json,
-                        )
-                        .ok()
-                    })
+                    .and_then(|json| pipeline.parser().parse(&json).ok())
             })
             .flatten();
         let response_id = semantic_response
@@ -660,10 +655,12 @@ mod tests {
             );
             assert_eq!(
                 plan.stream,
-                if response.source == response.target {
-                    StreamPolicy::Passthrough
-                } else {
+                if response.source != response.target {
                     StreamPolicy::Translate
+                } else if response.records_continuation_state() {
+                    StreamPolicy::RecordingPassthrough
+                } else {
+                    StreamPolicy::Passthrough
                 }
             );
             assert_eq!(plan.extensions, ExtensionPolicy::PreserveScopedOpaque);

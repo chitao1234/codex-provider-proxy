@@ -517,21 +517,15 @@ async fn handle_proxy_inner(
         let conversion_plan = conversion_plan.expect("conversion applies only when a plan exists");
         let response_pipeline = conversion_plan.response;
         if is_text_event_stream(&resp_headers) {
-            let target = response_pipeline.target;
             match conversion_plan.stream {
-                crate::api_conversion::StreamPolicy::Passthrough => match target {
-                    codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiResponses => {
-                        Box::pin(crate::streams::RecordingPassthroughStream::new(
-                            resp_stream,
-                            response_pipeline.stream_parser(),
-                            final_attempt.response_recorder.clone(),
-                        )) as BoxRespStream
-                    }
-                    codex_provider_proxy_api_conversion::protocol::Protocol::AnthropicMessages
-                    | codex_provider_proxy_api_conversion::protocol::Protocol::OpenAiChatCompletions => {
-                        resp_stream
-                    }
-                },
+                crate::api_conversion::StreamPolicy::Passthrough => resp_stream,
+                crate::api_conversion::StreamPolicy::RecordingPassthrough => {
+                    Box::pin(crate::streams::RecordingPassthroughStream::new(
+                        resp_stream,
+                        response_pipeline.stream_parser(),
+                        final_attempt.response_recorder.clone(),
+                    )) as BoxRespStream
+                }
                 crate::api_conversion::StreamPolicy::Translate => {
                     let parser = response_pipeline.stream_parser();
                     let renderer = response_pipeline

@@ -25,6 +25,7 @@ pub enum ContinuationPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamPolicy {
     Passthrough,
+    RecordingPassthrough,
     Translate,
 }
 
@@ -90,10 +91,12 @@ impl ConversionPlan {
             } else {
                 ContinuationPolicy::None
             },
-            stream: if source == target {
-                StreamPolicy::Passthrough
-            } else {
+            stream: if source != target {
                 StreamPolicy::Translate
+            } else if source == Protocol::OpenAiResponses {
+                StreamPolicy::RecordingPassthrough
+            } else {
+                StreamPolicy::Passthrough
             },
             extensions: ExtensionPolicy::PreserveScopedOpaque,
         }
@@ -119,6 +122,10 @@ impl ResponsePipeline {
         self,
     ) -> Result<crate::protocols::StreamRendererKind, crate::error::ConversionError> {
         crate::protocols::StreamRendererKind::for_protocol(self.target)
+    }
+
+    pub fn records_continuation_state(self) -> bool {
+        self.source == Protocol::OpenAiResponses && self.target == Protocol::OpenAiResponses
     }
 }
 
@@ -166,5 +173,19 @@ mod tests {
 
         assert_eq!(plan.request, RequestAction::Passthrough);
         assert_eq!(plan.stream, StreamPolicy::Passthrough);
+    }
+
+    #[test]
+    fn same_protocol_responses_streams_record_continuation_state() {
+        let plan = ConversionPlan::new(
+            DownstreamApi::OpenAiResponses,
+            UpstreamApi::OpenAiResponses,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiResponses,
+            None,
+        );
+
+        assert_eq!(plan.stream, StreamPolicy::RecordingPassthrough);
+        assert!(plan.response.records_continuation_state());
     }
 }
