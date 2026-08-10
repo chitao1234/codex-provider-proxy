@@ -28,32 +28,12 @@ pub fn render(
     if let Some(stream) = request.stream {
         output.insert("stream".to_owned(), Value::Bool(stream));
     }
-    if let Some(user_id) = request.state.cache.key.as_ref().or(request
-        .state
-        .identity
-        .user_id
-        .as_ref())
-    {
-        output.insert("user".to_owned(), Value::String(user_id.clone()));
-    }
-    if let Some(metadata) = &request.state.metadata {
-        output.insert("metadata".to_owned(), metadata.clone());
-    }
-    for extension in &request.state.extensions {
-        if extension.scope == crate::ir::ExtensionScope::State
-            && !matches!(
-                extension.key.as_str(),
-                "prompt_cache_key"
-                    | "prompt_cache_options"
-                    | "prompt_cache_retention"
-                    | "cache_control"
-            )
-        {
-            output
-                .entry(extension.key.clone())
-                .or_insert_with(|| extension.value.clone());
-        }
-    }
+    crate::protocols::request_support::render_openai_state(
+        request,
+        capabilities,
+        false,
+        &mut output,
+    );
     render_generation(&request.generation, capabilities, &mut output);
 
     let mut messages = Vec::new();

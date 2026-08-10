@@ -189,3 +189,72 @@ fn chat_v2_renderer_matches_cross_protocol_fixture_shape() {
         assert_eq!(rendered["messages"], legacy["messages"], "{fixture_name}");
     }
 }
+
+#[test]
+fn v2_state_rendering_respects_cache_and_identity_capabilities() {
+    let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
+    let request = adapter
+        .parse_v2(&serde_json::json!({
+            "model": "m",
+            "input": "hello",
+            "user": "end-user",
+            "metadata": {"tenant": "workspace"},
+            "safety_identifier": "safety-1",
+            "prompt_cache_key": "cache-1",
+            "prompt_cache_options": {"mode": "extended"},
+            "prompt_cache_retention": "24h",
+            "cache_control": {"type": "ephemeral"},
+            "x_provider_session_id": "session-1",
+            "store": false
+        }))
+        .unwrap();
+    let mut capabilities = ModelCapabilities::default();
+    capabilities.cache.prompt_cache_key = true;
+    capabilities.cache.prompt_cache_options = true;
+    capabilities.cache.block_cache_control = true;
+
+    let responses = adapter
+        .render_v2(&request, Protocol::OpenAiResponses, &capabilities)
+        .unwrap()
+        .body;
+    assert_eq!(responses["user"], "end-user");
+    assert_eq!(responses["prompt_cache_key"], "cache-1");
+    assert_eq!(responses["prompt_cache_options"]["mode"], "extended");
+    assert_eq!(responses["prompt_cache_retention"], "24h");
+    assert_eq!(responses["x_provider_session_id"], "session-1");
+    assert_eq!(responses["safety_identifier"], "safety-1");
+    assert_eq!(responses["metadata"]["tenant"], "workspace");
+    assert_eq!(responses["store"], false);
+
+    let chat = adapter
+        .render_v2(&request, Protocol::OpenAiChatCompletions, &capabilities)
+        .unwrap()
+        .body;
+    assert_eq!(chat["user"], "cache-1");
+    assert_eq!(chat["prompt_cache_key"], "cache-1");
+    assert_eq!(chat["prompt_cache_options"]["mode"], "extended");
+    assert_eq!(chat["x_provider_session_id"], "session-1");
+    assert_eq!(chat["safety_identifier"], "safety-1");
+
+    let messages = adapter
+        .render_v2(&request, Protocol::AnthropicMessages, &capabilities)
+        .unwrap()
+        .body;
+    assert_eq!(messages["metadata"]["tenant"], "workspace");
+    assert_eq!(messages["metadata"]["user_id"], "cache-1");
+    assert_eq!(messages["cache_control"]["type"], "ephemeral");
+    assert_eq!(messages["x_provider_session_id"], "session-1");
+
+    let disabled = adapter
+        .render_v2(
+            &request,
+            Protocol::OpenAiResponses,
+            &ModelCapabilities::default(),
+        )
+        .unwrap()
+        .body;
+    assert!(disabled.get("prompt_cache_key").is_none());
+    assert!(disabled.get("prompt_cache_options").is_none());
+    assert!(disabled.get("prompt_cache_retention").is_none());
+    assert!(disabled.get("cache_control").is_none());
+}

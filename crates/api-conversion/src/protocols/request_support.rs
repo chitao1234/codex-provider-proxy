@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value};
 
 use crate::{
+    dialect::ModelCapabilities,
     error::ConversionError,
     ir::{
         CacheIdentity, ContentPart, ConversationState, Extension, ExtensionScope,
@@ -10,6 +11,133 @@ use crate::{
         ToolResult,
     },
 };
+
+pub fn render_openai_state(
+    request: &RequestIr,
+    capabilities: &ModelCapabilities,
+    responses: bool,
+    output: &mut Map<String, Value>,
+) {
+    replay_state_extensions(request, output);
+    if let Some(metadata) = &request.state.metadata {
+        output.insert("metadata".to_owned(), metadata.clone());
+    }
+    if let Some(safety_identifier) = &request.state.safety_identifier {
+        output.insert(
+            "safety_identifier".to_owned(),
+            Value::String(safety_identifier.clone()),
+        );
+    }
+    if let Some(store) = &request.state.store {
+        output.insert("store".to_owned(), store.clone());
+    }
+    if capabilities.cache.prompt_cache_key {
+        if let Some(key) = &request.state.cache.key {
+            output.insert("prompt_cache_key".to_owned(), Value::String(key.clone()));
+        }
+    }
+    if capabilities.cache.prompt_cache_options {
+        if let Some(options) = &request.state.cache.options {
+            output.insert("prompt_cache_options".to_owned(), options.clone());
+        }
+        if let Some(retention) = &request.state.cache.retention {
+            output.insert("prompt_cache_retention".to_owned(), retention.clone());
+        }
+    }
+    if responses {
+        if let Some(conversation) = &request.state.conversation {
+            output.insert("conversation".to_owned(), conversation.clone());
+        }
+        if let Some(response_id) = &request.state.source_response_id {
+            output.insert(
+                "previous_response_id".to_owned(),
+                Value::String(response_id.clone()),
+            );
+        }
+        if let Some(include) = &request.state.include {
+            output.insert("include".to_owned(), include.clone());
+        }
+        if let Some(truncation) = &request.state.truncation {
+            output.insert("truncation".to_owned(), truncation.clone());
+        }
+        if let Some(user_id) = &request.state.identity.user_id {
+            output.insert("user".to_owned(), Value::String(user_id.clone()));
+        }
+    } else if let Some(user_id) = request.state.cache.key.as_ref().or(request
+        .state
+        .identity
+        .user_id
+        .as_ref())
+    {
+        output.insert("user".to_owned(), Value::String(user_id.clone()));
+    }
+}
+
+pub fn render_messages_state(
+    request: &RequestIr,
+    capabilities: &ModelCapabilities,
+    output: &mut Map<String, Value>,
+) {
+    replay_state_extensions(request, output);
+    if let Some(cache_control) = capabilities
+        .cache
+        .block_cache_control
+        .then_some(request.state.cache.control.as_ref())
+        .flatten()
+    {
+        output.insert("cache_control".to_owned(), cache_control.clone());
+    }
+    let user_id = request
+        .state
+        .cache
+        .key
+        .as_ref()
+        .or(request.state.identity.user_id.as_ref());
+    if request.state.metadata.is_some() || user_id.is_some() {
+        let mut metadata = request
+            .state
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(user_id) = user_id {
+            metadata
+                .entry("user_id".to_owned())
+                .or_insert_with(|| Value::String(user_id.clone()));
+        }
+        output.insert("metadata".to_owned(), Value::Object(metadata));
+    }
+}
+
+fn replay_state_extensions(request: &RequestIr, output: &mut Map<String, Value>) {
+    for extension in &request.state.extensions {
+        if extension.scope == ExtensionScope::State && !is_canonical_state_field(&extension.key) {
+            output
+                .entry(extension.key.clone())
+                .or_insert_with(|| extension.value.clone());
+        }
+    }
+}
+
+fn is_canonical_state_field(key: &str) -> bool {
+    matches!(
+        key,
+        "conversation"
+            | "previous_response_id"
+            | "user"
+            | "user_id"
+            | "safety_identifier"
+            | "metadata"
+            | "prompt_cache_key"
+            | "prompt_cache_options"
+            | "prompt_cache_retention"
+            | "cache_control"
+            | "store"
+            | "include"
+            | "truncation"
+    )
+}
 
 pub fn object(body: &Value) -> Result<&Map<String, Value>, ConversionError> {
     body.as_object()

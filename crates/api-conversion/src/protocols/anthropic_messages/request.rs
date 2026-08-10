@@ -23,7 +23,7 @@ pub fn render(
     if let Some(stream) = request.stream {
         output.insert("stream".to_owned(), Value::Bool(stream));
     }
-    render_state(request, &mut output);
+    crate::protocols::request_support::render_messages_state(request, capabilities, &mut output);
     render_generation(&request.generation, capabilities, &mut output);
 
     let mut system_parts = request
@@ -99,18 +99,6 @@ fn opaque_root(request: &RequestIr) -> Map<String, Value> {
         .filter(|extension| extension.scope == crate::ir::ExtensionScope::Request)
         .map(|extension| (extension.key.clone(), extension.value.clone()))
         .collect()
-}
-
-fn render_state(request: &RequestIr, output: &mut Map<String, Value>) {
-    if let Some(key) = request
-        .state
-        .cache
-        .key
-        .as_ref()
-        .or(request.state.identity.user_id.as_ref())
-    {
-        output.insert("metadata".to_owned(), serde_json::json!({"user_id": key}));
-    }
 }
 
 fn render_generation(

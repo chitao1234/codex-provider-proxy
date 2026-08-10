@@ -21,7 +21,12 @@ pub fn render(
     if let Some(stream) = request.stream {
         output.insert("stream".to_owned(), Value::Bool(stream));
     }
-    render_state(request, capabilities, &mut output);
+    crate::protocols::request_support::render_openai_state(
+        request,
+        capabilities,
+        true,
+        &mut output,
+    );
     render_generation(&request.generation, capabilities, &mut output);
     if !request.instructions.is_empty() {
         output.insert(
@@ -65,55 +70,6 @@ fn opaque_root(request: &RequestIr) -> Map<String, Value> {
         .filter(|extension| extension.scope == crate::ir::ExtensionScope::Request)
         .map(|extension| (extension.key.clone(), extension.value.clone()))
         .collect()
-}
-
-fn render_state(
-    request: &RequestIr,
-    capabilities: &ModelCapabilities,
-    output: &mut Map<String, Value>,
-) {
-    let state = &request.state;
-    if let Some(conversation) = &state.conversation {
-        output.insert("conversation".to_owned(), conversation.clone());
-    }
-    if let Some(response_id) = &state.source_response_id {
-        output.insert(
-            "previous_response_id".to_owned(),
-            Value::String(response_id.clone()),
-        );
-    }
-    if let Some(metadata) = &state.metadata {
-        output.insert("metadata".to_owned(), metadata.clone());
-    }
-    if let Some(user_id) = &state.identity.user_id {
-        output.insert("user".to_owned(), Value::String(user_id.clone()));
-    }
-    if let Some(safety_identifier) = &state.safety_identifier {
-        output.insert(
-            "safety_identifier".to_owned(),
-            Value::String(safety_identifier.clone()),
-        );
-    }
-    if let Some(store) = &state.store {
-        output.insert("store".to_owned(), store.clone());
-    }
-    if let Some(include) = &state.include {
-        output.insert("include".to_owned(), include.clone());
-    }
-    if let Some(truncation) = &state.truncation {
-        output.insert("truncation".to_owned(), truncation.clone());
-    }
-    if capabilities.cache.prompt_cache_key {
-        if let Some(key) = &state.cache.key {
-            output.insert("prompt_cache_key".to_owned(), Value::String(key.clone()));
-        }
-        if let Some(options) = &state.cache.options {
-            output.insert("prompt_cache_options".to_owned(), options.clone());
-        }
-        if let Some(retention) = &state.cache.retention {
-            output.insert("prompt_cache_retention".to_owned(), retention.clone());
-        }
-    }
 }
 
 fn render_generation(
