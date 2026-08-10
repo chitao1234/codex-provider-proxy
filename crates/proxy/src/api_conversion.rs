@@ -18,6 +18,7 @@ pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
 use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
 use codex_provider_proxy_api_conversion::messages_renderer::MessagesRenderer;
+use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use codex_provider_proxy_api_conversion::request_ir::{Protocol, RequestIr};
 use codex_provider_proxy_api_conversion::response_ir::ResponseIr;
 use codex_provider_proxy_api_conversion::responses_renderer::ResponsesRenderer;
@@ -252,19 +253,20 @@ pub fn convert_request_body(
         RequestAction::Passthrough => return Ok(body),
         RequestAction::Transform(pipeline) => {
             let source = downstream_protocol(plan.downstream);
-            let request = if source == Protocol::OpenAiResponses {
-                RequestIr::parse_with_context(source, &json, previous_request, last_reasoning)
-            } else {
-                RequestIr::parse(source, &json)
-            }
-            .map_err(|err| {
-                RequestConversionRejected::from_conversion_error(err, plan.downstream)
-            })?;
-            let (mut rendered, report) = request
-                .render_with_report(pipeline.target, &caps)
+            let adapter = RequestAdapterKind::for_protocol(source);
+            let request = adapter
+                .parse_with_context(&json, previous_request, last_reasoning)
                 .map_err(|err| {
                     RequestConversionRejected::from_conversion_error(err, plan.downstream)
                 })?;
+            let rendered_request =
+                adapter
+                    .render(&request, pipeline.target, &caps)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?;
+            let mut rendered = rendered_request.body;
+            let report = rendered_request.report;
             normalize_rendered_request(pipeline.normalizer, pipeline.target, &caps, &mut rendered);
             if pipeline.target == Protocol::OpenAiResponses {
                 inject_ark_explicit_cache(&caps, &json, &mut rendered);
