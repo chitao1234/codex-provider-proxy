@@ -496,6 +496,55 @@ impl ResponseRecorder {
             crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
         ));
     }
+
+    pub fn record_semantic(
+        &self,
+        response_id: &str,
+        response: &codex_provider_proxy_api_conversion::ir::ResponseIr,
+    ) {
+        let Some(request) = &self.semantic_request else {
+            return;
+        };
+        let mut request = request.clone();
+        request.append_response(response);
+        let last_reasoning = response.output.iter().rev().find_map(|item| match item {
+            codex_provider_proxy_api_conversion::ir::ContentItem::Reasoning { content, .. } => {
+                content.iter().rev().find_map(|part| match part {
+                    codex_provider_proxy_api_conversion::ir::ContentPart::Reasoning {
+                        text,
+                        ..
+                    } if !text.trim().is_empty() => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        let now = crate::response_state::now_unix();
+        let mut state = crate::response_state::ResponseState::new(
+            response_id.to_owned(),
+            self.provider_name.clone(),
+            self.model.clone(),
+            self.request_ir.clone(),
+            last_reasoning,
+            now,
+            crate::response_state::DEFAULT_RESPONSE_STATE_TTL_SECS,
+        );
+        state.semantic_request = Some(request);
+        self.store.put(state);
+    }
+
+    pub fn record_stream_prefer_semantic(
+        &self,
+        response_id: &str,
+        semantic: &codex_provider_proxy_api_conversion::ir::ResponseIr,
+        legacy: &StreamingResponseIr,
+    ) {
+        if self.semantic_request.is_some() {
+            self.record_semantic(response_id, semantic);
+        } else {
+            self.record_stream(response_id, legacy);
+        }
+    }
 }
 
 /// Convert an upstream non-2xx JSON error body to the downstream dialect's error envelope.
@@ -848,7 +897,11 @@ where
                     if let (Some(recorder), Some(response_id)) =
                         (this.recorder.as_ref(), this.response.openai_response_id())
                     {
-                        recorder.record_stream(&response_id, this.response);
+                        recorder.record_stream_prefer_semantic(
+                            &response_id,
+                            this.core_response.response(),
+                            this.response,
+                        );
                     }
                     if incomplete {
                         let error = std::io::Error::new(
