@@ -13,6 +13,7 @@ pub mod error;
 pub mod ir;
 pub mod protocol;
 pub mod protocols;
+pub mod provider_normalizer;
 pub(crate) mod provider_tools;
 pub mod request_adapter;
 pub mod sse;

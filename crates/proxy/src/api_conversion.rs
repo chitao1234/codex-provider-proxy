@@ -18,6 +18,7 @@ use codex_provider_proxy_api_conversion::error::ApiErrorIr;
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::protocol::Protocol;
+use codex_provider_proxy_api_conversion::provider_normalizer::RequestNormalizerKind;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
@@ -33,11 +34,6 @@ const MESSAGES_UPSTREAM_PATH: &str = "v1/messages";
 const RESPONSES_UPSTREAM_PATH: &str = "v1/responses";
 const MESSAGES_PATH: &str = "messages";
 const RESPONSES_PATH: &str = "responses";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestNormalizerKind {
-    ArkResponses,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPipeline {
@@ -280,13 +276,15 @@ pub fn convert_request_body(
                 })?;
             let rendered = rendered_request.body;
             let report = rendered_request.report;
-            let rendered = normalize_rendered_request(
-                pipeline.normalizer,
-                pipeline.target,
-                &request,
-                &caps,
-                rendered,
-            );
+            let rendered = if let Some(normalizer) = pipeline.normalizer {
+                normalizer
+                    .normalize(&request, &caps, pipeline.target, rendered)
+                    .map_err(|err| {
+                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                    })?
+            } else {
+                rendered
+            };
             (rendered, report)
         }
     };
@@ -309,24 +307,6 @@ pub fn convert_request_body(
     serde_json::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| RequestConversionRejected::invalid("failed to serialize converted request"))
-}
-
-fn normalize_rendered_request(
-    normalizer: Option<RequestNormalizerKind>,
-    target: Protocol,
-    semantic: &codex_provider_proxy_api_conversion::ir::RequestIr,
-    caps: &ModelCapabilities,
-    request: Value,
-) -> Value {
-    if normalizer == Some(RequestNormalizerKind::ArkResponses)
-        && caps.ark_style
-        && target == Protocol::OpenAiResponses
-    {
-        return codex_provider_proxy_api_conversion::protocols::openai_responses::normalizer::normalize_ark(
-            semantic, caps, request,
-        );
-    }
-    request
 }
 
 /// A request that cannot be converted; carries the Anthropic-style error envelope to return
