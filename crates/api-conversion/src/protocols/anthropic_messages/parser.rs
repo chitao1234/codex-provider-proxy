@@ -8,7 +8,7 @@ use crate::{
 
 pub fn parse(body: &Value) -> Result<RequestIr, ConversionError> {
     let source = object(body)?;
-    let mut request = request_support::base_request(source);
+    let mut request = request_support::base_request(source, "anthropic_messages");
     request.instructions = source
         .get("system")
         .map(|value| {

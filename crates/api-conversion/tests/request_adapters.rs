@@ -39,6 +39,32 @@ fn each_protocol_has_an_independent_request_adapter() {
 }
 
 #[test]
+fn request_extensions_record_their_source_protocol() {
+    for (protocol, source_protocol) in [
+        (Protocol::OpenAiResponses, "openai_responses"),
+        (Protocol::OpenAiChatCompletions, "openai_chat_completions"),
+        (Protocol::AnthropicMessages, "anthropic_messages"),
+    ] {
+        let adapter = RequestAdapterKind::for_protocol(protocol);
+        let request = adapter
+            .parse_v2(&serde_json::json!({
+                "model": "m",
+                "x_provider_parameter": true,
+                "x_session_id": "session-1"
+            }))
+            .unwrap();
+        assert_eq!(
+            request.opaque[0].source_protocol.as_deref(),
+            Some(source_protocol)
+        );
+        assert_eq!(
+            request.state.extensions[0].source_protocol.as_deref(),
+            Some(source_protocol)
+        );
+    }
+}
+
+#[test]
 fn adapter_dispatch_preserves_responses_continuation_context() {
     let adapter = RequestAdapterKind::for_protocol(Protocol::OpenAiResponses);
     let previous = adapter
@@ -88,9 +114,16 @@ fn responses_adapter_exposes_semantic_v2_request_without_messages_shape() {
     assert_eq!(request.model.as_deref(), Some("m"));
     assert_eq!(request.transcript.len(), 3);
     assert_eq!(request.state.cache.key.as_deref(), Some("cache-1"));
-    assert!(request.opaque.iter().any(|extension| {
-        extension.key == "x_client_extension" && extension.value["keep"] == true
-    }));
+    let extension = request
+        .opaque
+        .iter()
+        .find(|extension| extension.key == "x_client_extension")
+        .unwrap();
+    assert_eq!(extension.value["keep"], true);
+    assert_eq!(
+        extension.source_protocol.as_deref(),
+        Some("openai_responses")
+    );
     assert!(matches!(
         request.transcript[0],
         codex_provider_proxy_api_conversion::ir::ContentItem::Message { .. }

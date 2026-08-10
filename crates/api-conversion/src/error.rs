@@ -80,14 +80,6 @@ impl ConversionError {
     }
 }
 
-/// Map an upstream OpenAI-style error body to the Anthropic error envelope.
-///
-/// Upstream JSON of the shape `{"error": {"message", "type", "code", "param"}}` keeps its
-/// `type` when it matches Anthropic naming; the HTTP status is preserved by the caller.
-pub fn convert_chat_error_body(status: http::StatusCode, body: &Value) -> Value {
-    ApiErrorIr::parse(status, body).render_anthropic()
-}
-
 /// Protocol-neutral representation of a non-success API response.
 ///
 /// Standard error semantics are separated from opaque fields so provider-specific
@@ -238,43 +230,48 @@ mod tests {
 
     #[test]
     fn preserves_upstream_error_type_when_compatible() {
-        let body = convert_chat_error_body(
+        let body = ApiErrorIr::parse(
             http::StatusCode::BAD_REQUEST,
             &json!({"error": {"message": "unknown tool type", "type": "invalid_request_error", "param": "tools[0].type"}}),
-        );
+        )
+        .render_anthropic();
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["message"], "unknown tool type");
     }
 
     #[test]
     fn maps_status_when_upstream_type_is_foreign() {
-        let body = convert_chat_error_body(
+        let body = ApiErrorIr::parse(
             http::StatusCode::TOO_MANY_REQUESTS,
             &json!({"error": {"message": "rate limited", "type": "my_provider_rate_limit"}}),
-        );
+        )
+        .render_anthropic();
         assert_eq!(body["error"]["type"], "rate_limit_error");
     }
 
     #[test]
     fn preserves_minimax_bad_request_error_type() {
-        let body = convert_chat_error_body(
+        let body = ApiErrorIr::parse(
             http::StatusCode::BAD_REQUEST,
             &json!({"error": {"type": "bad_request_error", "message": "invalid params (2013)"}}),
-        );
+        )
+        .render_anthropic();
         assert_eq!(body["error"]["type"], "bad_request_error");
         assert_eq!(body["error"]["message"], "invalid params (2013)");
     }
 
     #[test]
     fn falls_back_to_code_then_status() {
-        let body = convert_chat_error_body(
+        let body = ApiErrorIr::parse(
             http::StatusCode::UNAUTHORIZED,
             &json!({"error": {"code": "auth_failed"}}),
-        );
+        )
+        .render_anthropic();
         assert_eq!(body["error"]["type"], "authentication_error");
         assert_eq!(body["error"]["message"], "auth_failed");
 
-        let body = convert_chat_error_body(http::StatusCode::BAD_GATEWAY, &json!({"error": {}}));
+        let body = ApiErrorIr::parse(http::StatusCode::BAD_GATEWAY, &json!({"error": {}}))
+            .render_anthropic();
         assert_eq!(body["error"]["type"], "api_error");
     }
 

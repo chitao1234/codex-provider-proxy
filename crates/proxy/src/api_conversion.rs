@@ -14,8 +14,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 pub use codex_provider_proxy_api_conversion::dialect::DownstreamApi;
 use codex_provider_proxy_api_conversion::dialect::{ModelCapabilities, UpstreamApi};
+use codex_provider_proxy_api_conversion::error::ApiErrorIr;
 use codex_provider_proxy_api_conversion::error::ConversionError;
-use codex_provider_proxy_api_conversion::error::{convert_chat_error_body, ApiErrorIr};
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 use codex_provider_proxy_api_conversion::request_adapter::{RequestAdapter, RequestAdapterKind};
 use codex_provider_proxy_api_conversion::request_ir::Protocol;
@@ -421,7 +421,7 @@ pub fn convert_error_body(status: StatusCode, body: &Value, pipeline: ResponsePi
         return body.clone();
     }
     match pipeline.target {
-        DownstreamApi::AnthropicMessages => convert_chat_error_body(status, body),
+        DownstreamApi::AnthropicMessages => ApiErrorIr::parse(status, body).render_anthropic(),
         DownstreamApi::OpenAiResponses => ApiErrorIr::parse(status, body).render_openai(),
     }
 }

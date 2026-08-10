@@ -147,14 +147,14 @@ pub fn object(body: &Value) -> Result<&Map<String, Value>, ConversionError> {
         .ok_or_else(|| ConversionError::invalid("request body is not a JSON object"))
 }
 
-pub fn base_request(body: &Map<String, Value>) -> RequestIr {
+pub fn base_request(body: &Map<String, Value>, source_protocol: &str) -> RequestIr {
     RequestIr {
         model: body.get("model").and_then(Value::as_str).map(str::to_owned),
         stream: body.get("stream").and_then(Value::as_bool),
         generation: parse_generation(body),
-        state: parse_state(body),
+        state: parse_state(body, source_protocol),
         tools: parse_tools(body),
-        opaque: parse_opaque(body),
+        opaque: parse_opaque(body, source_protocol),
         ..RequestIr::default()
     }
 }
@@ -180,7 +180,7 @@ pub fn parse_generation(body: &Map<String, Value>) -> GenerationControls {
     }
 }
 
-pub fn parse_state(body: &Map<String, Value>) -> ConversationState {
+pub fn parse_state(body: &Map<String, Value>, source_protocol: &str) -> ConversationState {
     let conversation = body.get("conversation").cloned();
     let user_id = body
         .get("user")
@@ -246,7 +246,9 @@ pub fn parse_state(body: &Map<String, Value>) -> ConversationState {
         truncation: body.get("truncation").cloned(),
         extensions: represented
             .iter()
-            .map(|(key, value)| extension("state", key, value, ExtensionScope::State))
+            .map(|(key, value)| {
+                extension("state", key, value, ExtensionScope::State, source_protocol)
+            })
             .collect(),
     }
 }
@@ -392,19 +394,25 @@ pub fn parse_tool_result(object: &Map<String, Value>) -> ToolResult {
     }
 }
 
-pub fn extension(namespace: &str, key: &str, value: &Value, scope: ExtensionScope) -> Extension {
+pub fn extension(
+    namespace: &str,
+    key: &str,
+    value: &Value,
+    scope: ExtensionScope,
+    source_protocol: &str,
+) -> Extension {
     Extension {
         namespace: namespace.to_owned(),
         key: key.to_owned(),
         value: value.clone(),
         scope,
-        source_protocol: None,
+        source_protocol: Some(source_protocol.to_owned()),
         provider: None,
         replay: ReplayPolicy::ReplayAsTargetOpaque,
     }
 }
 
-pub fn parse_opaque(body: &Map<String, Value>) -> Vec<Extension> {
+pub fn parse_opaque(body: &Map<String, Value>, source_protocol: &str) -> Vec<Extension> {
     let structural = BTreeSet::from([
         "model",
         "stream",
@@ -444,7 +452,7 @@ pub fn parse_opaque(body: &Map<String, Value>) -> Vec<Extension> {
     ]);
     body.iter()
         .filter(|(key, _)| !structural.contains(key.as_str()) && !is_state_extension(key))
-        .map(|(key, value)| extension("wire", key, value, ExtensionScope::Request))
+        .map(|(key, value)| extension("wire", key, value, ExtensionScope::Request, source_protocol))
         .collect()
 }
 
