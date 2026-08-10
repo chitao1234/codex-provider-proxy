@@ -38,32 +38,3 @@ fn substitute_search_query(value: &mut Value, replacement: &str) {
         }
     }
 }
-
-pub fn format_url_citations(annotations: Option<&Value>) -> Option<String> {
-    let Value::Array(items) = annotations? else {
-        return None;
-    };
-    let citations: Vec<String> = items
-        .iter()
-        .filter_map(|item| {
-            let object = item.as_object()?;
-            if object.get("type").and_then(Value::as_str) != Some("url_citation") {
-                return None;
-            }
-            let url = object
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let title = object
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            Some(if title.is_empty() {
-                url.to_owned()
-            } else {
-                format!("{title}: {url}")
-            })
-        })
-        .collect();
-    (!citations.is_empty()).then(|| format!("Sources:\n{}", citations.join("\n")))
-}

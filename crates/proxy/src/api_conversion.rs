@@ -363,7 +363,9 @@ fn normalize_rendered_request(
         && target == Protocol::OpenAiResponses
     {
         if let Some(object) = request.as_object_mut() {
-            codex_provider_proxy_api_conversion::responses::apply_ark_style_to_responses(object);
+            codex_provider_proxy_api_conversion::protocols::openai_responses::normalizer::apply_ark(
+                object,
+            );
         }
     }
 }

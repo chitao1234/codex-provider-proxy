@@ -454,33 +454,6 @@ impl RequestIr {
             .collect();
     }
 
-    pub(crate) fn append_assistant_output(
-        &mut self,
-        content: Vec<IrContent>,
-        item_id: Option<String>,
-        status: Option<String>,
-        tool_calls: Vec<IrToolCall>,
-        opaque_extensions: Map<String, Value>,
-    ) {
-        if content.is_empty() && tool_calls.is_empty() && opaque_extensions.is_empty() {
-            return;
-        }
-        self.transcript.push(IrConversationItem::Message(IrMessage {
-            role: "assistant".to_owned(),
-            content,
-            item_id,
-            status,
-            tool_call_id: None,
-            tool_calls,
-            opaque_extensions,
-        }));
-    }
-
-    pub(crate) fn append_extension_item(&mut self, namespace: String, value: Value) {
-        self.transcript
-            .push(IrConversationItem::Extension { namespace, value });
-    }
-
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }

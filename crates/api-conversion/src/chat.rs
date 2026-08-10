@@ -71,11 +71,6 @@ pub fn first_choice(body: &Value) -> Option<&Value> {
         .and_then(|choices| choices.first())
 }
 
-/// `choices[0].message` if present.
-pub fn first_choice_message(body: &Value) -> Option<&Value> {
-    first_choice(body).and_then(|choice| choice.get("message"))
-}
-
 /// `choices[0].delta` if present.
 pub fn first_choice_delta(body: &Value) -> Option<&Value> {
     first_choice(body).and_then(|choice| choice.get("delta"))
@@ -103,14 +98,6 @@ pub fn upstream_id(body: &Value) -> Option<&str> {
 /// The upstream model name.
 pub fn upstream_model(body: &Value) -> Option<&str> {
     body.get("model").and_then(Value::as_str)
-}
-
-/// A non-empty string field of a chunk delta (DeepSeek sends explicit `null` for content).
-pub fn delta_string<'a>(delta: &'a Value, field: &str) -> Option<&'a str> {
-    delta
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -192,13 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn identifies_usage_only_chunk_and_deltas() {
+    fn identifies_usage_only_chunk() {
         assert!(is_usage_only_chunk(
             &json!({"choices": [], "usage": {"prompt_tokens": 1}})
         ));
         assert!(!is_usage_only_chunk(&json!({"choices": [{"index": 0}]})));
-        let delta = json!({"content": null, "reasoning_content": "We"});
-        assert_eq!(delta_string(&delta, "content"), None);
-        assert_eq!(delta_string(&delta, "reasoning_content"), Some("We"));
     }
 }

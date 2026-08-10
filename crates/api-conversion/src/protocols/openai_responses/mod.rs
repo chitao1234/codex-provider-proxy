@@ -1,3 +1,4 @@
+pub mod normalizer;
 pub mod parser;
 pub mod renderer;
 pub mod request;

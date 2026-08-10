@@ -1,22 +1,16 @@
-//! Ark-specific normalization for rendered OpenAi Responses requests.
-
 use serde_json::{json, Map, Value};
 
-/// Apply Ark-style parameter normalization to a rendered Responses request object.
-///
-/// - `reasoning.effort` -> Ark `thinking: {"type": "enabled"|"disabled"}`.
-/// - web_search tools: `search_context_size` -> `max_keyword`.
-pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
+pub fn apply_ark(request: &mut Map<String, Value>) {
     let effort = request
         .get("reasoning")
         .and_then(Value::as_object)
         .and_then(|reasoning| reasoning.get("effort"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let Some(effort) = &effort {
+    if let Some(effort) = effort {
         request.insert(
             "thinking".to_owned(),
-            json!({"type": ark_thinking_type(effort)}),
+            json!({"type": ark_thinking_type(&effort)}),
         );
         request.remove("reasoning");
     }
@@ -41,7 +35,7 @@ pub fn apply_ark_style_to_responses(request: &mut Map<String, Value>) {
             }
         }
     }
-    normalize_ark_web_search_tools(request);
+    normalize_web_search_tools(request);
 }
 
 fn ark_thinking_type(effort: &str) -> &'static str {
@@ -52,7 +46,7 @@ fn ark_thinking_type(effort: &str) -> &'static str {
     }
 }
 
-fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
+fn normalize_web_search_tools(request: &mut Map<String, Value>) {
     let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
         return;
     };
@@ -63,8 +57,8 @@ fn normalize_ark_web_search_tools(request: &mut Map<String, Value>) {
         let kind = object
             .get("type")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_owned();
         if kind != "web_search" && kind != "web_search_preview" && !kind.starts_with("web_search_")
         {
             continue;

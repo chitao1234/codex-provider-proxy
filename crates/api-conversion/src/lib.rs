@@ -9,21 +9,12 @@
 //! crate owns networking, routing, configuration, and logging.
 
 pub(crate) mod chat;
-pub mod chat_parser;
 pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
 pub mod ir;
-pub mod messages_parser;
-pub mod messages_renderer;
 pub mod protocols;
 pub mod request_adapter;
 pub mod request_ir;
-pub mod response_adapter;
-pub mod response_ir;
-pub mod responses;
-pub mod responses_parser;
-pub mod responses_renderer;
 pub(crate) mod server_tools;
 pub mod sse;
-pub mod stream;
