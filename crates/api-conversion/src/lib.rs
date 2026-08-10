@@ -13,6 +13,7 @@ pub mod chat_parser;
 pub(crate) mod conversion_utils;
 pub mod dialect;
 pub mod error;
+pub mod ir;
 pub mod messages_parser;
 pub mod messages_renderer;
 pub mod request_ir;
