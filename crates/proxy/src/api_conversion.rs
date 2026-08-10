@@ -18,7 +18,7 @@ use codex_provider_proxy_api_conversion::error::ApiErrorIr;
 use codex_provider_proxy_api_conversion::error::ConversionError;
 use codex_provider_proxy_api_conversion::ir::ResponseAccumulator;
 pub use codex_provider_proxy_api_conversion::plan::{
-    ContinuationPolicy, ConversionPlan, RequestAction, ResponsePipeline, StreamPolicy,
+    ConversionPlan, RequestAction, ResponsePipeline, StreamPolicy,
 };
 use codex_provider_proxy_api_conversion::protocol::Protocol;
 use codex_provider_proxy_api_conversion::provider_normalizer::RequestNormalizerKind;
@@ -202,22 +202,14 @@ pub fn convert_request_body_with_plan(
             {
                 return Ok(body);
             }
-            let request = match plan.continuation {
-                ContinuationPolicy::None => plan.request_parser.parse(&json),
-                ContinuationPolicy::ResponsesState => {
-                    plan.request_parser
-                        .parse_with_context(&json, previous_request, last_reasoning)
-                }
-            }
-            .map_err(|err| {
+            let request = plan
+                .parse_request(&json, previous_request, last_reasoning)
+                .map_err(|err| {
+                    RequestConversionRejected::from_conversion_error(err, plan.downstream)
+                })?;
+            let rendered_request = plan.render_request(&request, &caps).map_err(|err| {
                 RequestConversionRejected::from_conversion_error(err, plan.downstream)
             })?;
-            let rendered_request =
-                plan.request_renderer
-                    .render(&request, &caps)
-                    .map_err(|err| {
-                        RequestConversionRejected::from_conversion_error(err, plan.downstream)
-                    })?;
             let rendered = rendered_request.body;
             let report = rendered_request.report;
             let rendered = if let Some(normalizer) = pipeline.normalizer {
@@ -577,7 +569,9 @@ pub fn strip_converted_response_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
-    use codex_provider_proxy_api_conversion::plan::{ExtensionPolicy, RequestPipeline};
+    use codex_provider_proxy_api_conversion::plan::{
+        ContinuationPolicy, ExtensionPolicy, RequestPipeline,
+    };
     use codex_provider_proxy_api_conversion::request::{RequestParserKind, RequestRendererKind};
     use futures_util::{stream, StreamExt};
 

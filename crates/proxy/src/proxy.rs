@@ -1475,13 +1475,12 @@ fn maybe_convert_request_body(
             )
         })?;
         Some(
-            plan.request_parser
-                .parse_with_context(
-                    &value,
-                    previous_state.as_ref().map(|previous| &previous.request_ir),
-                    last_reasoning,
-                )
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+            plan.parse_request(
+                &value,
+                previous_state.as_ref().map(|previous| &previous.request_ir),
+                last_reasoning,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
         )
     } else {
         None

@@ -1,9 +1,12 @@
 use crate::{
     dialect::{DownstreamApi, UpstreamApi},
+    error::ConversionError,
+    ir::RequestIr,
     protocol::Protocol,
     provider_normalizer::RequestNormalizerKind,
-    request::{RequestParserKind, RequestRendererKind},
+    request::{RenderedRequest, RequestParserKind, RequestRendererKind},
 };
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPipeline {
@@ -99,6 +102,35 @@ impl ConversionPlan {
                 StreamPolicy::Passthrough
             },
             extensions: ExtensionPolicy::PreserveScopedOpaque,
+        }
+    }
+
+    pub fn parse_request(
+        self,
+        body: &Value,
+        previous: Option<&RequestIr>,
+        last_reasoning: Option<&str>,
+    ) -> Result<RequestIr, ConversionError> {
+        match self.extensions {
+            ExtensionPolicy::PreserveScopedOpaque => match self.continuation {
+                ContinuationPolicy::None => self.request_parser.parse(body),
+                ContinuationPolicy::ResponsesState => {
+                    self.request_parser
+                        .parse_with_context(body, previous, last_reasoning)
+                }
+            },
+        }
+    }
+
+    pub fn render_request(
+        self,
+        request: &RequestIr,
+        capabilities: &crate::dialect::ModelCapabilities,
+    ) -> Result<RenderedRequest, ConversionError> {
+        match self.extensions {
+            ExtensionPolicy::PreserveScopedOpaque => {
+                self.request_renderer.render(request, capabilities)
+            }
         }
     }
 }
