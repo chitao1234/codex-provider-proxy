@@ -7,8 +7,8 @@ use crate::{
     error::ConversionError,
     ir::{
         CacheIdentity, ContentPart, ConversationState, Extension, ExtensionScope,
-        GenerationControls, Identity, ReplayPolicy, RequestIr, ToolCall, ToolDefinition,
-        ToolResult,
+        GenerationControls, Identity, ReplayPolicy, RequestIr, StateProvenance, StateSlot,
+        ToolCall, ToolDefinition, ToolResult,
     },
 };
 
@@ -182,53 +182,92 @@ pub fn parse_generation(body: &Map<String, Value>) -> GenerationControls {
 
 pub fn parse_state(body: &Map<String, Value>, source_protocol: &str) -> ConversationState {
     let conversation = body.get("conversation").cloned();
-    let user_id = body
-        .get("user")
-        .or_else(|| body.get("user_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let user_source = [("user", body.get("user")), ("user_id", body.get("user_id"))]
+        .into_iter()
+        .find_map(|(field, value)| value.and_then(Value::as_str).map(|value| (field, value)))
         .or_else(|| {
             body.get("metadata")
                 .and_then(|metadata| metadata.get("user_id"))
                 .and_then(Value::as_str)
-                .map(str::to_owned)
+                .map(|value| ("metadata.user_id", value))
         });
-    let cache_key = body
+    let user_id = user_source.map(|(_, value)| value.to_owned());
+    let cache_source = body
         .get("prompt_cache_key")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| user_id.clone());
+        .map(|value| ("prompt_cache_key", value))
+        .or(user_source);
+    let cache_key = cache_source.map(|(_, value)| value.to_owned());
     let represented = body
         .iter()
         .filter(|(key, _)| is_state_extension(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    let logical_conversation_id = conversation.as_ref().and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+    });
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let session_source = represented.iter().find_map(|(key, value)| {
+        key.to_ascii_lowercase()
+            .ends_with("session_id")
+            .then(|| value.as_str().map(|value| (key.as_str(), value)))
+            .flatten()
+    });
+    let mut provenance = Vec::new();
+    if logical_conversation_id.is_some() {
+        provenance.push(state_provenance(
+            StateSlot::ConversationId,
+            source_protocol,
+            "conversation",
+        ));
+    }
+    if previous_response_id.is_some() {
+        provenance.push(state_provenance(
+            StateSlot::PreviousResponseId,
+            source_protocol,
+            "previous_response_id",
+        ));
+    }
+    if let Some((field, _)) = user_source {
+        provenance.push(state_provenance(StateSlot::UserId, source_protocol, field));
+    }
+    if let Some((field, _)) = session_source {
+        provenance.push(state_provenance(
+            StateSlot::SessionId,
+            source_protocol,
+            field,
+        ));
+    }
+    if let Some((field, _)) = cache_source {
+        provenance.push(state_provenance(
+            StateSlot::CacheKey,
+            source_protocol,
+            field,
+        ));
+    }
+    if body.get("safety_identifier").is_some() {
+        provenance.push(state_provenance(
+            StateSlot::SafetyIdentifier,
+            source_protocol,
+            "safety_identifier",
+        ));
+    }
     ConversationState {
-        logical_conversation_id: conversation.as_ref().and_then(|value| {
-            value
-                .as_str()
-                .or_else(|| value.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-        }),
+        logical_conversation_id: logical_conversation_id.clone(),
         conversation,
-        source_response_id: body
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        source_response_id: previous_response_id.clone(),
         target_response_ids: BTreeMap::new(),
         identity: Identity {
-            conversation_id: None,
+            conversation_id: logical_conversation_id,
             user_id,
-            session_id: represented.iter().find_map(|(key, value)| {
-                key.to_ascii_lowercase()
-                    .ends_with("session_id")
-                    .then(|| value.as_str().map(str::to_owned))
-                    .flatten()
-            }),
-            response_id: body
-                .get("previous_response_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            session_id: session_source.map(|(_, value)| value.to_owned()),
+            response_id: previous_response_id,
         },
         cache: CacheIdentity {
             key: cache_key,
@@ -244,12 +283,22 @@ pub fn parse_state(body: &Map<String, Value>, source_protocol: &str) -> Conversa
         store: body.get("store").cloned(),
         include: body.get("include").cloned(),
         truncation: body.get("truncation").cloned(),
+        provenance,
         extensions: represented
             .iter()
             .map(|(key, value)| {
                 extension("state", key, value, ExtensionScope::State, source_protocol)
             })
             .collect(),
+    }
+}
+
+fn state_provenance(slot: StateSlot, source_protocol: &str, source_field: &str) -> StateProvenance {
+    StateProvenance {
+        slot,
+        source_protocol: source_protocol.to_owned(),
+        source_field: source_field.to_owned(),
+        replay: ReplayPolicy::ReplayIfSupported,
     }
 }
 

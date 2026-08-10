@@ -2,7 +2,29 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{cache::CacheIdentity, extension::Extension, identity::Identity};
+use super::{
+    cache::CacheIdentity,
+    extension::{Extension, ReplayPolicy},
+    identity::Identity,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSlot {
+    ConversationId,
+    PreviousResponseId,
+    UserId,
+    SessionId,
+    CacheKey,
+    SafetyIdentifier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateProvenance {
+    pub slot: StateSlot,
+    pub source_protocol: String,
+    pub source_field: String,
+    pub replay: ReplayPolicy,
+}
 
 /// Immutable state carried between requests in a stateful protocol conversation.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -18,6 +40,7 @@ pub struct ConversationState {
     pub store: Option<Value>,
     pub include: Option<Value>,
     pub truncation: Option<Value>,
+    pub provenance: Vec<StateProvenance>,
     pub extensions: Vec<Extension>,
 }
 

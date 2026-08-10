@@ -5,7 +5,7 @@ use codex_provider_proxy_api_conversion::{
         MaxTokensField, ModelCapabilities, ReasoningEffortConfig, ResponseFormatCap,
         ServerToolPolicy, ThinkingParam,
     },
-    ir::ContentItem,
+    ir::{ContentItem, StateSlot},
     protocol::Protocol,
     request::{RequestParserKind, RequestRendererKind},
 };
@@ -172,6 +172,16 @@ fn v2_state_rendering_respects_cache_and_identity_capabilities() {
     assert_eq!(responses["safety_identifier"], "safety-1");
     assert_eq!(responses["metadata"]["tenant"], "workspace");
     assert_eq!(responses["store"], false);
+    assert!(request.state.provenance.iter().any(|entry| {
+        entry.slot == StateSlot::CacheKey
+            && entry.source_protocol == "openai_responses"
+            && entry.source_field == "prompt_cache_key"
+    }));
+    assert!(request.state.provenance.iter().any(|entry| {
+        entry.slot == StateSlot::UserId
+            && entry.source_protocol == "openai_responses"
+            && entry.source_field == "user"
+    }));
 
     let chat = RequestRendererKind::OpenAiChatCompletions
         .render(&request, &capabilities)

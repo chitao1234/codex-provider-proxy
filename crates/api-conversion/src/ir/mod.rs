@@ -17,7 +17,7 @@ pub use identity::Identity;
 pub use request::{GenerationControls, RequestIr};
 pub use response::{ResponseIr, Usage};
 pub use response_core::ResponseAccumulator;
-pub use state::ConversationState;
+pub use state::{ConversationState, StateProvenance, StateSlot};
 pub use stop_reason::StopReason;
 pub use streaming::{CanonicalResponseEvent, CoreUpdate, ItemKind, ResponseSnapshot};
 pub use tools::{ToolCall, ToolDefinition, ToolResult};

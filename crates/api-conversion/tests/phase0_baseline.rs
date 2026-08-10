@@ -2,7 +2,9 @@ use std::fs;
 
 use codex_provider_proxy_api_conversion::{
     dialect::ModelCapabilities,
-    ir::{CanonicalResponseEvent, ContentPart, ResponseAccumulator, ResponseIr, StopReason},
+    ir::{
+        CanonicalResponseEvent, ContentPart, ResponseAccumulator, ResponseIr, StateSlot, StopReason,
+    },
     protocol::Protocol,
     protocols::{self, anthropic_messages, openai_chat_completions, openai_responses},
     request::{RequestParserKind, RequestRendererKind},
@@ -119,6 +121,16 @@ fn phase0_state_and_cache_identity_mapping_is_explicit() {
         .body;
     assert_eq!(responses["previous_response_id"], "resp_phase0");
     assert_eq!(responses["prompt_cache_key"], "phase0-cache");
+    assert!(continued.state.provenance.iter().any(|entry| {
+        entry.slot == StateSlot::CacheKey
+            && entry.source_protocol == "openai_responses"
+            && entry.source_field == "prompt_cache_key"
+    }));
+    assert!(continued.state.provenance.iter().any(|entry| {
+        entry.slot == StateSlot::PreviousResponseId
+            && entry.source_protocol == "openai_responses"
+            && entry.source_field == "previous_response_id"
+    }));
 
     let messages = RequestRendererKind::AnthropicMessages
         .render(&continued, &ModelCapabilities::default())

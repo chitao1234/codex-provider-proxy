@@ -156,4 +156,11 @@ fn inherit_state(
         .chain(&current.extensions)
         .cloned()
         .collect();
+    let mut provenance = previous.provenance.clone();
+    for entry in &current.provenance {
+        if !provenance.contains(entry) {
+            provenance.push(entry.clone());
+        }
+    }
+    current.provenance = provenance;
 }
