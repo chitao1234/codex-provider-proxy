@@ -776,8 +776,14 @@ accept_downstream_apis = ["openai_responses"]
             .expect("assistant message present");
         let block = &assistant["content"][0];
         assert_eq!(block["type"], "thinking");
-        assert!(block["thinking"].as_str().unwrap().contains("think step one"));
-        assert!(block["thinking"].as_str().unwrap().contains("think step two"));
+        assert!(block["thinking"]
+            .as_str()
+            .unwrap()
+            .contains("think step one"));
+        assert!(block["thinking"]
+            .as_str()
+            .unwrap()
+            .contains("think step two"));
         // No `reasoning` block leaks through.
         assert!(assistant["content"]
             .as_array()
@@ -1337,5 +1343,50 @@ accept_downstream_apis = ["openai_responses"]
         let error = converted.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("conversion limit"));
+    }
+}
+
+#[test]
+fn empty_reasoning_summary_does_not_emit_null_block() {
+    // Codex sends an empty reasoning shell (`{"summary":[]}`) when the model
+    // produced no thinking; it must not become a `[null]` content block in the
+    // Messages request (MiMo rejects invalid blocks).
+    let config = Config::from_toml_str(
+        r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "reasoning", "summary": [], "content": null, "encrypted_content": null},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+        ]
+    });
+    let converted = convert_request_body(
+        &config,
+        "mimo",
+        "/v1/responses",
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+        None,
+    )
+    .unwrap();
+    let converted: Value = serde_json::from_slice(&converted).unwrap();
+    for message in converted["messages"].as_array().unwrap() {
+        let content = message.get("content");
+        if let Some(blocks) = content.and_then(Value::as_array) {
+            for block in blocks {
+                assert!(!block.is_null(), "no null block: {}", message);
+            }
+        }
     }
 }

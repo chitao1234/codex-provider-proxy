@@ -65,9 +65,16 @@ pub(crate) fn render_usage(usage: &crate::ir::Usage) -> Value {
             .zip(usage.output_tokens)
             .and_then(|(input, output)| input.checked_add(output))
     });
-    rendered.insert("total_tokens".to_owned(), serde_json::json!(total.unwrap_or(0)));
+    rendered.insert(
+        "total_tokens".to_owned(),
+        serde_json::json!(total.unwrap_or(0)),
+    );
     let mut input_details = serde_json::Map::new();
-    insert_details(&mut input_details, "cached_tokens", usage.cached_input_tokens);
+    insert_details(
+        &mut input_details,
+        "cached_tokens",
+        usage.cached_input_tokens,
+    );
     insert_details(
         &mut input_details,
         "cache_write_tokens",

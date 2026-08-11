@@ -593,15 +593,12 @@ pub fn replay_content_extensions(
     keep_cache_control: bool,
 ) -> Value {
     if let Some(object) = rendered.as_object_mut() {
-        let extensions = part
-            .extensions()
-            .iter()
-            .filter(|extension| {
-                // Block-level cache_control is only kept for upstreams that support it
-                // (MiniMax anthropic endpoint, Qwen); it is stripped otherwise so it
-                // never leaks to an upstream that would reject or silently ignore it.
-                keep_cache_control || extension.key != "cache_control"
-            });
+        let extensions = part.extensions().iter().filter(|extension| {
+            // Block-level cache_control is only kept for upstreams that support it
+            // (MiniMax anthropic endpoint, Qwen); it is stripped otherwise so it
+            // never leaks to an upstream that would reject or silently ignore it.
+            keep_cache_control || extension.key != "cache_control"
+        });
         replay_scoped_extensions(object, extensions, &[ExtensionScope::ContentPart]);
     }
     rendered

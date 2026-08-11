@@ -309,7 +309,11 @@ fn render_input_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Va
         }
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
+    request_support::replay_content_extensions(
+        rendered,
+        part,
+        capabilities.cache.block_cache_control,
+    )
 }
 
 fn render_summary_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
@@ -320,7 +324,11 @@ fn render_summary_part(part: &ContentPart, capabilities: &ModelCapabilities) -> 
         ContentPart::Json(value) => value.clone(),
         other => render_input_part(other, capabilities),
     };
-    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
+    request_support::replay_content_extensions(
+        rendered,
+        part,
+        capabilities.cache.block_cache_control,
+    )
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {

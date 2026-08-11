@@ -51,10 +51,20 @@ pub fn render(
                 ));
             }
             ContentItem::Reasoning { content, .. } => {
+                // Empty reasoning shells (Codex sends `{"summary":[]}` when the model
+                // produced no thinking) render to no blocks and are skipped entirely;
+                // a `[null]` content block is invalid for Messages upstreams (MiMo 400).
+                let blocks: Vec<Value> = content
+                    .iter()
+                    .filter_map(|p| render_thinking_part(p, capabilities))
+                    .collect();
+                if blocks.is_empty() {
+                    continue;
+                }
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": "assistant",
-                        "content": content.iter().map(|p| render_thinking_part(p, capabilities)).collect::<Vec<_>>(),
+                        "content": blocks,
                     }),
                     item,
                 ))
@@ -228,18 +238,23 @@ fn render_content_part(part: &ContentPart, capabilities: &ModelCapabilities) -> 
         ContentPart::Json(value) => value.clone(),
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
+    request_support::replay_content_extensions(
+        rendered,
+        part,
+        capabilities.cache.block_cache_control,
+    )
 }
 
-fn render_thinking_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Value {
+fn render_thinking_part(part: &ContentPart, capabilities: &ModelCapabilities) -> Option<Value> {
     match part.semantic() {
         // A Responses reasoning item (`{"type":"reasoning","summary":[{"type":
         // "summary_text","text":...}]}`) becomes an Anthropic thinking block; the
-        // Messages dialect has no `reasoning` content type (MiMo rejects it).
+        // Messages dialect has no `reasoning` content type (MiMo rejects it). An
+        // empty summary produces no block.
         ContentPart::Json(value) => {
             let is_reasoning_item = value.get("type").and_then(Value::as_str) == Some("reasoning");
             if !is_reasoning_item {
-                return value.clone();
+                return Some(value.clone());
             }
             let text = value
                 .get("summary")
@@ -249,12 +264,12 @@ fn render_thinking_part(part: &ContentPart, capabilities: &ModelCapabilities) ->
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if text.is_empty() {
-                return Value::Null;
+            if text.trim().is_empty() {
+                return None;
             }
-            serde_json::json!({"type": "thinking", "thinking": text})
+            Some(serde_json::json!({"type": "thinking", "thinking": text}))
         }
-        _ => render_content_part(part, capabilities),
+        _ => Some(render_content_part(part, capabilities)),
     }
 }
 

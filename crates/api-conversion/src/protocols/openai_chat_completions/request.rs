@@ -94,14 +94,17 @@ pub fn render(
                 messages.push(request_support::replay_item_extensions(message, item));
             }
             ContentItem::Reasoning { content, .. } => {
-                pending_reasoning = Some((
-                    content
-                        .iter()
-                        .filter_map(text_part)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    item.extensions().to_vec(),
-                ));
+                // An empty reasoning shell produces no reasoning_content; attaching
+                // an empty one is meaningless to upstreams that require it non-empty
+                // (MiMo/DeepSeek on tool-call turns).
+                let text = content
+                    .iter()
+                    .filter_map(text_part)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    pending_reasoning = Some((text, item.extensions().to_vec()));
+                }
             }
             ContentItem::Refusal { content, .. } => messages.push(
                 request_support::replay_item_extensions(
@@ -353,7 +356,11 @@ fn render_content_part(part: &ContentPart, capabilities: &ModelCapabilities) -> 
         ContentPart::Json(value) => value.clone(),
         ContentPart::Extended { .. } => unreachable!("semantic content is never extended"),
     };
-    request_support::replay_content_extensions(rendered, part, capabilities.cache.block_cache_control)
+    request_support::replay_content_extensions(
+        rendered,
+        part,
+        capabilities.cache.block_cache_control,
+    )
 }
 
 fn render_tool_call(id: Option<&str>, call: &ToolCall) -> Value {
