@@ -34,6 +34,10 @@ pub fn render(
         .flat_map(content_item_text)
         .collect::<Vec<_>>();
     let mut messages = Vec::new();
+    // Pending assistant content blocks awaiting completion: Anthropic requires the
+    // thinking block to accompany its tool_use in the same assistant message, and
+    // Codex sends reasoning and function_call as separate input items.
+    let mut pending_assistant: Vec<Value> = Vec::new();
     for item in &request.transcript {
         match item {
             ContentItem::Message { role, content, .. }
@@ -42,6 +46,16 @@ pub fn render(
                 system_parts.extend(content.iter().filter_map(text_part));
             }
             ContentItem::Message { role, content, .. } => {
+                // An assistant message immediately following a pending reasoning
+                // belongs to the same turn (Codex interleaves reasoning, then the
+                // assistant text, then function_call); it joins the pending message
+                // so thinking + text + tool_use stay in one assistant message.
+                if normalize_role(role) == "assistant" && !pending_assistant.is_empty() {
+                    pending_assistant
+                        .extend(content.iter().map(|p| render_content_part(p, capabilities)));
+                    continue;
+                }
+                flush_pending_assistant(&mut messages, &mut pending_assistant);
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": normalize_role(role),
@@ -61,15 +75,12 @@ pub fn render(
                 if blocks.is_empty() {
                     continue;
                 }
-                messages.push(request_support::replay_item_extensions(
-                    serde_json::json!({
-                        "role": "assistant",
-                        "content": blocks,
-                    }),
-                    item,
-                ))
+                // Accumulate into the pending assistant message; a following tool_use
+                // joins it (Anthropic: thinking must accompany its tool_use).
+                pending_assistant.extend(blocks);
             }
             ContentItem::Refusal { content, .. } => {
+                flush_pending_assistant(&mut messages, &mut pending_assistant);
                 messages.push(request_support::replay_item_extensions(
                     serde_json::json!({
                         "role": "assistant",
@@ -78,21 +89,25 @@ pub fn render(
                     item,
                 ))
             }
-            ContentItem::ToolUse { id, call } => messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": [render_tool_use(id.as_deref(), call)],
-            })),
-            ContentItem::ToolResult { result } => messages.push(serde_json::json!({
-                "role": "user",
-                "content": [render_tool_result(result, capabilities)],
-            })),
+            ContentItem::ToolUse { id, call } => {
+                pending_assistant.push(render_tool_use(id.as_deref(), call));
+            }
+            ContentItem::ToolResult { result } => {
+                flush_pending_assistant(&mut messages, &mut pending_assistant);
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [render_tool_result(result, capabilities)],
+                }));
+            }
             ContentItem::ServerTool { payload, .. } | ContentItem::Unknown { payload, .. } => {
                 if payload.is_object() {
+                    flush_pending_assistant(&mut messages, &mut pending_assistant);
                     messages.push(serde_json::json!({"role": "assistant", "content": [payload]}));
                 }
             }
         }
     }
+    flush_pending_assistant(&mut messages, &mut pending_assistant);
     if !system_parts.is_empty() {
         output.insert(
             "system".to_owned(),
@@ -115,6 +130,20 @@ pub fn render(
         output.insert("tool_choice".to_owned(), render_tool_choice(choice));
     }
     Ok((Value::Object(output), report))
+}
+
+/// Emit the accumulated assistant blocks (thinking + tool_use) as one assistant
+/// message when the pending turn completes (a user message, tool result, or the end
+/// of the transcript). Anthropic requires thinking to accompany its tool_use in the
+/// same assistant message.
+fn flush_pending_assistant(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
+    if pending.is_empty() {
+        return;
+    }
+    messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": std::mem::take(pending),
+    }));
 }
 
 fn opaque_root(request: &RequestIr) -> Map<String, Value> {

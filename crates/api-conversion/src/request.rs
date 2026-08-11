@@ -64,14 +64,25 @@ impl RequestParserKind {
                     .iter()
                     .any(|item| matches!(item, crate::ir::ContentItem::Reasoning { .. }));
                 if !has_reasoning {
-                    request.transcript.push(crate::ir::ContentItem::Reasoning {
+                    // Reattach the reasoning at the position of the assistant turn it
+                    // belongs to: immediately before the first function_call_output of
+                    // the current continuation (the tool result of that turn). Appending
+                    // at the end would leave an isolated thinking-only assistant message
+                    // between turns (Messages upstreams).
+                    let reasoning_item = crate::ir::ContentItem::Reasoning {
                         id: None,
                         content: vec![crate::ir::ContentPart::Reasoning {
                             text: reasoning.to_owned(),
                             signature: None,
                         }],
                         extensions: Vec::new(),
-                    });
+                    };
+                    let insert_at = request
+                        .transcript
+                        .iter()
+                        .position(|item| matches!(item, crate::ir::ContentItem::ToolResult { .. }))
+                        .unwrap_or(request.transcript.len());
+                    request.transcript.insert(insert_at, reasoning_item);
                 }
             }
         }

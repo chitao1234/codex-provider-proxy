@@ -1390,3 +1390,233 @@ accept_downstream_apis = ["openai_responses"]
         }
     }
 }
+
+#[test]
+fn reasoning_reattach_position_is_not_isolated_at_transcript_end() {
+    // Continuation with a reattached reasoning: the reattached reasoning must
+    // stay adjacent to its assistant turn, not end up as an isolated trailing
+    // item (which messages rendering turns into a lone thinking-only assistant
+    // message between turns).
+    let config = Config::from_toml_str(
+        r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+    )
+    .unwrap();
+    // Continuation request: function_call_output for the previous tool call plus
+    // the next user turn. The model produced no reasoning in the previous turn,
+    // so last_reasoning (remembered from an even earlier turn) must be reattached.
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]
+    });
+    let converted = convert_request_body(
+        &config,
+        "mimo",
+        "/v1/responses",
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+        Some("remembered thinking from earlier turn"),
+    )
+    .unwrap();
+    let converted: Value = serde_json::from_slice(&converted).unwrap();
+    let messages = converted["messages"].as_array().unwrap();
+    // The reattached reasoning must precede the function_call_output's tool
+    // result, i.e. it must not be the last message.
+    let last = messages.last().expect("messages present");
+    assert_ne!(
+        last["role"], "assistant",
+        "reattached reasoning must not be an isolated trailing assistant message"
+    );
+    // The thinking block appears somewhere in the transcript.
+    let thinking_blocks = messages
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "thinking")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thinking_blocks.len(),
+        1,
+        "reattached reasoning becomes one thinking block"
+    );
+    assert!(thinking_blocks[0]["thinking"]
+        .as_str()
+        .unwrap()
+        .contains("remembered thinking"));
+}
+
+#[test]
+fn reattached_reasoning_precedes_tool_result() {
+    let config = Config::from_toml_str(
+        r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]
+    });
+    let converted = convert_request_body(
+        &config,
+        "mimo",
+        "/v1/responses",
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+        Some("remembered"),
+    )
+    .unwrap();
+    let converted: Value = serde_json::from_slice(&converted).unwrap();
+    let messages = converted["messages"].as_array().unwrap();
+    // The thinking block is attached to the assistant message that precedes the
+    // tool_result user message — not an isolated trailing assistant.
+    let assistant_pos = messages
+        .iter()
+        .position(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "thinking"))
+        })
+        .expect("thinking block present");
+    assert_eq!(messages[assistant_pos]["role"], "assistant");
+    assert!(assistant_pos < messages.len() - 1, "not the last message");
+}
+
+#[test]
+fn reasoning_and_tool_use_merge_into_one_assistant_message() {
+    // Anthropic requires the thinking block to accompany its tool_use in the same
+    // assistant message; Codex sends reasoning and function_call as separate
+    // input items. The messages renderer must merge them.
+    let config = Config::from_toml_str(
+        r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]
+    });
+    let converted = convert_request_body(
+        &config,
+        "mimo",
+        "/v1/responses",
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+        None,
+    )
+    .unwrap();
+    let converted: Value = serde_json::from_slice(&converted).unwrap();
+    let messages = converted["messages"].as_array().unwrap();
+    // One assistant message carrying both thinking and tool_use.
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message present");
+    let blocks = assistant["content"].as_array().unwrap();
+    let types: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["type"].as_str())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["thinking", "tool_use"],
+        "merged into one message"
+    );
+    assert_eq!(assistant["content"][0]["thinking"], "think");
+    assert_eq!(assistant["content"][1]["name"], "f");
+    // tool_result in the following user message.
+    let tool_result = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+        })
+        .expect("tool_result present");
+    assert_eq!(tool_result["role"], "user");
+}
+
+#[test]
+fn reasoning_text_tool_use_merge_with_interleaved_assistant_message() {
+    // Codex interleaves: reasoning, then an assistant message (text), then
+    // function_call. All three belong to one assistant turn.
+    let config = Config::from_toml_str(
+        r#"
+default_provider = "mimo"
+listen_addr = "127.0.0.1:0"
+[providers.mimo]
+base_url = "https://api.example.com/"
+api_key = "test"
+upstream_api = "anthropic_messages"
+accept_downstream_apis = ["openai_responses"]
+"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "let me check"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]
+    });
+    let converted = convert_request_body(
+        &config,
+        "mimo",
+        "/v1/responses",
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+        None,
+    )
+    .unwrap();
+    let converted: Value = serde_json::from_slice(&converted).unwrap();
+    let messages = converted["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message present");
+    let types: Vec<&str> = assistant["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["type"].as_str())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["thinking", "text", "tool_use"],
+        "thinking + text + tool_use merged into one assistant message"
+    );
+}
