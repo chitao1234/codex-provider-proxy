@@ -58,17 +58,16 @@ pub(crate) fn render_usage(usage: &crate::ir::Usage) -> Value {
     };
     insert("input_tokens", usage.input_tokens);
     insert("output_tokens", usage.output_tokens);
-    // Codex requires total_tokens to be a number, never null and never absent.
-    let total = usage.total_tokens.or_else(|| {
+    // Codex requires total_tokens to be a number, never null and never absent. It is
+    // at least the reported input or output count; a missing counterpart must not
+    // collapse it to zero (an upstream reporting only input still consumed that many).
+    let total = usage.total_tokens.unwrap_or_else(|| {
         usage
             .input_tokens
-            .zip(usage.output_tokens)
-            .and_then(|(input, output)| input.checked_add(output))
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens.unwrap_or(0))
     });
-    rendered.insert(
-        "total_tokens".to_owned(),
-        serde_json::json!(total.unwrap_or(0)),
-    );
+    rendered.insert("total_tokens".to_owned(), serde_json::json!(total));
     let mut input_details = serde_json::Map::new();
     insert_details(
         &mut input_details,
@@ -236,4 +235,50 @@ fn replay_content_part_extensions(mut rendered: Value, part: &ContentPart) -> Va
         replay_scoped(object, part.extensions(), ExtensionScope::ContentPart);
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::Usage;
+
+    #[test]
+    fn usage_total_falls_back_to_either_token_count() {
+        // Missing input or output must not collapse total_tokens to zero.
+        let usage = Usage {
+            input_tokens: Some(100),
+            output_tokens: None,
+            total_tokens: None,
+            ..Usage::default()
+        };
+        let rendered = render_usage(&usage);
+        assert_eq!(rendered["total_tokens"], 100, "input-only fallback");
+        assert!(
+            rendered.get("output_tokens").is_none(),
+            "absent field omitted"
+        );
+
+        let usage = Usage {
+            input_tokens: None,
+            output_tokens: Some(5),
+            total_tokens: None,
+            ..Usage::default()
+        };
+        let rendered = render_usage(&usage);
+        assert_eq!(rendered["total_tokens"], 5, "output-only fallback");
+
+        // Explicit total wins; missing optional details are omitted, never null.
+        let usage = Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            total_tokens: Some(200),
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            ..Usage::default()
+        };
+        let rendered = render_usage(&usage);
+        assert_eq!(rendered["total_tokens"], 200);
+        assert!(rendered.get("input_tokens_details").is_none());
+        assert!(rendered.get("output_tokens_details").is_none());
+    }
 }

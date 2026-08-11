@@ -22,6 +22,29 @@ pub fn render(response: &ResponseIr) -> Value {
         }
         StopReason::Unknown(reason) => reason.clone(),
     });
+    let mut usage_out = serde_json::Map::new();
+    let mut insert = |key: &str, value: Option<u64>| {
+        if let Some(value) = value {
+            usage_out.insert(key.to_owned(), serde_json::json!(value));
+        }
+    };
+    insert("input_tokens", response.usage.input_tokens);
+    insert("output_tokens", response.usage.output_tokens);
+    insert("total_tokens", response.usage.total_tokens);
+    insert(
+        "cache_read_input_tokens",
+        response.usage.cached_input_tokens,
+    );
+    insert(
+        "cache_creation_input_tokens",
+        response.usage.cache_write_input_tokens,
+    );
+    if let Some(reasoning) = response.usage.reasoning_tokens {
+        usage_out.insert(
+            "output_tokens_details".to_owned(),
+            serde_json::json!({"thinking_tokens": reasoning}),
+        );
+    }
     let mut rendered = json!({
         "id": response_id,
         "type": "message",
@@ -29,14 +52,7 @@ pub fn render(response: &ResponseIr) -> Value {
         "model": response.model,
         "content": content,
         "stop_reason": stop_reason,
-        "usage": {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-            "total_tokens": response.usage.total_tokens,
-            "cache_read_input_tokens": response.usage.cached_input_tokens,
-            "cache_creation_input_tokens": response.usage.cache_write_input_tokens,
-            "output_tokens_details": {"thinking_tokens": response.usage.reasoning_tokens},
-        },
+        "usage": Value::Object(usage_out),
     });
     if let Some(usage) = rendered.get_mut("usage").and_then(Value::as_object_mut) {
         replay_scoped(usage, &response.usage.extensions, ExtensionScope::Usage);
