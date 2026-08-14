@@ -216,7 +216,8 @@ server_tools = "drop"                            # how Anthropic server tools (w
 image_input = false
 ```
 
-Conversion behavior (see `docs/messages-to-chat-completions-conversion.md` for the full design):
+Conversion behavior (see `docs/api-conversion-refactor-design.md` for the architecture and
+`docs/api-reference/` for the protocol and provider reference):
 
 - Request: `system` merges into a leading `system` message (billing attribution and empty blocks
   dropped); `tool_result` blocks become `role: "tool"` messages emitted before the enclosing user
