@@ -363,7 +363,7 @@ fn resolve_logged_path(meta_path: &Path, configured: &str, fallback_file: &str) 
     }
 
     let direct = PathBuf::from(configured);
-    if direct.is_absolute() {
+    if direct.is_absolute() || direct.exists() {
         return direct;
     }
 
@@ -783,7 +783,7 @@ mod tests {
     use std::{
         fs,
         io::{self, Read},
-        path::Path,
+        path::{Path, PathBuf},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -802,6 +802,27 @@ mod tests {
         let resolved = resolve_logged_path(meta_path, "bodies/response.bin", "fallback.bin");
 
         assert_eq!(resolved, Path::new("logs/exchanges/bodies/response.bin"));
+    }
+
+    #[test]
+    fn resolves_current_writer_paths_from_working_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        let dir = PathBuf::from(format!(
+            ".proxyctl-log-analyze-paths-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create log directory");
+        let meta_path = dir.join("1700000000000_req_1.meta.json");
+        let configured = format!("./{}/response_body.bin.zst", dir.display());
+        fs::write(dir.join("response_body.bin.zst"), b"body").expect("write response body");
+
+        let resolved = resolve_logged_path(&meta_path, &configured, "fallback.bin");
+
+        fs::remove_dir_all(&dir).expect("remove log directory");
+        assert_eq!(resolved, PathBuf::from(configured));
     }
 
     #[test]
